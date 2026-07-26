@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    args: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class CommandError(RuntimeError):
+    def __init__(self, result: CommandResult):
+        command = " ".join(result.args)
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        super().__init__(f"{command}: {detail}")
+        self.result = result
+
+
+class Runner:
+    def __init__(self, cwd: Path | None = None):
+        self.cwd = cwd
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        capture: bool = True,
+        input_text: str | None = None,
+    ) -> CommandResult:
+        completed = subprocess.run(
+            args,
+            cwd=self.cwd,
+            check=False,
+            text=True,
+            input=input_text,
+            capture_output=capture,
+        )
+        result = CommandResult(
+            args=tuple(args),
+            returncode=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        )
+        if check and result.returncode:
+            raise CommandError(result)
+        return result
+
+    def json(self, args: list[str], *, input_value: Any | None = None) -> Any:
+        result = self.run(
+            args,
+            input_text=json.dumps(input_value) if input_value is not None else None,
+        )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{' '.join(args)} returned invalid JSON") from exc

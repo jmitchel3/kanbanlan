@@ -1,0 +1,616 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+from typing import Any
+
+from kanbanlan.config import Config
+from kanbanlan.runner import CommandError, Runner
+from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
+
+PROJECT_QUERY = """
+query($owner: String!, $number: Int!, $after: String) {
+  OWNER(login: $owner) {
+    projectV2(number: $number) {
+      id
+      number
+      title
+      url
+      updatedAt
+      fields(first: 50) {
+        nodes {
+          ... on ProjectV2Field {
+            id
+            name
+            dataType
+          }
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            dataType
+            options {
+              id
+              name
+              color
+              description
+            }
+          }
+        }
+      }
+      items(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          type
+          isArchived
+          fieldValues(first: 30) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                optionId
+                field { ... on ProjectV2SingleSelectField { id name } }
+              }
+            }
+          }
+          content {
+            ... on Issue {
+              id
+              number
+              title
+              body
+              url
+              state
+              stateReason
+              createdAt
+              updatedAt
+              closedAt
+              labels(first: 50) { nodes { name color } }
+              assignees(first: 20) { nodes { login } }
+              comments(last: 100) {
+                nodes { body createdAt author { login } }
+              }
+              repository { nameWithOwner }
+            }
+            ... on PullRequest {
+              id
+              number
+              title
+              url
+              state
+              isDraft
+              createdAt
+              updatedAt
+              mergedAt
+              repository { nameWithOwner }
+            }
+            ... on DraftIssue {
+              id
+              title
+              body
+              createdAt
+              updatedAt
+            }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"""
+
+PULL_REQUEST_QUERY = """
+query($owner: String!, $repo: String!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(
+      first: 100,
+      after: $after,
+      states: OPEN,
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        url
+        headRefName
+        baseRefName
+        isDraft
+        mergeStateStatus
+        createdAt
+        updatedAt
+        author { login }
+        labels(first: 50) { nodes { name color } }
+        closingIssuesReferences(first: 50) {
+          nodes { number url repository { nameWithOwner } }
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+"""
+
+REPOSITORY_QUERY = """
+query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    id
+    nameWithOwner
+    owner { __typename login }
+    defaultBranchRef { name }
+  }
+}
+"""
+
+OWNER_QUERY = """
+query($login: String!) {
+  organization(login: $login) { id login }
+  user(login: $login) { id login }
+}
+"""
+
+UPDATE_STATUS_FIELD = """
+mutation($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+  updateProjectV2Field(input: {fieldId: $field, singleSelectOptions: $options}) {
+    projectV2Field {
+      ... on ProjectV2SingleSelectField {
+        id
+        name
+        options { id name color description }
+      }
+    }
+  }
+}
+"""
+
+REQUIRED_STATUS_OPTIONS = [
+    ("Inbox", "GRAY", "Captured but not yet ready"),
+    ("Ready", "GREEN", "Scoped, checked for overlap, and unblocked"),
+    ("In progress", "YELLOW", "Claimed by one active session"),
+    ("Blocked", "RED", "Waiting on a dependency or decision"),
+    ("In review", "BLUE", "Pull request is open"),
+    ("Done", "PURPLE", "Delivered to the configured staging branch"),
+]
+STATUS_ALIASES = {
+    "Inbox": {"Todo", "To do", "Backlog"},
+    "In progress": {"In Progress", "Doing"},
+    "In review": {"Review"},
+}
+
+
+class GitHub:
+    def __init__(self, root: Path, config: Config | None = None, runner: Runner | None = None):
+        self.root = root
+        self.config = config
+        self.runner = runner or Runner(root)
+
+    @staticmethod
+    def require_cli() -> None:
+        if shutil.which("gh") is None:
+            raise RuntimeError("GitHub CLI is required; install it from https://cli.github.com")
+
+    def ensure_auth(self, hostname: str = "github.com", *, interactive: bool = True) -> None:
+        self.require_cli()
+        status = self.runner.run(
+            ["gh", "auth", "status", "--active", "--hostname", hostname],
+            check=False,
+        )
+        if status.returncode == 0:
+            return
+        if not interactive:
+            raise CommandError(status)
+        print("GitHub authentication is missing or expired; opening the browser login flow.")
+        self.runner.run(
+            [
+                "gh",
+                "auth",
+                "login",
+                "--hostname",
+                hostname,
+                "--git-protocol",
+                "https",
+                "--web",
+                "--scopes",
+                "project",
+            ],
+            capture=False,
+        )
+
+    def ensure_project_scope(
+        self, owner: str, hostname: str = "github.com", *, interactive: bool = True
+    ) -> None:
+        probe = self.runner.run(
+            ["gh", "project", "list", "--owner", owner, "--limit", "1", "--format", "json"],
+            check=False,
+        )
+        if probe.returncode == 0:
+            return
+        if not interactive:
+            raise CommandError(probe)
+        print("GitHub Project access needs approval; opening the scope authorization flow.")
+        self.runner.run(
+            ["gh", "auth", "refresh", "--hostname", hostname, "--scopes", "project"],
+            capture=False,
+        )
+        self.runner.run(
+            ["gh", "project", "list", "--owner", owner, "--limit", "1", "--format", "json"]
+        )
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        result = self.runner.run(
+            ["gh", "api", "graphql", "--input", "-"],
+            input_text=json.dumps({"query": query, "variables": variables}),
+        )
+        payload = json.loads(result.stdout)
+        errors = payload.get("errors")
+        if errors:
+            detail = "; ".join(error.get("message", "GraphQL error") for error in errors)
+            raise RuntimeError(detail)
+        return payload["data"]
+
+    def repository_info(self, repository: str) -> dict[str, Any]:
+        owner, repo = repository.split("/", 1)
+        data = self.graphql(REPOSITORY_QUERY, {"owner": owner, "repo": repo})
+        value = data.get("repository")
+        if not value:
+            raise RuntimeError(f"repository {repository} was not found")
+        return value
+
+    def detect_owner_type(self, owner: str) -> str:
+        data = self.graphql(OWNER_QUERY, {"login": owner})
+        if data.get("organization"):
+            return "organization"
+        if data.get("user"):
+            return "user"
+        raise RuntimeError(f"GitHub owner {owner} was not found")
+
+    def list_projects(self, owner: str) -> list[dict[str, Any]]:
+        payload = self.runner.json(
+            ["gh", "project", "list", "--owner", owner, "--limit", "100", "--format", "json"]
+        )
+        if isinstance(payload, list):
+            return payload
+        return payload.get("projects", [])
+
+    def create_project(self, owner: str, title: str) -> dict[str, Any]:
+        return self.runner.json(
+            [
+                "gh",
+                "project",
+                "create",
+                "--owner",
+                owner,
+                "--title",
+                title,
+                "--format",
+                "json",
+            ]
+        )
+
+    def copy_project(
+        self,
+        source_owner: str,
+        source_number: int,
+        target_owner: str,
+        title: str,
+    ) -> dict[str, Any]:
+        return self.runner.json(
+            [
+                "gh",
+                "project",
+                "copy",
+                str(source_number),
+                "--source-owner",
+                source_owner,
+                "--target-owner",
+                target_owner,
+                "--title",
+                title,
+                "--format",
+                "json",
+            ]
+        )
+
+    def link_project(self) -> None:
+        config = self._config()
+        self.runner.run(
+            [
+                "gh",
+                "project",
+                "link",
+                str(config.project_number),
+                "--owner",
+                config.project_owner,
+                "--repo",
+                config.repository,
+            ]
+        )
+
+    def project_metadata(self) -> dict[str, Any]:
+        project, _ = self._fetch_project()
+        return project
+
+    def ensure_status_options(self) -> bool:
+        project = self.project_metadata()
+        status_field = _status_field(project)
+        if not status_field:
+            raise RuntimeError("Project has no single-select Status field")
+        existing = status_field.get("options", [])
+        exact_names = {option["name"] for option in existing}
+        required_names = {name for name, _, _ in REQUIRED_STATUS_OPTIONS}
+        if required_names.issubset(exact_names):
+            return False
+
+        remaining = list(existing)
+        updated: list[dict[str, Any]] = []
+        for name, color, description in REQUIRED_STATUS_OPTIONS:
+            match = next((option for option in remaining if option["name"] == name), None)
+            if match is None:
+                aliases = STATUS_ALIASES.get(name, set())
+                match = next((option for option in remaining if option["name"] in aliases), None)
+            option = {"name": name, "color": color, "description": description}
+            if match:
+                option["id"] = match["id"]
+                remaining.remove(match)
+            updated.append(option)
+
+        for option in remaining:
+            updated.append(
+                {
+                    "id": option["id"],
+                    "name": option["name"],
+                    "color": option["color"],
+                    "description": option.get("description", ""),
+                }
+            )
+        self.graphql(UPDATE_STATUS_FIELD, {"field": status_field["id"], "options": updated})
+        return True
+
+    def ensure_labels(self) -> None:
+        config = self._config()
+        for name, (color, description) in {**STATUS_LABELS, **PRIORITY_LABELS}.items():
+            self.runner.run(
+                [
+                    "gh",
+                    "label",
+                    "create",
+                    name,
+                    "--repo",
+                    config.repository,
+                    "--color",
+                    color,
+                    "--description",
+                    description,
+                    "--force",
+                ]
+            )
+
+    def fetch(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        project, project_rate_limit = self._fetch_project()
+        pull_requests, pr_rate_limit = self._fetch_pull_requests()
+        rate_limit = min(
+            (project_rate_limit, pr_rate_limit),
+            key=lambda value: value.get("remaining", 10**12),
+        )
+        return project, pull_requests, rate_limit
+
+    def _fetch_project(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        config = self._config()
+        query = PROJECT_QUERY.replace(
+            "OWNER", "organization" if config.project_owner_type == "organization" else "user"
+        )
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        metadata: dict[str, Any] | None = None
+        rate_limit: dict[str, Any] = {}
+        while True:
+            payload = self.graphql(
+                query,
+                {
+                    "owner": config.project_owner,
+                    "number": config.project_number,
+                    "after": cursor,
+                },
+            )
+            owner = payload.get(
+                "organization" if config.project_owner_type == "organization" else "user"
+            )
+            project = owner and owner.get("projectV2")
+            if not project:
+                raise RuntimeError(
+                    f"Project {config.project_owner}/{config.project_number} was not found"
+                )
+            if metadata is None:
+                metadata = {key: value for key, value in project.items() if key != "items"}
+            connection = project["items"]
+            items.extend(connection.get("nodes", []))
+            rate_limit = payload.get("rateLimit", rate_limit)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            cursor = page_info["endCursor"]
+        assert metadata is not None
+        metadata["items"] = items
+        return metadata, rate_limit
+
+    def _fetch_pull_requests(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        config = self._config()
+        owner, repo = config.repository.split("/", 1)
+        values: list[dict[str, Any]] = []
+        cursor: str | None = None
+        rate_limit: dict[str, Any] = {}
+        while True:
+            payload = self.graphql(
+                PULL_REQUEST_QUERY,
+                {"owner": owner, "repo": repo, "after": cursor},
+            )
+            repository = payload.get("repository")
+            if not repository:
+                raise RuntimeError(f"repository {config.repository} was not found")
+            connection = repository["pullRequests"]
+            values.extend(connection.get("nodes", []))
+            rate_limit = payload.get("rateLimit", rate_limit)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            cursor = page_info["endCursor"]
+        return values, rate_limit
+
+    def open_issues(self) -> list[dict[str, Any]]:
+        config = self._config()
+        payload = self.runner.json(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                config.repository,
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,url,labels",
+            ]
+        )
+        return payload
+
+    def add_issue_to_project(self, url: str) -> dict[str, Any]:
+        config = self._config()
+        return self.runner.json(
+            [
+                "gh",
+                "project",
+                "item-add",
+                str(config.project_number),
+                "--owner",
+                config.project_owner,
+                "--url",
+                url,
+                "--format",
+                "json",
+            ]
+        )
+
+    def set_project_status(self, item_id: str, project: dict[str, Any], status: str) -> None:
+        field = _status_field(project)
+        if not field:
+            raise RuntimeError("Project has no single-select Status field")
+        option = next((value for value in field["options"] if value["name"] == status), None)
+        if not option:
+            raise RuntimeError(f"Project Status option {status!r} is missing")
+        self.runner.run(
+            [
+                "gh",
+                "project",
+                "item-edit",
+                "--id",
+                item_id,
+                "--project-id",
+                project["id"],
+                "--field-id",
+                field["id"],
+                "--single-select-option-id",
+                option["id"],
+            ]
+        )
+
+    def set_issue_status_label(self, number: int, label: str | None) -> None:
+        config = self._config()
+        payload = self.runner.json(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                config.repository,
+                "--json",
+                "labels",
+            ]
+        )
+        current = {
+            value["name"]
+            for value in payload.get("labels", [])
+            if value["name"].startswith("status:")
+        }
+        wanted = {label} if label else set()
+        if current == wanted:
+            return
+        args = [
+            "gh",
+            "issue",
+            "edit",
+            str(number),
+            "--repo",
+            config.repository,
+        ]
+        for value in sorted(current - wanted):
+            args.extend(["--remove-label", value])
+        for value in sorted(wanted - current):
+            args.extend(["--add-label", value])
+        self.runner.run(args)
+
+    def comment_issue(self, number: int, body: str) -> None:
+        config = self._config()
+        self.runner.run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                config.repository,
+                "--body",
+                body,
+            ]
+        )
+
+    def create_issue(self, title: str, body: str, priority: str) -> str:
+        config = self._config()
+        result = self.runner.run(
+            [
+                "gh",
+                "issue",
+                "create",
+                "--repo",
+                config.repository,
+                "--title",
+                title,
+                "--body",
+                body,
+                "--label",
+                "status:intake",
+                "--label",
+                priority,
+            ]
+        )
+        return result.stdout.strip()
+
+    def open_project(self) -> None:
+        config = self._config()
+        self.runner.run(
+            [
+                "gh",
+                "project",
+                "view",
+                str(config.project_number),
+                "--owner",
+                config.project_owner,
+                "--web",
+            ],
+            capture=False,
+        )
+
+    def _config(self) -> Config:
+        if self.config is None:
+            raise RuntimeError("this GitHub operation requires repository configuration")
+        return self.config
+
+
+def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
+    for field in project.get("fields", {}).get("nodes", []):
+        if field and field.get("name") == "Status" and "options" in field:
+            return field
+    return None
