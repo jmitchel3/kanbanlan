@@ -53,6 +53,9 @@ from kanbanlan.workflow import (
 )
 
 PROJECT_URL_RE = re.compile(r"github\.com/(?:orgs|users)/(?P<owner>[^/]+)/projects/(?P<number>\d+)")
+DEFAULT_TEMPLATE_OWNER = "jmitchel3"
+DEFAULT_TEMPLATE_NUMBER = 6
+DEFAULT_TEMPLATE_URL = "https://github.com/users/jmitchel3/projects/6/views/5"
 COMMAND_NAMES = (
     "init",
     "auth",
@@ -158,12 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="configure a repository and GitHub Project",
         description=(
-            "Interactively detect repository settings, choose a GitHub Project, review the plan, "
-            "and configure the coordination workflow."
+            "Interactively detect repository settings, default to a fresh Project copied from "
+            "the Kanbanlan template, review the plan, and configure the coordination workflow."
         ),
         epilog=(
             "Examples:\n"
-            "  kanbanlan init\n"
+            "  kanbanlan init  # copy the default template as <repository> Delivery\n"
             "  kanbanlan init --project-url https://github.com/orgs/acme/projects/2\n"
             "  kanbanlan init --create-project --project-title 'Product Delivery' --open\n"
             "  kanbanlan init --project-number 2 --local-only"
@@ -181,12 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project owner type; normally auto-detected",
     )
     project_source.add_argument(
-        "--create-project", action="store_true", help="create a new Project"
+        "--create-project", action="store_true", help="create a new empty Project"
     )
     project_source.add_argument(
         "--template-project",
         metavar="OWNER/NUMBER",
-        help="copy this Project instead of creating an empty Project",
+        help="copy this Project instead of the default Kanbanlan template",
     )
     init.add_argument("--project-title", help="title for a newly created/copied Project")
     init.add_argument("--default-branch", help="delivery branch; defaults from origin")
@@ -203,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--non-interactive",
         action="store_true",
-        help="disable prompts; all ambiguous choices become errors",
+        help="disable prompts and use defaults for omitted optional choices",
     )
     init.add_argument(
         "--local-only",
@@ -612,32 +615,48 @@ def _choose_project(
             title = _prompt_text("New Project title", default=title)
         return ProjectChoice(mode="create", title=title)
 
+    if args.non_interactive:
+        return ProjectChoice(
+            mode="copy",
+            template_owner=DEFAULT_TEMPLATE_OWNER,
+            template_number=DEFAULT_TEMPLATE_NUMBER,
+            title=title,
+        )
+
     with status(f"Loading Projects owned by {owner}"):
         projects = github.list_projects(owner)
-    if args.non_interactive:
-        if len(projects) == 1:
-            return ProjectChoice(mode="existing", number=int(projects[0]["number"]))
-        raise RuntimeError(
-            "choose --project-number, --project-url, --create-project, "
-            "or --template-project in non-interactive mode"
-        )
 
     section("2 of 3 · GitHub Project")
     options = [
         PromptChoice(
-            key=f"project:{project['number']}",
-            label=str(project["title"]),
-            detail=f"existing Project #{project['number']}",
-        )
-        for project in projects
+            "default",
+            "Create a preconfigured Project",
+            f"fresh copy of {DEFAULT_TEMPLATE_URL}",
+        ),
+        *[
+            PromptChoice(
+                key=f"project:{project['number']}",
+                label=str(project["title"]),
+                detail=f"existing Project #{project['number']}",
+            )
+            for project in projects
+        ],
     ]
     options.extend(
         [
-            PromptChoice("new", "Create a new Project", "empty board"),
-            PromptChoice("copy", "Copy a template Project", "includes template views"),
+            PromptChoice("new", "Create an empty Project", "no preconfigured views"),
+            PromptChoice("copy", "Copy another template Project", "includes template views"),
         ]
     )
     selected = _prompt_choice("Choose a Project", options)
+    if selected.key == "default":
+        title = _prompt_text("New Project title", default=title)
+        return ProjectChoice(
+            mode="copy",
+            template_owner=DEFAULT_TEMPLATE_OWNER,
+            template_number=DEFAULT_TEMPLATE_NUMBER,
+            title=title,
+        )
     if selected.key == "new":
         title = _prompt_text("New Project title", default=title)
         return ProjectChoice(mode="create", title=title)

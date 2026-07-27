@@ -77,11 +77,14 @@ cd /path/to/repository
 kanbanlan init
 ```
 
-The three-step wizard detects the repository and default branch, presents
-existing Projects and create/copy actions as a numbered menu, collects the
+The three-step wizard detects the repository and default branch, defaults to a
+fresh copy of the [Kanbanlan Project
+template](https://github.com/users/jmitchel3/projects/6/views/5), collects the
 staging and optional production branch, then shows a summary for confirmation
-before it changes repository files or Project settings. GitHub and cache work
-shows progress as it runs, including a clear failed step if setup stops.
+before it changes repository files or Project settings. The copied Project is
+titled `<repository name> Delivery` by default and includes the template's
+preconfigured views. GitHub and cache work shows progress as it runs, including
+a clear failed step if setup stops.
 
 You can also provide any choice up front. Reuse an existing Project:
 
@@ -90,13 +93,13 @@ cd /path/to/repository
 kanbanlan init --project-url https://github.com/orgs/acme/projects/2
 ```
 
-Create a new Project:
+Create a new empty Project instead of using the default template:
 
 ```sh
 kanbanlan init --create-project --project-title "Product Delivery" --open
 ```
 
-Copy a Project template, including its useful views:
+Copy a different Project template, including its useful views:
 
 ```sh
 kanbanlan init --template-project template-owner/1 --project-title "Product Delivery"
@@ -108,11 +111,12 @@ kanbanlan init --template-project template-owner/1 --project-title "Product Deli
 creates the workflow labels, writes managed repository files, adds open issues,
 and reconciles their state.
 
-Use `--non-interactive` in automation and provide `--project-number`,
-`--project-url`, `--create-project`, or `--template-project` explicitly.
-Use `--local-only` to generate repository files without GitHub mutations.
-Pass `--no-open` to suppress the wizard's browser question or `--open` to open
-the configured Project after setup.
+Use `--non-interactive` in automation; without a Project source it copies the
+default template. Provide `--project-number`, `--project-url`,
+`--create-project`, or `--template-project` to override that default. Use
+`--local-only` with an existing Project reference to generate repository files
+without GitHub mutations. Pass `--no-open` to suppress the wizard's browser
+question or `--open` to open the configured Project after setup.
 
 Terminal colors distinguish headings, workflow states, priorities, warnings,
 and errors when output is interactive. Use `--color always` or `--color never`
@@ -120,11 +124,12 @@ to choose explicitly. Kanbanlan also respects the standard `NO_COLOR`
 environment variable. Progress is written to stderr so commands such as
 `snapshot`, `path`, and `capture` keep clean, pipe-friendly stdout.
 
-Kanbanlan does not yet create custom Project views or GitHub's built-in
-auto-add workflow. Copying a template Project is the automated path when those
-views matter. Without a template, `kanbanlan init --open` opens the Project so
-a Board view can be added once. Kanbanlan's own `reconcile --apply` keeps item
-states correct even when GitHub Project workflows are not configured.
+Kanbanlan does not create custom Project views or GitHub's built-in auto-add
+workflow through the API. Plain `kanbanlan init` copies the default template so
+its views are present from the start. With `--create-project`, `--open` opens
+the empty Project so a Board view can be added manually. Kanbanlan's own
+`reconcile --apply` keeps item states correct even when GitHub Project workflows
+are not configured.
 
 ## Daily use
 

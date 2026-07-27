@@ -9,6 +9,9 @@ from unittest import mock
 
 from kanbanlan import __version__
 from kanbanlan.cli import (
+    DEFAULT_TEMPLATE_NUMBER,
+    DEFAULT_TEMPLATE_OWNER,
+    ProjectChoice,
     _choose_project,
     _cmd_init,
     _cmd_upgrade,
@@ -114,7 +117,7 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["init", "--project-number", "2", "--create-project"])
 
-    def test_interactive_project_creation_is_deferred_until_materialized(self) -> None:
+    def test_interactive_project_defaults_to_fresh_template(self) -> None:
         github = mock.Mock()
         github.list_projects.return_value = []
         args = Namespace(
@@ -127,15 +130,22 @@ class CliTests(unittest.TestCase):
         with mock.patch("builtins.input", side_effect=["", "Delivery Board"]):
             choice = _choose_project(args, github, "acme", "widget", None)
 
-        self.assertEqual("create", choice.mode)
+        self.assertEqual("copy", choice.mode)
+        self.assertEqual(DEFAULT_TEMPLATE_OWNER, choice.template_owner)
+        self.assertEqual(DEFAULT_TEMPLATE_NUMBER, choice.template_number)
         self.assertEqual("Delivery Board", choice.title)
-        github.create_project.assert_not_called()
+        github.copy_project.assert_not_called()
 
-        github.create_project.return_value = {"number": 8}
+        github.copy_project.return_value = {"number": 8}
         self.assertEqual(8, _materialize_project(github, choice, "acme"))
-        github.create_project.assert_called_once_with("acme", "Delivery Board")
+        github.copy_project.assert_called_once_with(
+            DEFAULT_TEMPLATE_OWNER,
+            DEFAULT_TEMPLATE_NUMBER,
+            "acme",
+            "Delivery Board",
+        )
 
-    def test_interactive_project_list_defaults_to_first_project(self) -> None:
+    def test_interactive_project_list_still_defaults_to_fresh_template(self) -> None:
         github = mock.Mock()
         github.list_projects.return_value = [
             {"number": 4, "title": "Delivery"},
@@ -148,11 +158,73 @@ class CliTests(unittest.TestCase):
             non_interactive=False,
         )
 
-        with mock.patch("builtins.input", return_value=""):
+        with mock.patch("builtins.input", side_effect=["", ""]):
             choice = _choose_project(args, github, "acme", "widget", None)
 
-        self.assertEqual(4, choice.number)
+        self.assertEqual("copy", choice.mode)
+        self.assertEqual(DEFAULT_TEMPLATE_OWNER, choice.template_owner)
+        self.assertEqual(DEFAULT_TEMPLATE_NUMBER, choice.template_number)
+        self.assertEqual("widget Delivery", choice.title)
         github.create_project.assert_not_called()
+
+    def test_non_interactive_project_defaults_to_fresh_template(self) -> None:
+        github = mock.Mock()
+        args = Namespace(
+            project_title=None,
+            template_project=None,
+            create_project=False,
+            non_interactive=True,
+        )
+
+        choice = _choose_project(args, github, "acme", "widget", None)
+
+        self.assertEqual("copy", choice.mode)
+        self.assertEqual(DEFAULT_TEMPLATE_OWNER, choice.template_owner)
+        self.assertEqual(DEFAULT_TEMPLATE_NUMBER, choice.template_number)
+        self.assertEqual("widget Delivery", choice.title)
+        github.list_projects.assert_not_called()
+
+    def test_explicit_empty_project_overrides_default_template(self) -> None:
+        github = mock.Mock()
+        args = Namespace(
+            project_title="Custom Delivery",
+            template_project=None,
+            create_project=True,
+            non_interactive=True,
+        )
+
+        choice = _choose_project(args, github, "acme", "widget", None)
+
+        self.assertEqual(ProjectChoice(mode="create", title="Custom Delivery"), choice)
+
+    def test_explicit_existing_project_overrides_default_template(self) -> None:
+        github = mock.Mock()
+        args = Namespace(
+            project_title=None,
+            template_project=None,
+            create_project=False,
+            non_interactive=True,
+        )
+
+        choice = _choose_project(args, github, "acme", "widget", 9)
+
+        self.assertEqual(ProjectChoice(mode="existing", number=9), choice)
+
+    def test_explicit_template_overrides_default_template(self) -> None:
+        github = mock.Mock()
+        args = Namespace(
+            project_title="Custom Delivery",
+            template_project="acme/12",
+            create_project=False,
+            non_interactive=True,
+        )
+
+        choice = _choose_project(args, github, "acme", "widget", None)
+
+        self.assertEqual("copy", choice.mode)
+        self.assertEqual("acme", choice.template_owner)
+        self.assertEqual(12, choice.template_number)
+        self.assertEqual("Custom Delivery", choice.title)
 
     def test_interactive_project_choice_retries_invalid_input(self) -> None:
         github = mock.Mock()
@@ -164,7 +236,7 @@ class CliTests(unittest.TestCase):
             non_interactive=False,
         )
 
-        with mock.patch("builtins.input", side_effect=["unknown", "0", "1"]):
+        with mock.patch("builtins.input", side_effect=["unknown", "0", "2"]):
             choice = _choose_project(args, github, "acme", "widget", None)
 
         self.assertEqual(4, choice.number)
@@ -182,7 +254,7 @@ class CliTests(unittest.TestCase):
             non_interactive=False,
         )
 
-        with mock.patch("builtins.input", return_value="2"):
+        with mock.patch("builtins.input", return_value="3"):
             choice = _choose_project(args, github, "acme", "widget", None)
 
         self.assertEqual(9, choice.number)
@@ -254,7 +326,7 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["init", "--repository", "acme/widget"])
         responses = [
             "",  # Project owner
-            "",  # Create a new Project
+            "",  # Create a preconfigured Project
             "",  # Default Project title
             "",  # Pull request target
             "",  # Staging branch
@@ -272,4 +344,47 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, _cmd_init(args))
 
         github.create_project.assert_not_called()
+        github.copy_project.assert_not_called()
         github.link_project.assert_not_called()
+
+    def test_non_interactive_init_copies_default_template_with_repo_title(self) -> None:
+        root = Path("/tmp/kanbanlan-non-interactive-init-test")
+        github = mock.Mock()
+        github.repository_info.return_value = {
+            "owner": {"login": "acme"},
+            "defaultBranchRef": {"name": "main"},
+        }
+        github.copy_project.return_value = {"number": 8}
+        github.ensure_status_options.return_value = False
+        store = mock.Mock()
+        args = build_parser().parse_args(
+            [
+                "init",
+                "--repository",
+                "acme/widget",
+                "--owner-type",
+                "organization",
+                "--non-interactive",
+                "--skip-reconcile",
+                "--no-open",
+            ]
+        )
+
+        with (
+            mock.patch("kanbanlan.cli._root", return_value=root),
+            mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
+            mock.patch("kanbanlan.cli.GitHub", return_value=github),
+            mock.patch("kanbanlan.cli.scaffold_repository", return_value=[]),
+            mock.patch("kanbanlan.cli.cache_dir", return_value=root / ".cache"),
+            mock.patch("kanbanlan.cli.CacheStore", return_value=store),
+        ):
+            self.assertEqual(0, _cmd_init(args))
+
+        github.copy_project.assert_called_once_with(
+            DEFAULT_TEMPLATE_OWNER,
+            DEFAULT_TEMPLATE_NUMBER,
+            "acme",
+            "widget Delivery",
+        )
+        github.link_project.assert_called_once_with()
+        github.create_project.assert_not_called()
