@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kanbanlan"
-version = "0.2.0"
-description = "Reusable GitHub Projects request coordination for humans and coding agents."
+version = "0.3.0"
+description = "Repository-native request coordination for humans and coding agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

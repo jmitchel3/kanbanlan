@@ -1,3 +1,3 @@
-"""Reusable GitHub Projects request coordination."""
+"""Repository-native request coordination for humans and coding agents."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

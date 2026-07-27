@@ -8,6 +8,7 @@ from pathlib import Path
 from kanbanlan.runner import Runner
 
 CONFIG_FILENAME = ".kanbanlan.toml"
+CONFIG_SCHEMA_VERSION = 2
 REMOTE_RE = re.compile(
     r"(?:git@[^:]+:|https?://[^/]+/|ssh://git@[^/]+/)(?P<repo>[^/]+/[^/]+?)(?:\.git)?$"
 )
@@ -24,6 +25,9 @@ class Config:
     production_branch: str = ""
     hostname: str = "github.com"
     stale_seconds: int = 180
+    code_host: str = "github"
+    canonical_home: str = "github"
+    projections: tuple[str, ...] = ("github_projects",)
 
     def __post_init__(self) -> None:
         if self.repository.count("/") != 1:
@@ -34,6 +38,12 @@ class Config:
             raise ValueError("project_number must be positive")
         if self.stale_seconds < 1:
             raise ValueError("stale_seconds must be positive")
+        if self.code_host != "github":
+            raise ValueError(f"unsupported code host: {self.code_host}")
+        if self.canonical_home != "github":
+            raise ValueError(f"unsupported canonical kanban home: {self.canonical_home}")
+        if not self.projections or any(not value for value in self.projections):
+            raise ValueError("at least one valid kanban projection is required")
 
     @classmethod
     def load(cls, root: Path) -> Config:
@@ -44,24 +54,50 @@ class Config:
             raise RuntimeError(
                 f"{path} is missing; run 'kanbanlan init' from the repository first"
             ) from exc
-        project = data.get("project", {})
-        repository = data.get("repository", {})
-        local = data.get("local", {})
-        return cls(
-            repository=repository["name_with_owner"],
-            project_owner=project["owner"],
-            project_owner_type=project.get("owner_type", "organization"),
-            project_number=int(project["number"]),
-            default_branch=repository.get("default_branch", "main"),
-            stage_branch=repository.get("stage_branch", repository.get("default_branch", "main")),
-            production_branch=repository.get("production_branch", ""),
-            hostname=repository.get("hostname", "github.com"),
-            stale_seconds=int(local.get("stale_seconds", 180)),
-        )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeError(f"could not read {path}: {exc}") from exc
+        try:
+            schema_version = int(data.get("schema_version", 1))
+            if schema_version < 1 or schema_version > CONFIG_SCHEMA_VERSION:
+                raise ValueError(f"unsupported schema_version {schema_version}")
+            project = data.get("project", {})
+            repository = data.get("repository", {})
+            local = data.get("local", {})
+            coordination = data.get("coordination", {})
+            projections = coordination.get("projections", ["github_projects"])
+            if not isinstance(projections, list) or not all(
+                isinstance(value, str) for value in projections
+            ):
+                raise ValueError("coordination.projections must be a list of strings")
+            return cls(
+                repository=repository["name_with_owner"],
+                project_owner=project["owner"],
+                project_owner_type=project.get("owner_type", "organization"),
+                project_number=int(project["number"]),
+                default_branch=repository.get("default_branch", "main"),
+                stage_branch=repository.get(
+                    "stage_branch", repository.get("default_branch", "main")
+                ),
+                production_branch=repository.get("production_branch", ""),
+                hostname=repository.get("hostname", "github.com"),
+                stale_seconds=int(local.get("stale_seconds", 180)),
+                code_host=coordination.get("code_host", "github"),
+                canonical_home=coordination.get("canonical_home", "github"),
+                projections=tuple(projections),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{path} is incomplete or invalid ({exc}); rerun 'kanbanlan init' to repair it"
+            ) from exc
 
     def to_toml(self) -> str:
+        projections = ", ".join(f'"{_escape(value)}"' for value in self.projections)
         return (
-            "schema_version = 1\n\n"
+            f"schema_version = {CONFIG_SCHEMA_VERSION}\n\n"
+            "[coordination]\n"
+            f'code_host = "{_escape(self.code_host)}"\n'
+            f'canonical_home = "{_escape(self.canonical_home)}"\n'
+            f"projections = [{projections}]\n\n"
             "[repository]\n"
             f'name_with_owner = "{_escape(self.repository)}"\n'
             f'hostname = "{_escape(self.hostname)}"\n'

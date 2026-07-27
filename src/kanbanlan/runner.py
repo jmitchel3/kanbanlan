@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ class CommandResult:
 
 class CommandError(RuntimeError):
     def __init__(self, result: CommandResult):
-        command = " ".join(result.args)
+        command = shlex.join(result.args)
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         super().__init__(f"{command}: {detail}")
         self.result = result
@@ -61,4 +62,6 @@ class Runner:
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{' '.join(args)} returned invalid JSON") from exc
+            detail = result.stdout.strip().replace("\n", " ")[:160]
+            suffix = f": {detail}" if detail else " (empty output)"
+            raise RuntimeError(f"{shlex.join(args)} returned invalid JSON{suffix}") from exc
