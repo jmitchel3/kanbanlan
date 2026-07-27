@@ -1,5 +1,8 @@
 # Kanbanlan
 
+[![CI](https://github.com/jmitchel3/kanbanlan/actions/workflows/ci.yml/badge.svg)](https://github.com/jmitchel3/kanbanlan/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jmitchel3/kanbanlan/blob/main/LICENSE)
+
 Kanbanlan turns a GitHub repository and a GitHub Projects v2 board into one
 coordinated request workflow for humans and coding agents.
 
@@ -21,12 +24,25 @@ not create another server-side database.
 ## Install
 
 Kanbanlan requires Python 3.11+, Git, and
-[GitHub CLI](https://cli.github.com/).
+[GitHub CLI](https://cli.github.com/). The examples below use
+[uv](https://docs.astral.sh/uv/) for installation and development.
 
-Install the local checkout with uv:
+Install the latest release from PyPI:
 
 ```sh
-uv tool install /Users/jmitch/devpkgs/kanbanlan
+uv tool install kanbanlan
+```
+
+Or install the unreleased development version from GitHub:
+
+```sh
+uv tool install git+https://github.com/jmitchel3/kanbanlan.git
+```
+
+To install a local checkout instead:
+
+```sh
+uv tool install .
 ```
 
 For development:
@@ -40,7 +56,19 @@ uv build
 
 ## Initialize a repository
 
-Reuse an existing Project:
+Start the guided setup wizard from any GitHub-backed repository:
+
+```sh
+cd /path/to/repository
+kanbanlan init
+```
+
+The wizard detects the repository and default branch, lets you reuse, create,
+or copy a GitHub Project, collects the staging and optional production branch,
+then shows a summary for confirmation before it changes repository files or
+Project settings.
+
+You can also provide any choice up front. Reuse an existing Project:
 
 ```sh
 cd /path/to/repository
@@ -59,7 +87,7 @@ Copy a Project template, including its useful views:
 kanbanlan init --template-project template-owner/1 --project-title "Product Delivery"
 ```
 
-`init` detects the repository and default branch, authenticates through
+`init` authenticates through
 `gh auth login --web` when necessary, ensures the GitHub token has the
 `project` scope, links the Project to the repository, repairs the Status field,
 creates the workflow labels, writes managed repository files, adds open issues,
@@ -68,13 +96,14 @@ and reconciles their state.
 Use `--non-interactive` in automation and provide `--project-number`,
 `--project-url`, `--create-project`, or `--template-project` explicitly.
 Use `--local-only` to generate repository files without GitHub mutations.
+Pass `--no-open` to suppress the wizard's browser question or `--open` to open
+the configured Project after setup.
 
-GitHub's public API supports Project fields and items but not creating custom
-views or the web-only auto-add workflow. Copying a template Project is the
-fully automated path when those views matter. Without a template,
-`kanbanlan init --open` opens the Project so a Board view can be added once.
-Kanbanlan's own `reconcile --apply` keeps item states correct even when GitHub
-Project workflows are not configured.
+Kanbanlan does not yet create custom Project views or GitHub's built-in
+auto-add workflow. Copying a template Project is the automated path when those
+views matter. Without a template, `kanbanlan init --open` opens the Project so
+a Board view can be added once. Kanbanlan's own `reconcile --apply` keeps item
+states correct even when GitHub Project workflows are not configured.
 
 ## Daily use
 
@@ -150,3 +179,14 @@ kanbanlan refresh
 
 `doctor` checks configuration, authentication, Project Status options, labels,
 and cache health without mutating GitHub.
+
+## Contributing and security
+
+Bug reports and focused pull requests are welcome. See
+[CONTRIBUTING.md](https://github.com/jmitchel3/kanbanlan/blob/main/CONTRIBUTING.md)
+for the development workflow. Please report security vulnerabilities privately
+as described in
+[SECURITY.md](https://github.com/jmitchel3/kanbanlan/blob/main/SECURITY.md).
+
+Kanbanlan is available under the
+[MIT License](https://github.com/jmitchel3/kanbanlan/blob/main/LICENSE).

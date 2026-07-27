@@ -5,10 +5,12 @@ import json
 import re
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from kanbanlan import __version__
 from kanbanlan.config import (
     Config,
     cache_dir,
@@ -29,6 +31,31 @@ from kanbanlan.workflow import (
 PROJECT_URL_RE = re.compile(r"github\.com/(?:orgs|users)/(?P<owner>[^/]+)/projects/(?P<number>\d+)")
 
 
+@dataclass(frozen=True)
+class ProjectChoice:
+    mode: str
+    number: int | None = None
+    template_owner: str | None = None
+    template_number: int | None = None
+    title: str | None = None
+
+
+@dataclass(frozen=True)
+class InitPlan:
+    repository: str
+    project_owner: str
+    project_owner_type: str
+    project: ProjectChoice
+    default_branch: str
+    stage_branch: str
+    production_branch: str
+    hostname: str
+    stale_seconds: int
+    reconcile: bool
+    open_project: bool
+    local_only: bool
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kanbanlan",
@@ -39,21 +66,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-root",
         help="run against this Git repository instead of the current directory",
     )
-    parser.add_argument("--version", action="version", version="kanbanlan 0.1.0")
+    parser.add_argument("--version", action="version", version=f"kanbanlan {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="configure a repository and GitHub Project")
     init.add_argument("--repository", help="GitHub owner/repository; defaults from origin")
-    init.add_argument("--project-url", help="existing GitHub Project URL")
     init.add_argument("--project-owner", help="Project owner; defaults to repository owner")
-    init.add_argument("--project-number", type=int, help="existing Project number")
+    project_source = init.add_mutually_exclusive_group()
+    project_source.add_argument("--project-url", help="existing GitHub Project URL")
+    project_source.add_argument("--project-number", type=int, help="existing Project number")
     init.add_argument(
         "--owner-type",
         choices=("organization", "user"),
         help="Project owner type; normally auto-detected",
     )
-    init.add_argument("--create-project", action="store_true", help="create a new Project")
-    init.add_argument(
+    project_source.add_argument(
+        "--create-project", action="store_true", help="create a new Project"
+    )
+    project_source.add_argument(
         "--template-project",
         metavar="OWNER/NUMBER",
         help="copy this Project instead of creating an empty Project",
@@ -61,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--project-title", help="title for a newly created/copied Project")
     init.add_argument("--default-branch", help="delivery branch; defaults from origin")
     init.add_argument("--stage-branch", help="branch deployed to staging")
-    init.add_argument("--production-branch", default="", help="optional production branch")
+    init.add_argument("--production-branch", help="optional production branch")
     init.add_argument("--hostname", default="github.com")
     init.add_argument("--stale-seconds", type=int, default=180)
     init.add_argument("--force", action="store_true", help="replace custom generated targets")
@@ -76,7 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not add/reconcile existing open issues during setup",
     )
-    init.add_argument("--open", action="store_true", help="open the Project in a browser")
+    init.add_argument(
+        "--open",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="open the Project in a browser after setup",
+    )
 
     commands.add_parser("auth", help="repair GitHub login and Project scope")
     commands.add_parser("doctor", help="check local config, auth, fields, and labels")
@@ -156,56 +191,106 @@ def _context(args: argparse.Namespace) -> tuple[Path, Config, GitHub, CacheStore
 def _cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
     repository = args.repository or discover_repository(root)
+    if repository.count("/") != 1 or any(not part for part in repository.split("/")):
+        raise RuntimeError("--repository must use OWNER/NAME")
+    if args.stale_seconds < 1:
+        raise RuntimeError("--stale-seconds must be positive")
     repo_owner, repo_name = repository.split("/", 1)
-    project_owner, project_number = _project_reference(args, repo_owner)
-    default_branch = args.default_branch or discover_default_branch(root)
+    detected_default_branch = args.default_branch or discover_default_branch(root)
     github = GitHub(root)
+    interactive = not args.non_interactive
+
+    if interactive:
+        print("Kanbanlan setup wizard")
+        print(f"Repository: {repository}")
 
     if args.local_only:
-        if not project_number:
+        project_owner, project_number = _project_reference(args, repo_owner)
+        if project_number is None:
             raise RuntimeError("--local-only requires --project-number or --project-url")
         owner_type = args.owner_type or "organization"
+        choice = ProjectChoice(mode="existing", number=project_number)
     else:
-        github.ensure_auth(args.hostname, interactive=not args.non_interactive)
+        github.ensure_auth(args.hostname, interactive=interactive)
         repository_info = github.repository_info(repository)
-        default_branch = (
+        detected_default_branch = (
             args.default_branch
             or (repository_info.get("defaultBranchRef") or {}).get("name")
-            or default_branch
+            or detected_default_branch
         )
+        project_owner, project_number = _project_reference(args, repo_owner)
         project_owner = project_owner or repository_info["owner"]["login"]
+        if interactive and not args.project_owner and not args.project_url:
+            project_owner = _prompt_text("Project owner", default=project_owner)
         github.ensure_project_scope(
             project_owner,
             args.hostname,
-            interactive=not args.non_interactive,
+            interactive=interactive,
         )
         owner_type = args.owner_type or github.detect_owner_type(project_owner)
-        if not project_number:
-            project_number = _choose_or_create_project(
-                args,
-                github,
-                project_owner,
-                repo_name,
-            )
+        choice = _choose_project(
+            args,
+            github,
+            project_owner,
+            repo_name,
+            project_number,
+        )
 
-    assert project_owner
-    assert project_number
-    config = Config(
+    default_branch = detected_default_branch
+    stage_branch = args.stage_branch or default_branch
+    production_branch = args.production_branch or ""
+    open_project = bool(args.open)
+    if interactive:
+        if args.default_branch is None:
+            default_branch = _prompt_text("Pull request target branch", default=default_branch)
+        if args.stage_branch is None:
+            stage_branch = _prompt_text("Staging branch", default=default_branch)
+        if args.production_branch is None:
+            production_branch = _prompt_text(
+                "Production branch (optional)",
+                default="",
+                required=False,
+            )
+        if args.open is None and not args.local_only:
+            open_project = _prompt_bool("Open the Project in a browser after setup?", default=False)
+
+    plan = InitPlan(
         repository=repository,
         project_owner=project_owner,
         project_owner_type=owner_type,
-        project_number=project_number,
+        project=choice,
         default_branch=default_branch,
-        stage_branch=args.stage_branch or default_branch,
-        production_branch=args.production_branch,
+        stage_branch=stage_branch,
+        production_branch=production_branch,
         hostname=args.hostname,
         stale_seconds=args.stale_seconds,
+        reconcile=not args.skip_reconcile and not args.local_only,
+        open_project=open_project and not args.local_only,
+        local_only=args.local_only,
+    )
+    if interactive:
+        _print_init_summary(plan)
+        if not _prompt_bool("Apply this setup?", default=True):
+            print("Setup cancelled; no repository files or Project settings were changed.")
+            return 0
+
+    project_number = _materialize_project(github, plan.project, project_owner)
+    config = Config(
+        repository=plan.repository,
+        project_owner=plan.project_owner,
+        project_owner_type=plan.project_owner_type,
+        project_number=project_number,
+        default_branch=plan.default_branch,
+        stage_branch=plan.stage_branch,
+        production_branch=plan.production_branch,
+        hostname=plan.hostname,
+        stale_seconds=plan.stale_seconds,
     )
     results = scaffold_repository(root, config, force=args.force)
     for result in results:
         print(f"{result.action}: {result.path.relative_to(root)}")
 
-    if args.local_only:
+    if plan.local_only:
         print("Local setup complete; run 'kanbanlan doctor' when GitHub access is available.")
         return 0
 
@@ -218,7 +303,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     store = CacheStore(config, cache_dir(root))
     snapshot = store.refresh(github)
-    if not args.skip_reconcile:
+    if plan.reconcile:
         drift = plan_reconciliation(snapshot, github.open_issues())
         if drift:
             print(f"reconciling {len(drift)} existing issue/Project differences")
@@ -232,7 +317,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     f"{len(remaining)} reconciliation differences remain after setup"
                 )
-    if args.open:
+    if plan.open_project:
         github.open_project()
     print(f"Kanbanlan configured for {repository} and Project {project_owner}/{project_number}.")
     return 0
@@ -253,49 +338,170 @@ def _project_reference(
             raise RuntimeError("--project-owner conflicts with --project-url")
         owner = url_owner
         number = int(match.group("number"))
+    if number is not None and number < 1:
+        raise RuntimeError("Project number must be positive")
     return owner, number
 
 
-def _choose_or_create_project(
+def _choose_project(
     args: argparse.Namespace,
     github: GitHub,
     owner: str,
     repo_name: str,
-) -> int:
+    project_number: int | None,
+) -> ProjectChoice:
     title = args.project_title or f"{repo_name} Delivery"
+    if project_number:
+        return ProjectChoice(mode="existing", number=project_number)
     if args.template_project:
         source_owner, source_number = _parse_template(args.template_project)
-        created = github.copy_project(source_owner, source_number, owner, title)
-        return _project_number(created)
+        if not args.non_interactive and args.project_title is None:
+            title = _prompt_text("New Project title", default=title)
+        return ProjectChoice(
+            mode="copy",
+            template_owner=source_owner,
+            template_number=source_number,
+            title=title,
+        )
     if args.create_project:
-        return _project_number(github.create_project(owner, title))
+        if not args.non_interactive and args.project_title is None:
+            title = _prompt_text("New Project title", default=title)
+        return ProjectChoice(mode="create", title=title)
 
     projects = github.list_projects(owner)
     if args.non_interactive:
         if len(projects) == 1:
-            return int(projects[0]["number"])
+            return ProjectChoice(mode="existing", number=int(projects[0]["number"]))
         raise RuntimeError(
             "choose --project-number, --project-url, --create-project, "
             "or --template-project in non-interactive mode"
         )
-    print("Available GitHub Projects:")
+
+    print("\nGitHub Project")
+    print(f"Available Projects owned by {owner}:")
     for project in projects:
         print(f"  {project['number']}: {project['title']}")
-    response = input("Project number, or 'new' to create one: ").strip()
-    if response.lower() == "new":
-        return _project_number(github.create_project(owner, title))
-    try:
-        return int(response)
-    except ValueError as exc:
-        raise RuntimeError("a numeric Project number or 'new' is required") from exc
+    if not projects:
+        print("  No Projects found.")
+    print("  new: create an empty Project")
+    print("  copy: copy a template Project")
+    default = str(projects[0]["number"]) if projects else "new"
+    while True:
+        response = _prompt_text("Project number, 'new', or 'copy'", default=default)
+        if response.lower() == "new":
+            title = _prompt_text("New Project title", default=title)
+            return ProjectChoice(mode="create", title=title)
+        if response.lower() == "copy":
+            while True:
+                try:
+                    source_owner, source_number = _parse_template(
+                        _prompt_text("Template Project (OWNER/NUMBER)")
+                    )
+                    break
+                except RuntimeError as exc:
+                    print(exc)
+            title = _prompt_text("New Project title", default=title)
+            return ProjectChoice(
+                mode="copy",
+                template_owner=source_owner,
+                template_number=source_number,
+                title=title,
+            )
+        try:
+            number = int(response)
+        except ValueError:
+            print("Enter a Project number, 'new', or 'copy'.")
+            continue
+        if number < 1:
+            print("Project number must be positive.")
+            continue
+        return ProjectChoice(mode="existing", number=number)
+
+
+def _materialize_project(github: GitHub, choice: ProjectChoice, owner: str) -> int:
+    if choice.mode == "existing" and choice.number:
+        return choice.number
+    if choice.mode == "create" and choice.title:
+        return _project_number(github.create_project(owner, choice.title))
+    if choice.mode == "copy" and choice.template_owner and choice.template_number and choice.title:
+        created = github.copy_project(
+            choice.template_owner,
+            choice.template_number,
+            owner,
+            choice.title,
+        )
+        return _project_number(created)
+    raise RuntimeError("invalid Project setup choice")
+
+
+def _prompt_text(
+    label: str,
+    *,
+    default: str | None = None,
+    required: bool = True,
+) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        try:
+            response = input(f"{label}{suffix}: ").strip()
+        except EOFError as exc:
+            raise RuntimeError(
+                "interactive setup requires terminal input; rerun with --non-interactive"
+            ) from exc
+        value = response if response else default
+        if value is not None and (value or not required):
+            return value
+        print(f"{label} is required.")
+
+
+def _prompt_bool(label: str, *, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        try:
+            response = input(f"{label} [{suffix}]: ").strip().lower()
+        except EOFError as exc:
+            raise RuntimeError(
+                "interactive setup requires terminal input; rerun with --non-interactive"
+            ) from exc
+        if not response:
+            return default
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def _print_init_summary(plan: InitPlan) -> None:
+    project = plan.project
+    if project.mode == "existing":
+        project_summary = f"use existing Project #{project.number}"
+    elif project.mode == "create":
+        project_summary = f"create {project.title!r}"
+    else:
+        project_summary = (
+            f"copy {project.template_owner}/{project.template_number} as {project.title!r}"
+        )
+    print("\nSetup summary")
+    print(f"  Repository: {plan.repository}")
+    print(f"  Project: {plan.project_owner} ({plan.project_owner_type}); {project_summary}")
+    print(f"  Pull request target: {plan.default_branch}")
+    print(f"  Staging branch: {plan.stage_branch}")
+    print(f"  Production branch: {plan.production_branch or '(not configured)'}")
+    print(f"  Reconcile open issues: {'yes' if plan.reconcile else 'no'}")
+    if not plan.local_only:
+        print(f"  Open Project after setup: {'yes' if plan.open_project else 'no'}")
 
 
 def _parse_template(value: str) -> tuple[str, int]:
     try:
         owner, raw_number = value.rsplit("/", 1)
-        return owner, int(raw_number)
+        number = int(raw_number)
     except ValueError as exc:
         raise RuntimeError("--template-project must use OWNER/NUMBER") from exc
+    if not owner or number < 1:
+        raise RuntimeError("--template-project must use OWNER/POSITIVE_NUMBER")
+    return owner, number
 
 
 def _project_number(payload: dict[str, Any]) -> int:

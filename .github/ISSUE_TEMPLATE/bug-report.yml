@@ -1,0 +1,62 @@
+name: Bug report
+description: Report reproducible behavior that is incorrect or unexpected.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove secrets and private repository data
+        from all commands, output, configuration, and snapshots.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `kanbanlan ...`
+        2. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Kanbanlan version
+      description: Output from `kanbanlan --version`.
+      placeholder: kanbanlan X.Y.Z
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Python version, and GitHub CLI version.
+      placeholder: macOS 15, Python 3.13, gh 2.x
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostic output
+      description: Include sanitized errors or `kanbanlan doctor` output.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I removed credentials and private repository data from this report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

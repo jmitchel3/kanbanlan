@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Kanbanlan"
+  short_description: "Safely version and publish Kanbanlan releases"
+  default_prompt: "Use $release to choose and publish the next Kanbanlan version."
