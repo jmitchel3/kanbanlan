@@ -218,7 +218,7 @@ deliberately outside the current implementation.
 - `.github/pull_request_template.md`;
 - `docs/workflow/kanbanlan.md`;
 - a marked Kanbanlan section in `AGENTS.md` and `CLAUDE.md`; and
-- `/.cache/kanbanlan/` in `.gitignore`.
+- `/.cache/kanbanlan/` and `/.worktrees/` in `.gitignore`.
 
 Generated standalone files carry a marker. Existing custom templates are not
 overwritten unless `--force` is passed. Agent instruction sections are

@@ -109,14 +109,24 @@ def _upsert_section(path: Path, default_heading: str, body: str) -> WriteResult:
 
 
 def _append_gitignore(path: Path) -> WriteResult:
-    entry = "/.cache/kanbanlan/"
+    entries = ("/.cache/kanbanlan/", "/.worktrees/")
+    legacy_heading = "# Local Kanbanlan coordination cache"
+    heading = "# Local Kanbanlan coordination state"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    if entry in existing.splitlines():
+    lines = [heading if line == legacy_heading else line for line in existing.splitlines()]
+    normalized = "\n".join(lines) + ("\n" if existing.endswith("\n") and lines else "")
+    present = set(lines)
+    missing = [entry for entry in entries if entry not in present]
+    if not missing and normalized == existing:
         return WriteResult(path, "unchanged")
-    prefix = existing.rstrip()
-    rendered = (
-        f"{prefix}\n\n# Local Kanbanlan coordination cache\n{entry}\n" if prefix else f"{entry}\n"
-    )
+    prefix = normalized.rstrip()
+    if missing:
+        separator = "\n" if any(entry in present for entry in entries) else "\n\n"
+        managed_heading = "" if heading in present else f"{heading}\n"
+        addition = managed_heading + "\n".join(missing)
+        rendered = f"{prefix}{separator if prefix else ''}{addition}\n"
+    else:
+        rendered = normalized
     path.write_text(rendered, encoding="utf-8")
     return WriteResult(path, "updated" if existing else "created")
 

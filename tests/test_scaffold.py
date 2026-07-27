@@ -24,6 +24,47 @@ def config() -> Config:
 
 
 class ScaffoldTests(unittest.TestCase):
+    def test_gitignore_adds_both_local_state_entries_on_first_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_results = scaffold_repository(root, config())
+            first = (root / ".gitignore").read_text(encoding="utf-8")
+            second_results = scaffold_repository(root, config())
+            second = (root / ".gitignore").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            "created",
+            next(value.action for value in first_results if value.path.name == ".gitignore"),
+        )
+        self.assertEqual(
+            "unchanged",
+            next(value.action for value in second_results if value.path.name == ".gitignore"),
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(1, first.splitlines().count("/.cache/kanbanlan/"))
+        self.assertEqual(1, first.splitlines().count("/.worktrees/"))
+
+    def test_gitignore_migrates_cache_only_entry_and_preserves_custom_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".gitignore"
+            path.write_text(
+                "custom-output/\n\n# Local Kanbanlan coordination cache\n/.cache/kanbanlan/\n",
+                encoding="utf-8",
+            )
+
+            scaffold_repository(root, config())
+            first = path.read_text(encoding="utf-8")
+            scaffold_repository(root, config())
+            second = path.read_text(encoding="utf-8")
+
+        self.assertEqual(first, second)
+        self.assertIn("custom-output/", first)
+        self.assertIn("# Local Kanbanlan coordination state", first)
+        self.assertNotIn("# Local Kanbanlan coordination cache", first)
+        self.assertEqual(1, first.splitlines().count("/.cache/kanbanlan/"))
+        self.assertEqual(1, first.splitlines().count("/.worktrees/"))
+
     def test_scaffold_is_idempotent_and_preserves_unmanaged_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
