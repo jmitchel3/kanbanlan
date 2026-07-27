@@ -167,6 +167,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual("widget Delivery", choice.title)
         github.create_project.assert_not_called()
 
+    def test_interactive_default_template_preserves_explicit_project_title(self) -> None:
+        github = mock.Mock()
+        github.list_projects.return_value = []
+        args = Namespace(
+            project_title="Explicit Delivery",
+            template_project=None,
+            create_project=False,
+            non_interactive=False,
+        )
+
+        with mock.patch("builtins.input", side_effect=[""]) as prompt:
+            choice = _choose_project(args, github, "acme", "widget", None)
+
+        self.assertEqual("copy", choice.mode)
+        self.assertEqual(DEFAULT_TEMPLATE_OWNER, choice.template_owner)
+        self.assertEqual(DEFAULT_TEMPLATE_NUMBER, choice.template_number)
+        self.assertEqual("Explicit Delivery", choice.title)
+        prompt.assert_called_once()
+
     def test_non_interactive_project_defaults_to_fresh_template(self) -> None:
         github = mock.Mock()
         args = Namespace(

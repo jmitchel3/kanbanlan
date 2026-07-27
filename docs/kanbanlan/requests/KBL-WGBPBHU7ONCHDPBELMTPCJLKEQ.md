@@ -32,7 +32,7 @@ Changing the contents of the canonical template Project.
 
 ## Verification
 
-- `uv run pytest -q` — 69 tests and 4 subtests passed.
+- `uv run pytest -q` — 70 tests and 4 subtests passed.
 - `uv run ruff check .` — passed.
 - `uv run ruff format --check .` — all 35 files formatted.
 - `git diff --check` — passed.

@@ -650,7 +650,8 @@ def _choose_project(
     )
     selected = _prompt_choice("Choose a Project", options)
     if selected.key == "default":
-        title = _prompt_text("New Project title", default=title)
+        if args.project_title is None:
+            title = _prompt_text("New Project title", default=title)
         return ProjectChoice(
             mode="copy",
             template_owner=DEFAULT_TEMPLATE_OWNER,
