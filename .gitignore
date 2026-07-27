@@ -7,5 +7,6 @@ dist/
 build/
 *.egg-info/
 
-# Local Kanbanlan coordination cache
+# Local Kanbanlan coordination state
 /.cache/kanbanlan/
+/.worktrees/
