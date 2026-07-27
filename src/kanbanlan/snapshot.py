@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from kanbanlan.config import Config
+from kanbanlan.identity import extract_kanbanlan_id, find_kanbanlan_ids
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CLAIM_RE = re.compile(r"^CLAIM:\s*(?P<claimed_at>[^\n]+)", re.MULTILINE)
 CLAIM_FIELD_RE = re.compile(
     r"^(Session|Branch|Worktree|Touchpoints):\s*(.+)$",
@@ -97,6 +98,7 @@ def _normalize_pull_request(pull_request: dict[str, Any], repository: str) -> di
     return {
         "number": pull_request["number"],
         "title": pull_request["title"],
+        "body": pull_request.get("body"),
         "url": pull_request["url"],
         "head_ref": pull_request.get("headRefName"),
         "base_ref": pull_request.get("baseRefName"),
@@ -107,7 +109,16 @@ def _normalize_pull_request(pull_request: dict[str, Any], repository: str) -> di
         "author": (pull_request.get("author") or {}).get("login"),
         "labels": _labels(pull_request),
         "closing_issue_numbers": sorted(closing_numbers),
+        "kanbanlan_ids": find_kanbanlan_ids(pull_request.get("body")),
     }
+
+
+def _merge_pull_requests(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_url: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for pull_request in group:
+            by_url[pull_request["url"]] = pull_request
+    return sorted(by_url.values(), key=lambda value: value.get("number", 0))
 
 
 def build_snapshot(
@@ -122,9 +133,12 @@ def build_snapshot(
         _normalize_pull_request(value, config.repository) for value in raw_pull_requests
     ]
     linked_pull_requests: dict[int, list[dict[str, Any]]] = {}
+    linked_pull_requests_by_kanbanlan_id: dict[str, list[dict[str, Any]]] = {}
     for pull_request in pull_requests:
         for issue_number in pull_request["closing_issue_numbers"]:
             linked_pull_requests.setdefault(issue_number, []).append(pull_request)
+        for kanbanlan_id in pull_request["kanbanlan_ids"]:
+            linked_pull_requests_by_kanbanlan_id.setdefault(kanbanlan_id, []).append(pull_request)
 
     items: list[dict[str, Any]] = []
     for raw_item in project.get("items", []):
@@ -156,8 +170,16 @@ def build_snapshot(
                 None,
             )
             number = content["number"]
+            kanbanlan_id = extract_kanbanlan_id(content.get("body"))
+            provider_ref = f"github:{content_repository}#{number}"
             normalized.update(
                 {
+                    "kanbanlan_id": kanbanlan_id,
+                    "provider": "github",
+                    "provider_id": content.get("id"),
+                    "provider_ref": provider_ref,
+                    "display_id": f"#{number}",
+                    "canonical_url": content.get("url"),
                     "content_id": content.get("id"),
                     "number": number,
                     "repository": content_repository,
@@ -175,7 +197,12 @@ def build_snapshot(
                         if content.get("state") == "OPEN"
                         else None
                     ),
-                    "linked_open_pull_requests": linked_pull_requests.get(number, []),
+                    "linked_open_pull_requests": _merge_pull_requests(
+                        linked_pull_requests.get(number, []),
+                        linked_pull_requests_by_kanbanlan_id.get(kanbanlan_id, [])
+                        if kanbanlan_id
+                        else [],
+                    ),
                 }
             )
         elif item_type == "PULL_REQUEST":
@@ -220,6 +247,9 @@ def build_snapshot(
             "project_owner": config.project_owner,
             "project_number": config.project_number,
             "authoritative": "github",
+            "code_host": config.code_host,
+            "canonical_home": config.canonical_home,
+            "projections": list(config.projections),
         },
         "project": {
             "id": project.get("id"),
@@ -292,14 +322,17 @@ class CacheStore:
         with FileLock(self.lock_path):
             attempted_at = utc_now()
             try:
-                project, pull_requests, rate_limit = client.fetch()
-                snapshot = build_snapshot(
-                    self.config,
-                    project,
-                    pull_requests,
-                    rate_limit,
-                    generated_at=attempted_at,
-                )
+                if hasattr(client, "snapshot"):
+                    snapshot = client.snapshot(generated_at=attempted_at)
+                else:
+                    project, pull_requests, rate_limit = client.fetch()
+                    snapshot = build_snapshot(
+                        self.config,
+                        project,
+                        pull_requests,
+                        rate_limit,
+                        generated_at=attempted_at,
+                    )
                 self._write_json(self.snapshot_path, snapshot)
                 self._write_json(
                     self.health_path,
@@ -377,6 +410,8 @@ class CacheStore:
     def _snapshot_state(self, snapshot: dict[str, Any] | None) -> str:
         if not snapshot or not snapshot.get("generated_at"):
             return "missing"
+        if snapshot.get("schema_version") != SCHEMA_VERSION:
+            return "stale"
         age = self._snapshot_age(snapshot)
         return "fresh" if age is not None and age <= self.config.stale_seconds else "stale"
 

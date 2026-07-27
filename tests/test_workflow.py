@@ -8,6 +8,7 @@ from kanbanlan.workflow import expected_state, plan_reconciliation
 def item(**overrides):
     value = {
         "type": "ISSUE",
+        "kanbanlan_id": "KBL-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         "number": 1,
         "title": "Example",
         "url": "url",
@@ -40,7 +41,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_closed_issue_is_done_without_status_label(self) -> None:
         self.assertEqual(
-            (None, "Done", "issue is closed"),
+            (None, "Done", "canonical request is closed"),
             expected_state(item(state="CLOSED")),
         )
 
@@ -52,6 +53,6 @@ class WorkflowTests(unittest.TestCase):
         ]
         drift = plan_reconciliation(snapshot, open_issues)
         self.assertEqual(
-            ["add_to_project", "set_project_status"],
+            ["add_to_projection", "set_projection_status"],
             [value.kind for value in drift],
         )

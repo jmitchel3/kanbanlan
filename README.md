@@ -3,8 +3,10 @@
 [![CI](https://github.com/jmitchel3/kanbanlan/actions/workflows/ci.yml/badge.svg)](https://github.com/jmitchel3/kanbanlan/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jmitchel3/kanbanlan/blob/main/LICENSE)
 
-Kanbanlan turns a GitHub repository and a GitHub Projects v2 board into one
-coordinated request workflow for humans and coding agents.
+Kanbanlan gives a repository one documented coordination workflow for humans
+and coding agents. Today its canonical kanban home is GitHub Issues with a
+GitHub Projects v2 projection; its core identity and provider contract are
+portable to other canonical homes.
 
 It provides:
 
@@ -16,10 +18,12 @@ It provides:
 - a private local snapshot shared across Git worktrees;
 - dry-run-first reconciliation between issue labels, Project Status, active
   claims, and linked pull requests; and
-- safe capture, claim, release, handoff, and review commands.
+- immutable, provider-independent Kanbanlan IDs;
+- safe capture, claim, release, handoff, and review commands; and
+- durable per-request records stored in the repository.
 
-GitHub Issues remain canonical. Kanbanlan does not store API tokens and does
-not create another server-side database.
+GitHub Issues remain canonical in the current provider. Kanbanlan does not
+store API tokens, require an MCP server, or create another server-side database.
 
 ## Install
 
@@ -32,6 +36,16 @@ Install the latest release from PyPI:
 ```sh
 uv tool install kanbanlan
 ```
+
+Once installed, upgrade to the latest release with:
+
+```sh
+kanbanlan upgrade
+```
+
+On normal CLI use, Kanbanlan also checks PyPI at most once every three days and
+prints a short notice when a newer release is available. Set
+`KANBANLAN_NO_UPDATE_CHECK=1` to disable these checks.
 
 Or install the unreleased development version from GitHub:
 
@@ -63,10 +77,11 @@ cd /path/to/repository
 kanbanlan init
 ```
 
-The wizard detects the repository and default branch, lets you reuse, create,
-or copy a GitHub Project, collects the staging and optional production branch,
-then shows a summary for confirmation before it changes repository files or
-Project settings.
+The three-step wizard detects the repository and default branch, presents
+existing Projects and create/copy actions as a numbered menu, collects the
+staging and optional production branch, then shows a summary for confirmation
+before it changes repository files or Project settings. GitHub and cache work
+shows progress as it runs, including a clear failed step if setup stops.
 
 You can also provide any choice up front. Reuse an existing Project:
 
@@ -99,6 +114,12 @@ Use `--local-only` to generate repository files without GitHub mutations.
 Pass `--no-open` to suppress the wizard's browser question or `--open` to open
 the configured Project after setup.
 
+Terminal colors distinguish headings, workflow states, priorities, warnings,
+and errors when output is interactive. Use `--color always` or `--color never`
+to choose explicitly. Kanbanlan also respects the standard `NO_COLOR`
+environment variable. Progress is written to stderr so commands such as
+`snapshot`, `path`, and `capture` keep clean, pipe-friendly stdout.
+
 Kanbanlan does not yet create custom Project views or GitHub's built-in
 auto-add workflow. Copying a template Project is the automated path when those
 views matter. Without a template, `kanbanlan init --open` opens the Project so
@@ -113,6 +134,7 @@ kanbanlan next               # report the first unblocked Ready issue
 kanbanlan status             # summarize the local cache
 kanbanlan reconcile          # report drift, without mutations
 kanbanlan reconcile --apply  # apply and verify the displayed repairs
+kanbanlan --json next        # stable output for agents and automation
 ```
 
 The cache lives at `<primary-checkout>/.cache/kanbanlan/` with private file
@@ -123,18 +145,42 @@ error in `health.json`.
 
 ```sh
 kanbanlan capture "Add export audit log" --priority priority:p1
-kanbanlan claim 123 --touchpoints "audit API; exports UI; migrations"
-kanbanlan review 123
-kanbanlan release 123 --reason "Waiting for product decision" --blocked
-kanbanlan handoff 123 --session codex-next --branch work/123-audit \\
+kanbanlan claim KBL-... --touchpoints "audit API; exports UI; migrations"
+kanbanlan record KBL-...
+kanbanlan review KBL-...
+kanbanlan release KBL-... --reason "Waiting for product decision" --blocked
+kanbanlan handoff KBL-... --session codex-next --branch work/kbl-audit \\
   --worktree /path/to/worktree --reason "Shift change"
 ```
+
+`capture` assigns a globally unique `KBL-...` Kanbanlan ID. Lifecycle commands
+accept that ID, a GitHub issue number, or the normalized GitHub provider
+reference. `reconcile --apply` assigns IDs to requests created through GitHub's
+web interface or by older Kanbanlan releases.
 
 By default `claim` posts the claim first, verifies that it is the earliest
 active claim, and only then creates a dedicated worktree from the configured
 default branch. If checkout creation fails, it releases the claim and returns
 the card to Ready. Use `--no-worktree` only from an existing non-default
 branch/worktree.
+
+`record` creates `docs/kanbanlan/requests/<Kanbanlan ID>.md` once. Complete its
+decisions, verification, and delivered-result sections in the implementation
+PR. Kanbanlan never overwrites manual changes to an existing record. Volatile
+status and claim movements remain in the live canonical home rather than Git.
+
+## Portable architecture
+
+The versioned configuration distinguishes the GitHub code host, the canonical
+kanban home, and board projections. Normalized snapshots expose a Kanbanlan ID,
+provider ID, display ID, provider reference, canonical URL, lifecycle state,
+claims, and linked pull requests. Workflow reconciliation depends on a provider
+contract; GitHub is its first implementation.
+
+This keeps the CLI as the portable agent interface. MCP integrations may wrap
+it, but agents can operate using ordinary shell access and `--json`. Linear or
+Asana adapters, mirroring, webhooks, and multi-master conflict resolution are
+deliberately outside the current implementation.
 
 ## Managed repository files
 

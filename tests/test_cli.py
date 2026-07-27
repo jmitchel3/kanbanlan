@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -9,13 +11,16 @@ from kanbanlan import __version__
 from kanbanlan.cli import (
     _choose_project,
     _cmd_init,
+    _cmd_upgrade,
     _materialize_project,
     _parse_template,
     _project_number,
     _project_reference,
     _prompt_bool,
     build_parser,
+    main,
 )
+from kanbanlan.runner import CommandError, CommandResult
 
 
 class CliTests(unittest.TestCase):
@@ -38,6 +43,65 @@ class CliTests(unittest.TestCase):
             ("paracord-clients", 2),
             _project_reference(args, "repository-owner"),
         )
+
+    def test_upgrade_uses_uv_tool_upgrade(self) -> None:
+        runner = mock.Mock()
+        args = build_parser().parse_args(["upgrade"])
+
+        with mock.patch("kanbanlan.cli.Runner", return_value=runner):
+            self.assertEqual(0, _cmd_upgrade(args))
+
+        runner.run.assert_called_once_with(
+            ["uv", "tool", "upgrade", "kanbanlan"],
+            capture=False,
+        )
+
+    def test_upgrade_explains_when_uv_is_unavailable(self) -> None:
+        runner = mock.Mock()
+        runner.run.side_effect = FileNotFoundError
+        args = build_parser().parse_args(["upgrade"])
+
+        with (
+            mock.patch("kanbanlan.cli.Runner", return_value=runner),
+            self.assertRaisesRegex(RuntimeError, "uv is required"),
+        ):
+            _cmd_upgrade(args)
+
+    def test_upgrade_explains_before_running_when_uv_is_not_installed(self) -> None:
+        args = build_parser().parse_args(["upgrade"])
+
+        with (
+            mock.patch("kanbanlan.cli.shutil.which", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "uv is required"),
+        ):
+            _cmd_upgrade(args)
+
+    def test_normal_commands_check_for_a_new_release(self) -> None:
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
+            mock.patch("kanbanlan.cli._cmd_status", return_value=0),
+        ):
+            self.assertEqual(0, main(["status"]))
+
+        notify.assert_called_once_with(__version__)
+
+    def test_upgrade_does_not_check_before_upgrading(self) -> None:
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
+            mock.patch("kanbanlan.cli._cmd_upgrade", return_value=0),
+        ):
+            self.assertEqual(0, main(["upgrade"]))
+
+        notify.assert_not_called()
+
+    def test_json_mode_does_not_check_for_updates(self) -> None:
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
+            mock.patch("kanbanlan.cli._cmd_status", return_value=0),
+        ):
+            self.assertEqual(0, main(["--json", "status"]))
+
+        notify.assert_not_called()
 
     def test_created_project_number_falls_back_to_url(self) -> None:
         self.assertEqual(
@@ -100,10 +164,74 @@ class CliTests(unittest.TestCase):
             non_interactive=False,
         )
 
-        with mock.patch("builtins.input", side_effect=["unknown", "0", "9"]):
+        with mock.patch("builtins.input", side_effect=["unknown", "0", "1"]):
+            choice = _choose_project(args, github, "acme", "widget", None)
+
+        self.assertEqual(4, choice.number)
+
+    def test_interactive_project_choice_uses_displayed_selection_number(self) -> None:
+        github = mock.Mock()
+        github.list_projects.return_value = [
+            {"number": 4, "title": "Delivery"},
+            {"number": 9, "title": "Roadmap"},
+        ]
+        args = Namespace(
+            project_title=None,
+            template_project=None,
+            create_project=False,
+            non_interactive=False,
+        )
+
+        with mock.patch("builtins.input", return_value="2"):
             choice = _choose_project(args, github, "acme", "widget", None)
 
         self.assertEqual(9, choice.number)
+
+    def test_command_failure_includes_actionable_hint(self) -> None:
+        stderr = StringIO()
+        failure = RuntimeError("network is unavailable")
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, main(["status"]))
+
+        self.assertIn("Error: network is unavailable", stderr.getvalue())
+
+    def test_github_auth_failure_suggests_auth_helper(self) -> None:
+        stderr = StringIO()
+        failure = CommandError(
+            CommandResult(("gh", "api", "graphql"), 1, "", "authentication token expired")
+        )
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, main(["status"]))
+
+        self.assertIn("Hint: Run 'kanbanlan auth'", stderr.getvalue())
+
+    def test_mistyped_command_suggests_the_closest_command(self) -> None:
+        stderr = StringIO()
+
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["stats"])
+
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("Did you mean 'status'?", stderr.getvalue())
+
+    def test_keyboard_interrupt_has_shell_standard_exit_code(self) -> None:
+        stderr = StringIO()
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=KeyboardInterrupt),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(130, main(["status"]))
+
+        self.assertIn("Error: cancelled", stderr.getvalue())
 
     def test_template_reference_requires_a_positive_number(self) -> None:
         for value in ("acme", "acme/nope", "acme/0", "/2"):

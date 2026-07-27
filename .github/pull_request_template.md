@@ -2,6 +2,10 @@
 
 <!-- What problem does this pull request solve? -->
 
+Kanbanlan: KBL-
+
+Closes #
+
 ## Changes
 
 <!-- List the important user-visible or implementation changes. -->
@@ -15,6 +19,7 @@
 - [ ] `uv run ruff format --check .`
 - [ ] `uv build`
 - [ ] Tests and documentation were updated where needed.
+- [ ] The durable `docs/kanbanlan/requests/<Kanbanlan ID>.md` record is complete.
 
 ## Security and compatibility
 

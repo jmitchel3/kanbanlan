@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
+import shutil
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,10 +20,32 @@ from kanbanlan.config import (
     discover_repository,
     find_repo_root,
 )
+from kanbanlan.domain import request_label, resolve_request_item
 from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
+from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id
+from kanbanlan.providers import CoordinationProvider, create_provider
+from kanbanlan.records import create_record
 from kanbanlan.runner import CommandError, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.snapshot import CacheStore
+from kanbanlan.ui import (
+    BOLD,
+    CYAN,
+    DIM,
+    configure_color,
+    configure_progress,
+    error,
+    field,
+    heading,
+    priority_value,
+    section,
+    status,
+    status_value,
+    style,
+    success,
+    warning,
+)
+from kanbanlan.updates import notify_if_update_available
 from kanbanlan.workflow import (
     apply_reconciliation,
     format_drift,
@@ -29,6 +53,25 @@ from kanbanlan.workflow import (
 )
 
 PROJECT_URL_RE = re.compile(r"github\.com/(?:orgs|users)/(?P<owner>[^/]+)/projects/(?P<number>\d+)")
+COMMAND_NAMES = (
+    "init",
+    "auth",
+    "upgrade",
+    "doctor",
+    "ensure",
+    "refresh",
+    "status",
+    "snapshot",
+    "path",
+    "next",
+    "reconcile",
+    "capture",
+    "claim",
+    "release",
+    "review",
+    "handoff",
+    "record",
+)
 
 
 @dataclass(frozen=True)
@@ -56,20 +99,77 @@ class InitPlan:
     local_only: bool
 
 
+@dataclass(frozen=True)
+class PromptChoice:
+    key: str
+    label: str
+    detail: str = ""
+
+
+class KanbanlanParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        hint = f"Run '{self.prog} --help' to see available options."
+        invalid_command = re.search(r"invalid choice: '([^']+)'", message)
+        if invalid_command:
+            suggestions = difflib.get_close_matches(invalid_command.group(1), COMMAND_NAMES, n=1)
+            if suggestions:
+                hint = (
+                    f"Did you mean '{suggestions[0]}'? Run '{self.prog} --help' for all commands."
+                )
+        error(message, hint=hint)
+        raise SystemExit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = KanbanlanParser(
         prog="kanbanlan",
-        description="Reusable GitHub Project coordination for humans and coding agents.",
+        description="Repository-native request coordination for humans and coding agents.",
+        epilog=(
+            "Common workflows:\n"
+            "  kanbanlan init                 Configure this repository\n"
+            "  kanbanlan doctor               Diagnose configuration and access\n"
+            "  kanbanlan next                 Find the next Ready request\n"
+            "  kanbanlan reconcile --apply    Repair board drift"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-C",
         "--repo-root",
         help="run against this Git repository instead of the current directory",
     )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="terminal colors (default: auto; NO_COLOR is also respected)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit stable JSON for agents and automation",
+    )
     parser.add_argument("--version", action="version", version=f"kanbanlan {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    init = commands.add_parser("init", help="configure a repository and GitHub Project")
+    init = commands.add_parser(
+        "init",
+        help="configure a repository and GitHub Project",
+        description=(
+            "Interactively detect repository settings, choose a GitHub Project, review the plan, "
+            "and configure the coordination workflow."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  kanbanlan init\n"
+            "  kanbanlan init --project-url https://github.com/orgs/acme/projects/2\n"
+            "  kanbanlan init --create-project --project-title 'Product Delivery' --open\n"
+            "  kanbanlan init --project-number 2 --local-only"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     init.add_argument("--repository", help="GitHub owner/repository; defaults from origin")
     init.add_argument("--project-owner", help="Project owner; defaults to repository owner")
     project_source = init.add_mutually_exclusive_group()
@@ -93,9 +193,18 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--stage-branch", help="branch deployed to staging")
     init.add_argument("--production-branch", help="optional production branch")
     init.add_argument("--hostname", default="github.com")
-    init.add_argument("--stale-seconds", type=int, default=180)
+    init.add_argument(
+        "--stale-seconds",
+        type=int,
+        default=180,
+        help="snapshot freshness window (default: 180)",
+    )
     init.add_argument("--force", action="store_true", help="replace custom generated targets")
-    init.add_argument("--non-interactive", action="store_true")
+    init.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="disable prompts; all ambiguous choices become errors",
+    )
     init.add_argument(
         "--local-only",
         action="store_true",
@@ -114,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     commands.add_parser("auth", help="repair GitHub login and Project scope")
+    commands.add_parser("upgrade", help="upgrade Kanbanlan to the latest release")
     commands.add_parser("doctor", help="check local config, auth, fields, and labels")
     commands.add_parser("ensure", help="ensure the shared snapshot is fresh")
     commands.add_parser("refresh", help="refresh the shared snapshot now")
@@ -126,20 +236,21 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--apply", action="store_true", help="apply the displayed repairs")
 
     capture = commands.add_parser("capture", help="create an Inbox request card")
-    capture.add_argument("title")
-    capture.add_argument("--body", default="")
+    capture.add_argument("title", help="issue title")
+    capture.add_argument("--body", default="", help="issue body; defaults to an outcome template")
     capture.add_argument(
         "--priority",
         choices=tuple(PRIORITY_LABELS),
         default="priority:p2",
+        help="request priority (default: priority:p2)",
     )
 
     claim = commands.add_parser("claim", help="claim one Ready issue")
-    claim.add_argument("issue", type=int)
-    claim.add_argument("--touchpoints", required=True)
-    claim.add_argument("--session")
-    claim.add_argument("--branch")
-    claim.add_argument("--worktree")
+    claim.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    claim.add_argument("--touchpoints", required=True, help="expected files or systems to change")
+    claim.add_argument("--session", help="claim owner; generated when omitted")
+    claim.add_argument("--branch", help="work branch; generated when omitted")
+    claim.add_argument("--worktree", help="worktree path; generated when omitted")
     claim.add_argument(
         "--no-worktree",
         action="store_true",
@@ -147,19 +258,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     release = commands.add_parser("release", help="release an active claim")
-    release.add_argument("issue", type=int)
-    release.add_argument("--reason", required=True)
-    release.add_argument("--blocked", action="store_true")
+    release.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    release.add_argument("--reason", required=True, help="why the claim is being released")
+    release.add_argument("--blocked", action="store_true", help="move to Blocked instead of Ready")
 
     review = commands.add_parser("review", help="move an issue with an open PR to review")
-    review.add_argument("issue", type=int)
+    review.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
 
     handoff = commands.add_parser("handoff", help="transfer an active claim")
-    handoff.add_argument("issue", type=int)
+    handoff.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     handoff.add_argument("--session", required=True, help="new owner/session identifier")
-    handoff.add_argument("--branch", required=True)
-    handoff.add_argument("--worktree", required=True)
-    handoff.add_argument("--reason", required=True)
+    handoff.add_argument("--branch", required=True, help="branch the new owner should continue")
+    handoff.add_argument("--worktree", required=True, help="worktree the new owner should continue")
+    handoff.add_argument("--reason", required=True, help="handoff context")
+
+    record = commands.add_parser(
+        "record",
+        help="create a durable repository record for one request",
+    )
+    record.add_argument("request", help="Kanbanlan ID or canonical provider reference")
 
     return parser
 
@@ -167,12 +284,105 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_color(args.color)
+    configure_progress(not args.json_output)
+    if args.command != "upgrade" and not args.json_output:
+        notify_if_update_available(__version__)
     try:
         handler = globals()[f"_cmd_{args.command.replace('-', '_')}"]
         return int(handler(args) or 0)
-    except (CommandError, RuntimeError, ValueError) as exc:
-        print(f"kanbanlan: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        _emit_error(args, "cancelled", kind="KeyboardInterrupt")
+        return 130
+    except FileNotFoundError as exc:
+        command = exc.filename or "required command"
+        _emit_error(
+            args,
+            f"{command!r} was not found",
+            kind=exc.__class__.__name__,
+            hint=_missing_command_hint(command),
+        )
         return 1
+    except (CommandError, RuntimeError, ValueError) as exc:
+        message, hint = _friendly_error(exc)
+        _emit_error(args, message, kind=exc.__class__.__name__, hint=hint)
+        return 1
+
+
+def _write_json(value: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    json.dump(value, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+
+
+def _emit_result(args: argparse.Namespace, value: dict[str, Any]) -> bool:
+    if not args.json_output:
+        return False
+    _write_json({"ok": True, "result": value})
+    return True
+
+
+def _emit_error(
+    args: argparse.Namespace,
+    message: str,
+    *,
+    kind: str,
+    hint: str | None = None,
+) -> None:
+    if args.json_output:
+        _write_json(
+            {
+                "ok": False,
+                "error": {
+                    "kind": kind,
+                    "message": message,
+                    "hint": hint,
+                },
+            },
+            stream=sys.stderr,
+        )
+        return
+    error(message, hint=hint)
+
+
+def _missing_command_hint(command: str) -> str:
+    name = Path(command).name
+    if name == "gh":
+        return "Install GitHub CLI from https://cli.github.com, then run 'kanbanlan auth'."
+    if name == "git":
+        return "Install Git and rerun the command from a Git repository."
+    if name == "uv":
+        return "Install uv from https://docs.astral.sh/uv/."
+    return f"Install {name!r} and make sure it is available on PATH."
+
+
+def _friendly_error(exc: Exception) -> tuple[str, str | None]:
+    if not isinstance(exc, CommandError):
+        message = str(exc)
+        hint = None
+        if ".kanbanlan.toml" in message and "missing" in message:
+            hint = "Run 'kanbanlan init' from the repository root."
+        elif "not a git repository" in message.lower():
+            hint = "Run inside a Git repository or pass '-C /path/to/repository'."
+        return message, hint
+
+    result = exc.result
+    command = " ".join(result.args)
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    normalized = detail.lower()
+    hint = f"Run `{command}` directly for more detail."
+    if result.args and result.args[0] == "gh":
+        if any(value in normalized for value in ("auth", "credential", "401", "scope")):
+            hint = "Run 'kanbanlan auth' to repair GitHub login and Project access."
+        elif any(
+            value in normalized for value in ("connect", "network", "resolve host", "timed out")
+        ):
+            hint = "Check network access to GitHub, then retry this command."
+    elif result.args[:3] == ("git", "rev-parse", "--show-toplevel"):
+        return (
+            "the selected directory is not inside a Git repository",
+            "Run inside a Git repository or pass '-C /path/to/repository'.",
+        )
+    return f"command failed ({result.returncode}): {command}\n{detail}", hint
 
 
 def _root(args: argparse.Namespace) -> Path:
@@ -180,12 +390,14 @@ def _root(args: argparse.Namespace) -> Path:
     return find_repo_root(start)
 
 
-def _context(args: argparse.Namespace) -> tuple[Path, Config, GitHub, CacheStore]:
+def _context(
+    args: argparse.Namespace,
+) -> tuple[Path, Config, CoordinationProvider, CacheStore]:
     root = _root(args)
     config = Config.load(root)
-    github = GitHub(root, config)
+    provider = create_provider(root, config)
     store = CacheStore(config, cache_dir(root))
-    return root, config, github, store
+    return root, config, provider, store
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -201,8 +413,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     interactive = not args.non_interactive
 
     if interactive:
-        print("Kanbanlan setup wizard")
-        print(f"Repository: {repository}")
+        heading("Kanbanlan setup")
+        print("Configure a shared GitHub Project workflow in three short steps.")
+        section("1 of 3 · Repository")
+        field("Repository", repository)
+        field("Root", root)
 
     if args.local_only:
         project_owner, project_number = _project_reference(args, repo_owner)
@@ -212,7 +427,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         choice = ProjectChoice(mode="existing", number=project_number)
     else:
         github.ensure_auth(args.hostname, interactive=interactive)
-        repository_info = github.repository_info(repository)
+        with status("Reading GitHub repository settings"):
+            repository_info = github.repository_info(repository)
         detected_default_branch = (
             args.default_branch
             or (repository_info.get("defaultBranchRef") or {}).get("name")
@@ -222,7 +438,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
         project_owner = project_owner or repository_info["owner"]["login"]
         if interactive and not args.project_owner and not args.project_url:
             project_owner = _prompt_text("Project owner", default=project_owner)
-        owner_type = args.owner_type or github.detect_owner_type(project_owner)
+        if args.owner_type:
+            owner_type = args.owner_type
+        else:
+            with status(f"Checking Project owner {project_owner}"):
+                owner_type = github.detect_owner_type(project_owner)
         github.ensure_project_scope(
             project_owner,
             args.hostname,
@@ -242,6 +462,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
     production_branch = args.production_branch or ""
     open_project = bool(args.open)
     if interactive:
+        section("3 of 3 · Delivery branches")
+        print("These branches define where work is reviewed and delivered.")
         if args.default_branch is None:
             default_branch = _prompt_text("Pull request target branch", default=default_branch)
         if args.stage_branch is None:
@@ -272,10 +494,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if interactive:
         _print_init_summary(plan)
         if not _prompt_bool("Apply this setup?", default=True):
-            print("Setup cancelled; no repository files or Project settings were changed.")
+            warning("Setup cancelled; no repository files or Project settings were changed.")
             return 0
 
-    project_number = _materialize_project(github, plan.project, project_owner)
+    if interactive:
+        section("Applying setup")
+    materialize_label = {
+        "existing": "Using selected GitHub Project",
+        "create": "Creating GitHub Project",
+        "copy": "Copying template GitHub Project",
+    }[plan.project.mode]
+    with status(materialize_label):
+        project_number = _materialize_project(github, plan.project, project_owner)
     config = Config(
         repository=plan.repository,
         project_owner=plan.project_owner,
@@ -287,40 +517,53 @@ def _cmd_init(args: argparse.Namespace) -> int:
         hostname=plan.hostname,
         stale_seconds=plan.stale_seconds,
     )
-    results = scaffold_repository(root, config, force=args.force)
+    with status("Writing repository configuration"):
+        results = scaffold_repository(root, config, force=args.force)
     for result in results:
-        print(f"{result.action}: {result.path.relative_to(root)}")
+        marker = style(f"{result.action:<10}", CYAN if result.action != "unchanged" else DIM)
+        print(f"  {marker} {result.path.relative_to(root)}")
 
     if plan.local_only:
-        print("Local setup complete; run 'kanbanlan doctor' when GitHub access is available.")
+        success("Local setup complete.")
+        print("Run 'kanbanlan doctor' when GitHub access is available.")
         return 0
 
     github.config = config
-    github.link_project()
-    changed = github.ensure_status_options()
-    print("updated: Project Status options" if changed else "unchanged: Project Status options")
-    github.ensure_labels()
-    print("updated: repository workflow labels")
+    with status("Linking Project to repository"):
+        github.link_project()
+    with status("Checking Project Status options"):
+        changed = github.ensure_status_options()
+    project_status_result = (
+        "  updated    Project Status options" if changed else "  unchanged  Project Status options"
+    )
+    print(project_status_result)
+    with status("Creating workflow labels"):
+        github.ensure_labels()
 
     store = CacheStore(config, cache_dir(root))
-    snapshot = store.refresh(github)
+    with status("Refreshing the shared board snapshot"):
+        snapshot = store.refresh(github)
     if plan.reconcile:
-        drift = plan_reconciliation(snapshot, github.open_issues())
+        with status("Checking existing issue and Project state"):
+            open_issues = github.open_issues()
+            drift = plan_reconciliation(snapshot, open_issues)
         if drift:
             print(f"reconciling {len(drift)} existing issue/Project differences")
-            remaining, _ = apply_reconciliation(
-                github,
-                store,
-                snapshot,
-                github.open_issues(),
-            )
+            with status(f"Repairing {len(drift)} board difference(s)"):
+                remaining, _ = apply_reconciliation(
+                    github,
+                    store,
+                    snapshot,
+                    open_issues,
+                )
             if remaining:
                 raise RuntimeError(
                     f"{len(remaining)} reconciliation differences remain after setup"
                 )
     if plan.open_project:
         github.open_project()
-    print(f"Kanbanlan configured for {repository} and Project {project_owner}/{project_number}.")
+    success(f"Kanbanlan configured for {repository} and Project {project_owner}/{project_number}.")
+    print("Next: run 'kanbanlan doctor' to verify the setup, then 'kanbanlan next'.")
     return 0
 
 
@@ -369,7 +612,8 @@ def _choose_project(
             title = _prompt_text("New Project title", default=title)
         return ProjectChoice(mode="create", title=title)
 
-    projects = github.list_projects(owner)
+    with status(f"Loading Projects owned by {owner}"):
+        projects = github.list_projects(owner)
     if args.non_interactive:
         if len(projects) == 1:
             return ProjectChoice(mode="existing", number=int(projects[0]["number"]))
@@ -378,45 +622,42 @@ def _choose_project(
             "or --template-project in non-interactive mode"
         )
 
-    print("\nGitHub Project")
-    print(f"Available Projects owned by {owner}:")
-    for project in projects:
-        print(f"  {project['number']}: {project['title']}")
-    if not projects:
-        print("  No Projects found.")
-    print("  new: create an empty Project")
-    print("  copy: copy a template Project")
-    default = str(projects[0]["number"]) if projects else "new"
-    while True:
-        response = _prompt_text("Project number, 'new', or 'copy'", default=default)
-        if response.lower() == "new":
-            title = _prompt_text("New Project title", default=title)
-            return ProjectChoice(mode="create", title=title)
-        if response.lower() == "copy":
-            while True:
-                try:
-                    source_owner, source_number = _parse_template(
-                        _prompt_text("Template Project (OWNER/NUMBER)")
-                    )
-                    break
-                except RuntimeError as exc:
-                    print(exc)
-            title = _prompt_text("New Project title", default=title)
-            return ProjectChoice(
-                mode="copy",
-                template_owner=source_owner,
-                template_number=source_number,
-                title=title,
-            )
-        try:
-            number = int(response)
-        except ValueError:
-            print("Enter a Project number, 'new', or 'copy'.")
-            continue
-        if number < 1:
-            print("Project number must be positive.")
-            continue
-        return ProjectChoice(mode="existing", number=number)
+    section("2 of 3 · GitHub Project")
+    options = [
+        PromptChoice(
+            key=f"project:{project['number']}",
+            label=str(project["title"]),
+            detail=f"existing Project #{project['number']}",
+        )
+        for project in projects
+    ]
+    options.extend(
+        [
+            PromptChoice("new", "Create a new Project", "empty board"),
+            PromptChoice("copy", "Copy a template Project", "includes template views"),
+        ]
+    )
+    selected = _prompt_choice("Choose a Project", options)
+    if selected.key == "new":
+        title = _prompt_text("New Project title", default=title)
+        return ProjectChoice(mode="create", title=title)
+    if selected.key == "copy":
+        while True:
+            try:
+                source_owner, source_number = _parse_template(
+                    _prompt_text("Template Project (OWNER/NUMBER)")
+                )
+                break
+            except RuntimeError as exc:
+                warning(str(exc))
+        title = _prompt_text("New Project title", default=title)
+        return ProjectChoice(
+            mode="copy",
+            template_owner=source_owner,
+            template_number=source_number,
+            title=title,
+        )
+    return ProjectChoice(mode="existing", number=int(selected.key.removeprefix("project:")))
 
 
 def _materialize_project(github: GitHub, choice: ProjectChoice, owner: str) -> int:
@@ -444,7 +685,7 @@ def _prompt_text(
     suffix = f" [{default}]" if default else ""
     while True:
         try:
-            response = input(f"{label}{suffix}: ").strip()
+            response = input(f"{style(label, BOLD)}{style(suffix, DIM)}: ").strip()
         except EOFError as exc:
             raise RuntimeError(
                 "interactive setup requires terminal input; rerun with --non-interactive"
@@ -452,7 +693,38 @@ def _prompt_text(
         value = response if response else default
         if value is not None and (value or not required):
             return value
-        print(f"{label} is required.")
+        warning(f"{label} is required.")
+
+
+def _prompt_choice(
+    label: str,
+    choices: list[PromptChoice],
+    *,
+    default: int = 0,
+) -> PromptChoice:
+    if not choices:
+        raise RuntimeError("no choices are available")
+    if default < 0 or default >= len(choices):
+        raise ValueError("default choice is out of range")
+
+    print(f"{label}:")
+    for index, choice in enumerate(choices, start=1):
+        marker = style(f"[{index}]", CYAN, BOLD)
+        detail = f" — {style(choice.detail, DIM)}" if choice.detail else ""
+        print(f"  {marker} {choice.label}{detail}")
+
+    by_key = {choice.key.casefold(): choice for choice in choices}
+    while True:
+        response = _prompt_text("Selection", default=str(default + 1)).casefold()
+        if response in by_key:
+            return by_key[response]
+        try:
+            selected = int(response)
+        except ValueError:
+            selected = 0
+        if 1 <= selected <= len(choices):
+            return choices[selected - 1]
+        warning(f"Choose a number from 1 to {len(choices)}.")
 
 
 def _prompt_bool(label: str, *, default: bool) -> bool:
@@ -470,7 +742,7 @@ def _prompt_bool(label: str, *, default: bool) -> bool:
             return True
         if response in {"n", "no"}:
             return False
-        print("Please answer yes or no.")
+        warning("Please answer yes or no.")
 
 
 def _print_init_summary(plan: InitPlan) -> None:
@@ -483,15 +755,15 @@ def _print_init_summary(plan: InitPlan) -> None:
         project_summary = (
             f"copy {project.template_owner}/{project.template_number} as {project.title!r}"
         )
-    print("\nSetup summary")
-    print(f"  Repository: {plan.repository}")
-    print(f"  Project: {plan.project_owner} ({plan.project_owner_type}); {project_summary}")
-    print(f"  Pull request target: {plan.default_branch}")
-    print(f"  Staging branch: {plan.stage_branch}")
-    print(f"  Production branch: {plan.production_branch or '(not configured)'}")
-    print(f"  Reconcile open issues: {'yes' if plan.reconcile else 'no'}")
+    section("Review setup")
+    field("Repository", plan.repository)
+    field("Project", f"{plan.project_owner} ({plan.project_owner_type}); {project_summary}")
+    field("Pull request target", plan.default_branch)
+    field("Staging branch", plan.stage_branch)
+    field("Production branch", plan.production_branch or "not configured")
+    field("Reconcile open issues", "yes" if plan.reconcile else "no")
     if not plan.local_only:
-        print(f"  Open Project after setup: {'yes' if plan.open_project else 'no'}")
+        field("Open Project after setup", "yes" if plan.open_project else "no")
 
 
 def _parse_template(value: str) -> tuple[str, int]:
@@ -523,27 +795,47 @@ def _cmd_auth(args: argparse.Namespace) -> int:
         owner_type=config.project_owner_type,
         interactive=True,
     )
-    print("GitHub authentication and Project scope are ready.")
+    success("GitHub authentication and Project scope are ready.")
+    return 0
+
+
+def _cmd_upgrade(args: argparse.Namespace) -> int:
+    if shutil.which("uv") is None:
+        raise RuntimeError(
+            "uv is required to upgrade Kanbanlan; install it from https://docs.astral.sh/uv/"
+        )
+    try:
+        with status("Upgrading Kanbanlan"):
+            Runner().run(["uv", "tool", "upgrade", "kanbanlan"], capture=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "uv is required to upgrade Kanbanlan; install it from https://docs.astral.sh/uv/"
+        ) from exc
+    success("Kanbanlan upgrade complete.")
+    print("Run 'kanbanlan --version' to verify the installed version.")
     return 0
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     root, config, github, store = _context(args)
     failures: list[str] = []
-    print(f"config: {root / '.kanbanlan.toml'}")
-    print(f"repository: {config.repository}")
-    print(f"project: {config.project_owner}/{config.project_number}")
+    heading("Kanbanlan doctor")
+    field("Config", root / ".kanbanlan.toml")
+    field("Repository", config.repository)
+    field("Project", f"{config.project_owner}/{config.project_number}")
 
-    auth = github.runner.run(
-        ["gh", "auth", "status", "--active", "--hostname", config.hostname],
-        check=False,
-    )
+    with status("Checking GitHub authentication"):
+        auth = github.runner.run(
+            ["gh", "auth", "status", "--active", "--hostname", config.hostname],
+            check=False,
+        )
     if auth.returncode:
         failures.append("GitHub authentication is unavailable; run 'kanbanlan auth'")
     else:
-        print("auth: ok")
+        success("GitHub authentication")
         try:
-            project = github.project_metadata()
+            with status("Checking Project Status field"):
+                project = github.project_metadata()
             names = {
                 option["name"]
                 for field in project.get("fields", {}).get("nodes", [])
@@ -554,64 +846,86 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             if missing:
                 failures.append(f"Project Status options missing: {', '.join(sorted(missing))}")
             else:
-                print("Project Status field: ok")
-            labels = github.runner.json(
-                [
-                    "gh",
-                    "label",
-                    "list",
-                    "--repo",
-                    config.repository,
-                    "--limit",
-                    "200",
-                    "--json",
-                    "name",
-                ]
-            )
+                success("Project Status field")
+            with status("Checking repository workflow labels"):
+                labels = github.runner.json(
+                    [
+                        "gh",
+                        "label",
+                        "list",
+                        "--repo",
+                        config.repository,
+                        "--limit",
+                        "200",
+                        "--json",
+                        "name",
+                    ]
+                )
             names = {value["name"] for value in labels}
             missing_labels = (set(STATUS_LABELS) | set(PRIORITY_LABELS)) - names
             if missing_labels:
                 failures.append(f"labels missing: {', '.join(sorted(missing_labels))}")
             else:
-                print("workflow labels: ok")
+                success("Repository workflow labels")
         except (CommandError, RuntimeError) as exc:
             failures.append(str(exc))
-    print(f"cache: {store.inspect()['snapshot_state']} ({store.snapshot_path})")
+    cache_state = store.inspect()["snapshot_state"]
+    field("Cache", f"{status_value(cache_state)} ({store.snapshot_path})")
     if failures:
         for failure in failures:
-            print(f"FAIL: {failure}")
+            warning(failure)
+        print("Run 'kanbanlan auth' for access problems or 'kanbanlan init' to repair setup.")
         return 1
-    print("doctor: all checks passed")
+    success("All checks passed")
     return 0
 
 
 def _cmd_ensure(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    store.ensure(github)
+    _, _, provider, store = _context(args)
+    with status("Ensuring the shared board snapshot is fresh"):
+        snapshot = store.ensure(provider)
+    if _emit_result(
+        args,
+        {"snapshot_path": str(store.snapshot_path), "generated_at": snapshot["generated_at"]},
+    ):
+        return 0
     print(store.snapshot_path)
     return 0
 
 
 def _cmd_refresh(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.refresh(github)
+    _, _, provider, store = _context(args)
+    with status("Refreshing the shared board snapshot"):
+        snapshot = store.refresh(provider)
+    if _emit_result(
+        args,
+        {"snapshot_path": str(store.snapshot_path), "generated_at": snapshot["generated_at"]},
+    ):
+        return 0
     print(f"refreshed {store.snapshot_path} at {snapshot['generated_at']}")
     return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
     _, _, _, store = _context(args)
-    status = store.inspect()
-    print(f"snapshot: {status['snapshot_state']}")
-    if status["generated_at"]:
-        print(f"generated: {status['generated_at']} ({status['age_seconds']:.0f}s ago)")
-    counts = status["status_counts"]
-    print("board:", ", ".join(f"{name}={count}" for name, count in counts.items()) or "empty")
-    next_ready = status["next_ready"]
+    inspection = store.inspect()
+    if _emit_result(args, inspection):
+        return 0
+    heading("Kanbanlan status")
+    field("Snapshot", status_value(inspection["snapshot_state"]))
+    if inspection["generated_at"]:
+        field(
+            "Generated",
+            f"{inspection['generated_at']} ({inspection['age_seconds']:.0f}s ago)",
+        )
+    counts = inspection["status_counts"]
+    board = ", ".join(f"{status_value(name)}={count}" for name, count in counts.items()) or "empty"
+    field("Board", board)
+    next_ready = inspection["next_ready"]
     if next_ready:
-        print(f"next: #{next_ready['number']} {next_ready['title']}")
-    if status["error"]:
-        print(f"last error: {status['error']['kind']}: {status['error']['message']}")
+        field("Next", f"{request_label(next_ready)} {next_ready['title']}")
+    if inspection["error"]:
+        warning(f"Last refresh: {inspection['error']['kind']}: {inspection['error']['message']}")
     return 0
 
 
@@ -627,115 +941,169 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
 
 def _cmd_path(args: argparse.Namespace) -> int:
     _, _, _, store = _context(args)
+    if _emit_result(args, {"snapshot_path": str(store.snapshot_path)}):
+        return 0
     print(store.snapshot_path)
     return 0
 
 
 def _cmd_next(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.ensure(github)
+    _, _, provider, store = _context(args)
+    with status("Finding the next unblocked Ready card"):
+        snapshot = store.ensure(provider)
     item = snapshot.get("next_ready")
     if not item:
+        if _emit_result(args, {"request": None}):
+            return 0
         print("No unblocked Ready card is available.")
         return 0
+    if _emit_result(args, {"request": item}):
+        return 0
     priority = item.get("priority") or "unprioritized"
-    print(f"#{item['number']} [{priority}] {item['title']}")
+    print(f"{request_label(item)} [{priority_value(priority)}] {item['title']}")
     print(item["url"])
     return 0
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.refresh(github)
-    open_issues = github.open_issues()
+    _, _, provider, store = _context(args)
+    with status("Loading current Project and issue state"):
+        snapshot = store.refresh(provider)
+        open_issues = provider.list_open_requests()
     drift = plan_reconciliation(snapshot, open_issues)
     if not drift:
-        print("GitHub Issues and Project Status are reconciled.")
+        if _emit_result(args, {"applied": False, "drift": [], "remaining": []}):
+            return 0
+        success("GitHub Issues and Project Status are reconciled.")
         return 0
+    drift_payload = [asdict(value) for value in drift]
+    if args.json_output and not args.apply:
+        _emit_result(args, {"applied": False, "drift": drift_payload, "remaining": drift_payload})
+        return 2
     for value in drift:
         print(format_drift(value))
     if not args.apply:
-        print(f"{len(drift)} difference(s); rerun with --apply to repair them.")
+        warning(f"{len(drift)} difference(s); rerun with --apply to repair them.")
         return 2
-    remaining, _ = apply_reconciliation(github, store, snapshot, open_issues)
+    with status(f"Applying {len(drift)} reconciliation repair(s)"):
+        remaining, _ = apply_reconciliation(provider, store, snapshot, open_issues)
+    if args.json_output:
+        _emit_result(
+            args,
+            {
+                "applied": True,
+                "drift": drift_payload,
+                "remaining": [asdict(value) for value in remaining],
+            },
+        )
+        return 1 if remaining else 0
     if remaining:
         for value in remaining:
             print(f"remaining: {format_drift(value)}")
         return 1
-    print("Reconciliation applied and verified.")
+    success("Reconciliation applied and verified.")
     return 0
 
 
 def _cmd_capture(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
+    _, _, provider, store = _context(args)
+    kanbanlan_id = new_kanbanlan_id()
     body = args.body or (
         "## Outcome\n\n"
         "<!-- Describe the independently reviewable result. -->\n\n"
         "## Acceptance criteria\n\n- [ ] "
     )
-    url = github.create_issue(args.title, body, args.priority)
-    github.add_issue_to_project(url)
-    snapshot = store.refresh(github)
-    remaining, _ = apply_reconciliation(
-        github,
-        store,
-        snapshot,
-        github.open_issues(),
-    )
+    body = attach_kanbanlan_id(body, kanbanlan_id)
+    with status("Creating Inbox issue"):
+        url = provider.create_request(args.title, body, args.priority)
+    try:
+        with status("Adding issue to the configured Project"):
+            provider.add_to_projection(url)
+        with status("Reconciling initial issue state"):
+            snapshot = store.refresh(provider)
+            remaining, _ = apply_reconciliation(
+                provider,
+                store,
+                snapshot,
+                provider.list_open_requests(),
+            )
+    except (CommandError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"the issue was created at {url}, but Project setup failed: {exc}"
+        ) from exc
     if remaining:
         raise RuntimeError("the issue was created but its Project state did not reconcile")
+    if _emit_result(args, {"kanbanlan_id": kanbanlan_id, "url": url}):
+        return 0
+    print(f"Kanbanlan: {kanbanlan_id}")
     print(url)
     return 0
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    root, config, github, store = _context(args)
-    snapshot = store.refresh(github)
+    root, config, provider, store = _context(args)
+    with status(f"Checking request {args.issue}"):
+        snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
     if item.get("state") != "OPEN":
-        raise RuntimeError(f"issue #{args.issue} is not open")
+        raise RuntimeError(f"request {label} is not open")
     if item.get("status") != "Ready":
-        raise RuntimeError(f"issue #{args.issue} is {item.get('status')!r}, not Ready")
+        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Ready")
     if item.get("active_claim"):
-        raise RuntimeError(f"issue #{args.issue} already has an active claim")
+        raise RuntimeError(f"request {label} already has an active claim")
 
     session = args.session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
     branch, worktree = _claim_checkout(args, root, config, item)
     timestamp = _utc_timestamp()
-    github.comment_issue(
-        args.issue,
-        (
-            f"CLAIM: {timestamp}\n"
-            f"Session: {session}\n"
-            f"Branch: {branch}\n"
-            f"Worktree: {worktree}\n"
-            f"Touchpoints: {args.touchpoints}"
-        ),
-    )
-    refreshed = store.refresh(github)
-    claimed = _issue(refreshed, args.issue).get("active_claim") or {}
+    with status(f"Posting claim for {label}"):
+        provider.comment_request(
+            number,
+            (
+                f"CLAIM: {timestamp}\n"
+                f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
+                f"Session: {session}\n"
+                f"Branch: {branch}\n"
+                f"Worktree: {worktree}\n"
+                f"Touchpoints: {args.touchpoints}"
+            ),
+        )
+        refreshed = store.refresh(provider)
+    claimed = _issue(refreshed, number).get("active_claim") or {}
     if claimed.get("session") != session:
-        github.comment_issue(
-            args.issue,
+        provider.comment_request(
+            number,
             (f"RELEASED: {_utc_timestamp()} — concurrent claim lost\nSession: {session}"),
         )
         owner = claimed.get("session") or "another session"
-        raise RuntimeError(f"issue #{args.issue} was claimed first by {owner}")
+        raise RuntimeError(f"request {label} was claimed first by {owner}")
 
-    _set_state(github, refreshed, args.issue, "status:in-progress", "In progress")
+    with status("Moving request to In progress"):
+        _set_state(provider, refreshed, number, "status:in-progress", "In progress")
     try:
         if not args.no_worktree:
-            _create_worktree(root, config, branch, Path(worktree))
+            with status(f"Creating worktree {worktree}"):
+                _create_worktree(root, config, branch, Path(worktree))
     except Exception:
-        github.comment_issue(
-            args.issue,
+        provider.comment_request(
+            number,
             (f"RELEASED: {_utc_timestamp()} — worktree creation failed\nSession: {session}"),
         )
-        latest = store.refresh(github)
-        _set_state(github, latest, args.issue, "status:ready", "Ready")
+        latest = store.refresh(provider)
+        _set_state(provider, latest, number, "status:ready", "Ready")
         raise
-    store.refresh(github)
-    print(f"claimed #{args.issue} as {session}")
+    store.refresh(provider)
+    result = {
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "provider_ref": item.get("provider_ref"),
+        "session": session,
+        "branch": branch,
+        "worktree": worktree,
+    }
+    if _emit_result(args, result):
+        return 0
+    success(f"Claimed {label} as {session}")
     print(f"branch: {branch}")
     print(f"worktree: {worktree}")
     return 0
@@ -755,13 +1123,14 @@ def _claim_checkout(
         return branch, str(Path(args.worktree).resolve() if args.worktree else root)
 
     slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:48]
-    branch = args.branch or f"work/{item['number']}-{slug or 'request'}"
+    identity = (item.get("kanbanlan_id") or str(item["number"])).lower()
+    branch = args.branch or f"work/{identity}-{slug or 'request'}"
     common = Path(
         runner.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]
         ).stdout.strip()
     ).resolve()
-    default_worktree = common.parent / ".worktrees" / f"{item['number']}-{slug or 'request'}"
+    default_worktree = common.parent / ".worktrees" / f"{identity}-{slug or 'request'}"
     worktree = Path(args.worktree).resolve() if args.worktree else default_worktree
     if worktree.exists():
         raise RuntimeError(f"worktree path already exists: {worktree}")
@@ -794,89 +1163,122 @@ def _create_worktree(root: Path, config: Config, branch: str, worktree: Path) ->
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.refresh(github)
+    _, _, provider, store = _context(args)
+    with status(f"Checking active claim for request {args.issue}"):
+        snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
     claim = item.get("active_claim")
     if not claim:
-        raise RuntimeError(f"issue #{args.issue} has no active claim")
+        raise RuntimeError(f"request {label} has no active claim")
     session = claim.get("session") or "unknown"
-    github.comment_issue(
-        args.issue,
-        (f"RELEASED: {_utc_timestamp()} — {args.reason}\nSession: {session}"),
-    )
-    latest = store.refresh(github)
-    if args.blocked:
-        _set_state(github, latest, args.issue, "status:blocked", "Blocked")
-    else:
-        _set_state(github, latest, args.issue, "status:ready", "Ready")
-    store.refresh(github)
-    print(f"released #{args.issue} from {session}")
+    destination = "Blocked" if args.blocked else "Ready"
+    with status(f"Releasing claim and moving request to {destination}"):
+        provider.comment_request(
+            number,
+            (f"RELEASED: {_utc_timestamp()} — {args.reason}\nSession: {session}"),
+        )
+        latest = store.refresh(provider)
+        if args.blocked:
+            _set_state(provider, latest, number, "status:blocked", "Blocked")
+        else:
+            _set_state(provider, latest, number, "status:ready", "Ready")
+        store.refresh(provider)
+    if _emit_result(
+        args,
+        {"kanbanlan_id": item.get("kanbanlan_id"), "session": session, "status": destination},
+    ):
+        return 0
+    success(f"Released {label} from {session}")
     return 0
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.refresh(github)
+    _, _, provider, store = _context(args)
+    with status(f"Checking pull requests for request {args.issue}"):
+        snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
     if not item.get("linked_open_pull_requests"):
-        raise RuntimeError(f"issue #{args.issue} has no linked open pull request")
-    _set_state(github, snapshot, args.issue, "status:review", "In review")
-    store.refresh(github)
-    print(f"moved #{args.issue} to In review")
+        raise RuntimeError(f"request {label} has no linked open pull request")
+    with status("Moving request to In review"):
+        _set_state(provider, snapshot, number, "status:review", "In review")
+        store.refresh(provider)
+    if _emit_result(args, {"kanbanlan_id": item.get("kanbanlan_id"), "status": "In review"}):
+        return 0
+    success(f"Moved {label} to In review")
     return 0
 
 
 def _cmd_handoff(args: argparse.Namespace) -> int:
-    _, _, github, store = _context(args)
-    snapshot = store.refresh(github)
+    _, _, provider, store = _context(args)
+    with status(f"Checking active claim for request {args.issue}"):
+        snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
     if not item.get("active_claim"):
-        raise RuntimeError(f"issue #{args.issue} has no active claim")
-    github.comment_issue(
-        args.issue,
-        (
-            f"HANDOFF: {_utc_timestamp()} — {args.reason}\n"
-            f"Session: {args.session}\n"
-            f"Branch: {args.branch}\n"
-            f"Worktree: {Path(args.worktree).resolve()}"
-        ),
-    )
-    refreshed = store.refresh(github)
-    _set_state(github, refreshed, args.issue, "status:in-progress", "In progress")
-    store.refresh(github)
-    print(f"handed off #{args.issue} to {args.session}")
+        raise RuntimeError(f"request {label} has no active claim")
+    with status(f"Handing off {label} to {args.session}"):
+        provider.comment_request(
+            number,
+            (
+                f"HANDOFF: {_utc_timestamp()} — {args.reason}\n"
+                f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
+                f"Session: {args.session}\n"
+                f"Branch: {args.branch}\n"
+                f"Worktree: {Path(args.worktree).resolve()}"
+            ),
+        )
+        refreshed = store.refresh(provider)
+        _set_state(provider, refreshed, number, "status:in-progress", "In progress")
+        store.refresh(provider)
+    if _emit_result(
+        args,
+        {"kanbanlan_id": item.get("kanbanlan_id"), "session": args.session},
+    ):
+        return 0
+    success(f"Handed off {label} to {args.session}")
+    return 0
+
+
+def _cmd_record(args: argparse.Namespace) -> int:
+    root, _, provider, store = _context(args)
+    with status(f"Loading request {args.request}"):
+        snapshot = store.ensure(provider)
+    item = _issue(snapshot, args.request)
+    result = create_record(root, item)
+    payload = {
+        "action": result.action,
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "path": str(result.path),
+    }
+    if _emit_result(args, payload):
+        return 0
+    print(f"{result.action}: {result.path.relative_to(root)}")
     return 0
 
 
 def _set_state(
-    github: GitHub,
+    provider: CoordinationProvider,
     snapshot: dict[str, Any],
-    issue_number: int,
+    reference: int | str,
     label: str,
     status: str,
 ) -> None:
-    item = _issue(snapshot, issue_number)
-    github.set_issue_status_label(issue_number, label)
-    github.set_project_status(
+    item = _issue(snapshot, reference)
+    provider.set_request_status(item["number"], label)
+    provider.set_projection_status(
         item["project_item_id"],
         snapshot["project"],
         status,
     )
 
 
-def _issue(snapshot: dict[str, Any], number: int) -> dict[str, Any]:
-    item = next(
-        (
-            value
-            for value in snapshot.get("items", [])
-            if value.get("type") == "ISSUE" and value.get("number") == number
-        ),
-        None,
-    )
-    if not item:
-        raise RuntimeError(f"issue #{number} is not on the configured Project")
-    return item
+def _issue(snapshot: dict[str, Any], reference: int | str) -> dict[str, Any]:
+    return resolve_request_item(snapshot, reference)
 
 
 def _utc_timestamp() -> str:
