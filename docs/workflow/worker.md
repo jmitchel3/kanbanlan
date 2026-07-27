@@ -27,8 +27,10 @@ through `GH_HOST` and `GH_TOKEN`.
 
 ## macOS LaunchAgent
 
-Create `~/Library/LaunchAgents/com.kanbanlan.worker.plist`, replacing the
-Python path with the active installation:
+Create `/Users/YOU/Library/LaunchAgents/com.kanbanlan.worker.plist`, replacing
+`YOU` and the executable path with the values reported by `id -un` and
+`command -v kanbanlan`. Launchd does not expand `~` or use an interactive shell
+PATH in these fields.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36,17 +38,19 @@ Python path with the active installation:
 <plist version="1.0"><dict>
   <key>Label</key><string>com.kanbanlan.worker</string>
   <key>ProgramArguments</key>
-  <array><string>/usr/bin/env</string><string>kanbanlan</string><string>worker</string><string>run</string></array>
+  <array><string>/Users/YOU/.local/bin/kanbanlan</string><string>worker</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>~/Library/Logs/kanbanlan-worker.log</string>
-  <key>StandardErrorPath</key><string>~/Library/Logs/kanbanlan-worker.log</string>
+  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/kanbanlan-worker.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/kanbanlan-worker.log</string>
 </dict></plist>
 ```
 
-Load or unload it with `launchctl bootstrap gui/$(id -u)` and
-`launchctl bootout gui/$(id -u)`, then inspect health with
-`kanbanlan worker status`.
+Load it with
+`launchctl bootstrap gui/$(id -u) /Users/YOU/Library/LaunchAgents/com.kanbanlan.worker.plist`
+and unload it with
+`launchctl bootout gui/$(id -u) /Users/YOU/Library/LaunchAgents/com.kanbanlan.worker.plist`,
+then inspect health with `kanbanlan worker status`.
 
 ## Linux systemd user service
 

@@ -16,7 +16,9 @@ from kanbanlan.cli import (
     _activate_worker,
     _choose_project,
     _cmd_init,
+    _cmd_reconcile,
     _cmd_upgrade,
+    _cmd_worker,
     _materialize_project,
     _parse_template,
     _project_number,
@@ -27,6 +29,7 @@ from kanbanlan.cli import (
 )
 from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, CommandResult
+from kanbanlan.workflow import Drift
 
 
 class CliTests(unittest.TestCase):
@@ -57,10 +60,84 @@ class CliTests(unittest.TestCase):
             with (
                 mock.patch.dict("os.environ", {"KANBANLAN_STATE_DIR": str(state)}),
                 mock.patch("kanbanlan.cli.common_dir", return_value=common),
+                mock.patch("kanbanlan.cli.primary_worktree") as primary_worktree,
                 mock.patch("kanbanlan.cli.start_worker") as start,
             ):
                 _activate_worker(root, config)
             start.assert_not_called()
+            primary_worktree.assert_not_called()
+
+    def test_activation_registers_the_primary_worktree_and_starts_one_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            linked = Path(directory) / "linked"
+            primary = Path(directory) / "primary"
+            common = primary / ".git"
+            primary.mkdir()
+            config = mock.Mock(hostname="github.com", repository="acme/repo")
+            with (
+                mock.patch.dict("os.environ", {"KANBANLAN_STATE_DIR": str(state)}),
+                mock.patch("kanbanlan.cli.common_dir", return_value=common),
+                mock.patch("kanbanlan.cli.primary_worktree", return_value=primary),
+                mock.patch("kanbanlan.cli._discover_github_login", return_value="alice"),
+                mock.patch("kanbanlan.cli.start_worker") as start,
+            ):
+                _activate_worker(linked, config)
+
+            registration = RegistryStore(state).registrations()[0]
+            self.assertEqual(str(primary.resolve()), registration.root)
+            self.assertEqual("alice", registration.github_login)
+            start.assert_called_once()
+
+    def test_worker_disable_creates_a_tombstone_before_first_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = Path(directory) / "repo"
+            common = root / ".git"
+            root.mkdir()
+            config = mock.Mock(hostname="github.com", repository="acme/repo")
+            args = build_parser().parse_args(["worker", "disable"])
+            with (
+                mock.patch.dict("os.environ", {"KANBANLAN_STATE_DIR": str(state)}),
+                mock.patch(
+                    "kanbanlan.cli._context", return_value=(root, config, mock.Mock(), mock.Mock())
+                ),
+                mock.patch("kanbanlan.cli.common_dir", return_value=common),
+                mock.patch("kanbanlan.cli.primary_worktree", return_value=root),
+                mock.patch("kanbanlan.cli.worker_status", return_value={"worker": {}}),
+            ):
+                self.assertEqual(0, _cmd_worker(args))
+
+            registration = RegistryStore(state).registrations()[0]
+            self.assertFalse(registration.enabled)
+            self.assertTrue(registration.disabled)
+
+    def test_successful_reconcile_activates_worker_but_preview_drift_does_not(self) -> None:
+        root = Path("/tmp/kanbanlan-reconcile-activation")
+        config = mock.Mock()
+        provider = mock.Mock()
+        provider.list_open_requests.return_value = []
+        store = mock.Mock()
+        store.refresh.return_value = {"items": []}
+        args = build_parser().parse_args(["reconcile"])
+        with (
+            mock.patch("kanbanlan.cli._context", return_value=(root, config, provider, store)),
+            mock.patch("kanbanlan.cli._root", return_value=root),
+            mock.patch("kanbanlan.cli.Config.load", return_value=config),
+            mock.patch("kanbanlan.cli.plan_reconciliation", return_value=[]),
+            mock.patch("kanbanlan.cli._activate_worker") as activate,
+        ):
+            self.assertEqual(0, _cmd_reconcile(args))
+        activate.assert_called_once_with(root, config)
+
+        drift = Drift("set_request_status", 1, "status:intake", "status:ready", "test")
+        with (
+            mock.patch("kanbanlan.cli._context", return_value=(root, config, provider, store)),
+            mock.patch("kanbanlan.cli.plan_reconciliation", return_value=[drift]),
+            mock.patch("kanbanlan.cli._activate_worker") as activate,
+        ):
+            self.assertEqual(2, _cmd_reconcile(args))
+        activate.assert_not_called()
 
     def test_version_comes_from_package_metadata(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -431,6 +508,7 @@ class CliTests(unittest.TestCase):
             mock.patch("kanbanlan.cli.scaffold_repository", return_value=[]),
             mock.patch("kanbanlan.cli.cache_dir", return_value=root / ".cache"),
             mock.patch("kanbanlan.cli.CacheStore", return_value=store),
+            mock.patch("kanbanlan.cli._activate_worker") as activate,
         ):
             self.assertEqual(0, _cmd_init(args))
 
@@ -442,3 +520,43 @@ class CliTests(unittest.TestCase):
         )
         github.link_project.assert_called_once_with()
         github.create_project.assert_not_called()
+        activate.assert_not_called()
+
+    def test_successful_live_init_activates_worker(self) -> None:
+        root = Path("/tmp/kanbanlan-live-init-test")
+        github = mock.Mock()
+        github.repository_info.return_value = {
+            "owner": {"login": "acme"},
+            "defaultBranchRef": {"name": "main"},
+        }
+        github.copy_project.return_value = {"number": 8}
+        github.ensure_status_options.return_value = False
+        store = mock.Mock()
+        store.refresh.return_value = {"items": []}
+        args = build_parser().parse_args(
+            [
+                "init",
+                "--repository",
+                "acme/widget",
+                "--owner-type",
+                "organization",
+                "--non-interactive",
+                "--no-open",
+            ]
+        )
+
+        with (
+            mock.patch("kanbanlan.cli._root", return_value=root),
+            mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
+            mock.patch("kanbanlan.cli.GitHub", return_value=github),
+            mock.patch("kanbanlan.cli.scaffold_repository", return_value=[]),
+            mock.patch("kanbanlan.cli.cache_dir", return_value=root / ".cache"),
+            mock.patch("kanbanlan.cli.CacheStore", return_value=store),
+            mock.patch("kanbanlan.cli.plan_reconciliation", return_value=[]),
+            mock.patch("kanbanlan.cli._activate_worker") as activate,
+        ):
+            self.assertEqual(0, _cmd_init(args))
+
+        activate.assert_called_once()
+        self.assertEqual(root, activate.call_args.args[0])
+        self.assertEqual("acme/widget", activate.call_args.args[1].repository)

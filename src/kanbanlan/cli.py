@@ -20,6 +20,7 @@ from kanbanlan.config import (
     discover_default_branch,
     discover_repository,
     find_repo_root,
+    primary_worktree,
 )
 from kanbanlan.domain import request_label, resolve_request_item
 from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
@@ -1067,12 +1068,13 @@ def _activate_worker(root: Path, config: Config, *, github_login: str | None = N
     existing = registry.get(str(key))
     if existing and existing.disabled:
         return
+    stable_root = primary_worktree(root)
     login = github_login or (existing.github_login if existing else None)
     if login is None:
         login = _discover_github_login(root, config.hostname)
     registration = registry.register(
         common_dir=key,
-        root=root,
+        root=stable_root,
         repository=config.repository,
         hostname=config.hostname,
         github_login=login,
@@ -1092,11 +1094,12 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     if args.action in {"enable", "disable"}:
         root, config, _, _ = _context(args)
         key = common_dir(root)
+        stable_root = primary_worktree(root)
         if args.action == "enable":
             login = args.github_login or _discover_github_login(root, config.hostname)
             registry.register(
                 common_dir=key,
-                root=root,
+                root=stable_root,
                 repository=config.repository,
                 hostname=config.hostname,
                 github_login=login,
@@ -1105,6 +1108,15 @@ def _cmd_worker(args: argparse.Namespace) -> int:
             registry.enable(key)
             payload = start_worker(registry, interval_seconds=args.interval)
         else:
+            if registry.get(str(key)) is None:
+                registry.register(
+                    common_dir=key,
+                    root=stable_root,
+                    repository=config.repository,
+                    hostname=config.hostname,
+                    github_login=None,
+                    interval_seconds=args.interval,
+                )
             registry.disable(key)
             payload = worker_status(registry)
         if _emit_result(args, payload):

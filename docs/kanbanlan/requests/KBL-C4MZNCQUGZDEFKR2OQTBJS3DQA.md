@@ -46,9 +46,14 @@ initialization, unresolved drift, and explicit disablement do not activate it.
   and account; each run resolves that account with `gh auth token --user` or a
   scoped token environment variable, then passes `GH_HOST` and `GH_TOKEN` only
   to its subprocesses.
-- A PID-aware worker lock prevents concurrent iterations and does not steal a
-  live process merely because a lock file is old. Per-repository refresh locks
-  continue to protect atomic snapshots.
+- An atomic, PID-aware process lock is held for the worker lifetime. Concurrent
+  starts reuse the live owner, stale locks are removed only after their owner is
+  gone, and per-repository refresh locks continue to protect atomic snapshots.
+- Registrations keep the stable primary checkout path when commands run from a
+  linked worktree. A deleted checkout can be replaced by a later valid root.
+- Ambient GitHub token variables are removed while resolving the registered
+  account with `gh auth token --user`; the selected credential is then scoped
+  only to that repository's subprocesses.
 - Duplicate identities and other unresolved unsafe drift are recorded as a
   health error and skipped rather than repeatedly applying unsafe mutations.
 - Backoff is 30 seconds doubled per failure and capped at one hour. Successful
@@ -56,15 +61,22 @@ initialization, unresolved drift, and explicit disablement do not activate it.
 
 ## Verification
 
-- `uv run pytest -q` — 82 tests and 4 subtests passed.
+- `uv run pytest -q` — 98 tests and 4 subtests passed.
 - `uv run ruff check .` — passed.
 - `uv run ruff format --check .` — all files formatted.
 - `git diff --check` — passed.
 - Registry tests cover atomic permissions, common-directory deduplication,
-  persistent disablement, and health round trips.
-- Worker tests cover PID locking, disabled repositories, scoped auth env,
-  success/reset behavior, failure/backoff health, and status output.
-- CLI tests cover worker lifecycle parsing and disablement activation gates.
+  stable primary roots, schema defaults, corruption handling, persistent
+  disablement, and health round trips.
+- Worker tests cover atomic process-lifetime locking, duplicate starts,
+  start/stop behavior, disabled repositories, scoped auth isolation,
+  scheduling, success/reset behavior, failure/backoff health, and status.
+- CLI tests cover worker lifecycle parsing, pre-activation disablement, and the
+  successful-init, successful-reconcile, unresolved-preview activation gates.
+- An isolated real-process smoke test verified start, status, duplicate-start
+  idempotence, and clean stop with one stable PID.
+- An isolated linked-worktree smoke test verified the linked and primary
+  checkouts produce one disabled registry entry rooted at the primary checkout.
 
 ## Delivered result
 
@@ -73,4 +85,6 @@ registry, worktree deduplication, scoped GitHub authentication, PID-aware
 locking, bounded retries, health reporting, lifecycle commands, activation
 gates, and macOS/Linux service documentation. The worker preserves last-good
 snapshots during transient failures and leaves unresolved unsafe drift for
-explicit operator review.
+explicit operator review. Its process lifecycle is single-owner and atomic,
+and registrations remain anchored to the primary checkout rather than a
+disposable linked worktree.

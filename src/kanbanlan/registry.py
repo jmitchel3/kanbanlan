@@ -48,11 +48,11 @@ class Registration:
         if not self.registered_at:
             self.registered_at = utc_now()
         self.enabled = bool(self.enabled and not self.disabled)
-        self.interval_seconds = max(30, int(self.interval_seconds))
+        self.interval_seconds = max(30, int(self.interval_seconds or 300))
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Registration:
-        fields = {field: value.get(field) for field in cls.__dataclass_fields__}
+        fields = {field: value[field] for field in cls.__dataclass_fields__ if field in value}
         return cls(**fields)
 
 
@@ -68,8 +68,10 @@ class RegistryStore:
         try:
             with self.path.open(encoding="utf-8") as stream:
                 value = json.load(stream)
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             value = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"could not read worker registry {self.path}: {exc}") from exc
         repositories = value.get("repositories", {}) if isinstance(value, dict) else {}
         return {
             "schema_version": REGISTRY_SCHEMA_VERSION,
@@ -94,13 +96,15 @@ class RegistryStore:
         interval_seconds: int = 300,
     ) -> Registration:
         key = str(common_dir.resolve())
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_directory()
         with FileLock(self.lock_path):
             data = self.load()
             existing = data["repositories"].get(key)
             if existing:
                 registration = Registration.from_dict(existing)
-                registration.root = str(root.resolve())
+                existing_root = Path(registration.root)
+                if not existing_root.exists():
+                    registration.root = str(root.resolve())
                 registration.repository = repository
                 registration.hostname = hostname
                 registration.github_login = github_login or registration.github_login
@@ -126,7 +130,7 @@ class RegistryStore:
 
     def update(self, registration: Registration) -> None:
         key = str(Path(registration.common_dir).resolve())
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_directory()
         with FileLock(self.lock_path):
             data = self.load()
             data["repositories"][key] = asdict(registration)
@@ -134,7 +138,7 @@ class RegistryStore:
 
     def _set_enabled(self, common_dir: Path, enabled: bool) -> Registration:
         key = str(common_dir.resolve())
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_directory()
         with FileLock(self.lock_path):
             data = self.load()
             value = data["repositories"].get(key)
@@ -148,7 +152,7 @@ class RegistryStore:
             return registration
 
     def _save(self, data: dict[str, Any]) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_directory()
         temporary: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -164,3 +168,10 @@ class RegistryStore:
         finally:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
+
+    def _prepare_directory(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.directory, 0o700)
+        except OSError:
+            pass
