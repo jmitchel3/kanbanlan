@@ -23,7 +23,9 @@ version, and changes since the latest release. Select a semantic version:
 
 If there is no published release, use the prepared project version when it is
 greater than any existing tag; otherwise choose the smallest suitable next
-version. Never reuse a version already present on PyPI.
+version. Never reuse a version once any artifact carrying it has escaped the
+repository, including a local build or tool installation, even when that
+version is not yet present on PyPI.
 
 ## Prepare
 

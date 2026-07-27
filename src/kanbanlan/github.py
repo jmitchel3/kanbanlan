@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from kanbanlan.config import Config
+from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
+from kanbanlan.providers import ProviderCapabilities
 from kanbanlan.runner import CommandError, CommandResult, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
+from kanbanlan.snapshot import build_snapshot
 
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!, $after: String) {
@@ -113,6 +117,7 @@ query($owner: String!, $repo: String!, $after: String) {
       nodes {
         number
         title
+        body
         url
         headRefName
         baseRefName
@@ -179,6 +184,9 @@ STATUS_ALIASES = {
 
 
 class GitHub:
+    provider_name = "github"
+    capabilities = ProviderCapabilities()
+
     def __init__(self, root: Path, config: Config | None = None, runner: Runner | None = None):
         self.root = root
         self.config = config
@@ -425,6 +433,16 @@ class GitHub:
         )
         return project, pull_requests, rate_limit
 
+    def snapshot(self, *, generated_at: datetime) -> dict[str, Any]:
+        project, pull_requests, rate_limit = self.fetch()
+        return build_snapshot(
+            self._config(),
+            project,
+            pull_requests,
+            rate_limit,
+            generated_at=generated_at,
+        )
+
     def _fetch_project(self) -> tuple[dict[str, Any], dict[str, Any]]:
         config = self._config()
         query = PROJECT_QUERY.replace(
@@ -506,6 +524,9 @@ class GitHub:
         )
         return payload
 
+    def list_open_requests(self) -> list[dict[str, Any]]:
+        return self.open_issues()
+
     def add_issue_to_project(self, url: str) -> dict[str, Any]:
         config = self._config()
         return self.runner.json(
@@ -522,6 +543,9 @@ class GitHub:
                 "json",
             ]
         )
+
+    def add_to_projection(self, url: str) -> dict[str, Any]:
+        return self.add_issue_to_project(url)
 
     def set_project_status(self, item_id: str, project: dict[str, Any], status: str) -> None:
         field = _status_field(project)
@@ -545,6 +569,14 @@ class GitHub:
                 option["id"],
             ]
         )
+
+    def set_projection_status(
+        self,
+        item_id: str,
+        projection: dict[str, Any],
+        status: str,
+    ) -> None:
+        self.set_project_status(item_id, projection, status)
 
     def set_issue_status_label(self, number: int, label: str | None) -> None:
         config = self._config()
@@ -582,6 +614,9 @@ class GitHub:
             args.extend(["--add-label", value])
         self.runner.run(args)
 
+    def set_request_status(self, reference: int | str, label: str | None) -> None:
+        self.set_issue_status_label(_issue_number(reference), label)
+
     def comment_issue(self, number: int, body: str) -> None:
         config = self._config()
         self.runner.run(
@@ -596,6 +631,9 @@ class GitHub:
                 body,
             ]
         )
+
+    def comment_request(self, reference: int | str, body: str) -> None:
+        self.comment_issue(_issue_number(reference), body)
 
     def create_issue(self, title: str, body: str, priority: str) -> str:
         config = self._config()
@@ -617,6 +655,47 @@ class GitHub:
             ]
         )
         return result.stdout.strip()
+
+    def create_request(self, title: str, body: str, priority: str) -> str:
+        return self.create_issue(title, body, priority)
+
+    def ensure_request_identity(
+        self,
+        reference: int | str,
+        kanbanlan_id: str,
+    ) -> str:
+        number = _issue_number(reference)
+        config = self._config()
+        payload = self.runner.json(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                config.repository,
+                "--json",
+                "body",
+            ]
+        )
+        body = payload.get("body") or ""
+        existing = extract_kanbanlan_id(body)
+        if existing:
+            return existing
+        updated = attach_kanbanlan_id(body, kanbanlan_id)
+        self.runner.run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                config.repository,
+                "--body",
+                updated,
+            ]
+        )
+        return kanbanlan_id
 
     def open_project(self) -> None:
         config = self._config()
@@ -644,6 +723,18 @@ def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
         if field and field.get("name") == "Status" and "options" in field:
             return field
     return None
+
+
+def _issue_number(reference: int | str) -> int:
+    try:
+        number = int(str(reference).removeprefix("#"))
+    except ValueError as exc:
+        raise RuntimeError(
+            f"GitHub request reference must be an issue number: {reference!r}"
+        ) from exc
+    if number < 1:
+        raise RuntimeError("GitHub issue number must be positive")
+    return number
 
 
 def _command_detail(result: CommandResult) -> str:

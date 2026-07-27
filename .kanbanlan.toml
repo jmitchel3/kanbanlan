@@ -1,0 +1,21 @@
+schema_version = 2
+
+[coordination]
+code_host = "github"
+canonical_home = "github"
+projections = ["github_projects"]
+
+[repository]
+name_with_owner = "jmitchel3/kanbanlan"
+hostname = "github.com"
+default_branch = "main"
+stage_branch = "main"
+production_branch = ""
+
+[project]
+owner = "jmitchel3"
+owner_type = "user"
+number = 2
+
+[local]
+stale_seconds = 180

@@ -44,3 +44,19 @@ class ConfigTests(unittest.TestCase):
 
         with mock.patch("kanbanlan.config.Runner", return_value=FakeRunner()):
             self.assertEqual("acme/widget", discover_repository(Path("/tmp")))
+
+    def test_malformed_config_has_repair_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".kanbanlan.toml").write_text("[project\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "could not read.*kanbanlan.toml"):
+                Config.load(root)
+
+    def test_incomplete_config_has_repair_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".kanbanlan.toml").write_text("schema_version = 1\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "rerun 'kanbanlan init'"):
+                Config.load(root)
