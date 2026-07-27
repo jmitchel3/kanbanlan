@@ -70,3 +70,9 @@ Pull requests target `main`, carry `Kanbanlan: KBL-...`, and use
 `Closes #<issue>` while GitHub is canonical. Merging moves the card to Done.
 Done means delivered to `main`, not production-ready. Production promotion
 remains a separate review after staging verification.
+
+Successful live setup can register the repository with the optional user-scoped
+worker. Manage it with `kanbanlan worker status`, `enable`, `disable`, `start`,
+and `stop`. The worker deduplicates worktrees, preserves last-good snapshots,
+uses bounded retry/backoff, and never stores GitHub tokens. See
+`docs/workflow/worker.md` for macOS and Linux service examples.

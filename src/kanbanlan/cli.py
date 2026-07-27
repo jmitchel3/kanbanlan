@@ -16,6 +16,7 @@ from kanbanlan import __version__
 from kanbanlan.config import (
     Config,
     cache_dir,
+    common_dir,
     discover_default_branch,
     discover_repository,
     find_repo_root,
@@ -25,6 +26,7 @@ from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
 from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id
 from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
+from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.snapshot import CacheStore
@@ -46,6 +48,7 @@ from kanbanlan.ui import (
     warning,
 )
 from kanbanlan.updates import notify_if_update_available
+from kanbanlan.worker import Worker, start_worker, stop_worker, worker_status
 from kanbanlan.workflow import (
     apply_reconciliation,
     format_drift,
@@ -74,6 +77,7 @@ COMMAND_NAMES = (
     "review",
     "handoff",
     "record",
+    "worker",
 )
 
 
@@ -280,6 +284,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a durable repository record for one request",
     )
     record.add_argument("request", help="Kanbanlan ID or canonical provider reference")
+
+    worker = commands.add_parser("worker", help="manage the user-scoped background reconciler")
+    worker.add_argument(
+        "action",
+        choices=("status", "enable", "disable", "start", "stop", "run"),
+        help="worker lifecycle action",
+    )
+    worker.add_argument(
+        "--github-login",
+        help="GitHub account to use for this repository without switching the active account",
+    )
+    worker.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="worker polling interval in seconds (default: 300)",
+    )
+    worker.add_argument("--once", action="store_true", help="run one worker iteration and exit")
 
     return parser
 
@@ -546,6 +568,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     store = CacheStore(config, cache_dir(root))
     with status("Refreshing the shared board snapshot"):
         snapshot = store.refresh(github)
+    reconciled_successfully = False
     if plan.reconcile:
         with status("Checking existing issue and Project state"):
             open_issues = github.open_issues()
@@ -563,8 +586,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     f"{len(remaining)} reconciliation differences remain after setup"
                 )
+        reconciled_successfully = True
     if plan.open_project:
         github.open_project()
+    if reconciled_successfully:
+        _activate_worker(root, config)
     success(f"Kanbanlan configured for {repository} and Project {project_owner}/{project_number}.")
     print("Next: run 'kanbanlan doctor' to verify the setup, then 'kanbanlan next'.")
     return 0
@@ -992,6 +1018,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         open_issues = provider.list_open_requests()
     drift = plan_reconciliation(snapshot, open_issues)
     if not drift:
+        _activate_worker(_root(args), Config.load(_root(args)))
         if _emit_result(args, {"applied": False, "drift": [], "remaining": []}):
             return 0
         success("GitHub Issues and Project Status are reconciled.")
@@ -1021,7 +1048,78 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         for value in remaining:
             print(f"remaining: {format_drift(value)}")
         return 1
+    _activate_worker(_root(args), Config.load(_root(args)))
     success("Reconciliation applied and verified.")
+    return 0
+
+
+def _discover_github_login(root: Path, hostname: str) -> str:
+    result = Runner(root, env={"GH_HOST": hostname}).run(["gh", "api", "user", "--jq", ".login"])
+    login = result.stdout.strip()
+    if not login:
+        raise RuntimeError("GitHub did not return an account login; pass --github-login explicitly")
+    return login
+
+
+def _activate_worker(root: Path, config: Config, *, github_login: str | None = None) -> None:
+    registry = RegistryStore()
+    key = common_dir(root)
+    existing = registry.get(str(key))
+    if existing and existing.disabled:
+        return
+    login = github_login or (existing.github_login if existing else None)
+    if login is None:
+        login = _discover_github_login(root, config.hostname)
+    registration = registry.register(
+        common_dir=key,
+        root=root,
+        repository=config.repository,
+        hostname=config.hostname,
+        github_login=login,
+    )
+    if registration.enabled and not registration.disabled:
+        start_worker(registry, interval_seconds=registration.interval_seconds)
+
+
+def _cmd_worker(args: argparse.Namespace) -> int:
+    registry = RegistryStore()
+    if args.action == "status":
+        payload = worker_status(registry)
+        if _emit_result(args, payload):
+            return 0
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.action in {"enable", "disable"}:
+        root, config, _, _ = _context(args)
+        key = common_dir(root)
+        if args.action == "enable":
+            login = args.github_login or _discover_github_login(root, config.hostname)
+            registry.register(
+                common_dir=key,
+                root=root,
+                repository=config.repository,
+                hostname=config.hostname,
+                github_login=login,
+                interval_seconds=args.interval,
+            )
+            registry.enable(key)
+            payload = start_worker(registry, interval_seconds=args.interval)
+        else:
+            registry.disable(key)
+            payload = worker_status(registry)
+        if _emit_result(args, payload):
+            return 0
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.action == "start":
+        payload = start_worker(registry, interval_seconds=args.interval)
+    elif args.action == "stop":
+        payload = stop_worker(registry)
+    else:
+        payload = Worker(registry, interval_seconds=args.interval).run_forever(once=args.once)
+    if _emit_result(args, payload or {}):
+        return 0
+    print(json.dumps(payload or {}, indent=2, sort_keys=True))
     return 0
 
 

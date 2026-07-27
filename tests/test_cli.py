@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stderr
@@ -12,6 +13,7 @@ from kanbanlan.cli import (
     DEFAULT_TEMPLATE_NUMBER,
     DEFAULT_TEMPLATE_OWNER,
     ProjectChoice,
+    _activate_worker,
     _choose_project,
     _cmd_init,
     _cmd_upgrade,
@@ -23,10 +25,43 @@ from kanbanlan.cli import (
     build_parser,
     main,
 )
+from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, CommandResult
 
 
 class CliTests(unittest.TestCase):
+    def test_worker_lifecycle_parser_accepts_scoped_account(self) -> None:
+        args = build_parser().parse_args(
+            ["worker", "enable", "--github-login", "alice", "--interval", "60"]
+        )
+        self.assertEqual("worker", args.command)
+        self.assertEqual("enable", args.action)
+        self.assertEqual("alice", args.github_login)
+        self.assertEqual(60, args.interval)
+
+    def test_activation_respects_explicit_disablement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = Path(directory) / "repo"
+            common = Path(directory) / "common"
+            store = RegistryStore(state)
+            store.register(
+                common_dir=common,
+                root=root,
+                repository="acme/repo",
+                hostname="github.com",
+                github_login="alice",
+            )
+            store.disable(common)
+            config = mock.Mock(hostname="github.com", repository="acme/repo")
+            with (
+                mock.patch.dict("os.environ", {"KANBANLAN_STATE_DIR": str(state)}),
+                mock.patch("kanbanlan.cli.common_dir", return_value=common),
+                mock.patch("kanbanlan.cli.start_worker") as start,
+            ):
+                _activate_worker(root, config)
+            start.assert_not_called()
+
     def test_version_comes_from_package_metadata(self) -> None:
         with self.assertRaises(SystemExit) as raised:
             with mock.patch("sys.stdout") as stdout:

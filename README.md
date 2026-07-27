@@ -131,6 +131,28 @@ the empty Project so a Board view can be added manually. Kanbanlan's own
 `reconcile --apply` keeps item states correct even when GitHub Project workflows
 are not configured.
 
+### Optional background reconciliation
+
+Successful live initialization and reconciliation register the repository with
+one user-scoped worker. It deduplicates worktrees through Git's common
+directory, refreshes enabled repositories on a bounded schedule, applies only
+safe repairs, and records last-good snapshot and retry health without storing
+credentials.
+
+```sh
+kanbanlan worker status
+kanbanlan worker enable --github-login YOUR_GITHUB_ACCOUNT
+kanbanlan worker start
+kanbanlan worker stop
+kanbanlan worker disable
+```
+
+The worker resolves the selected account's credential at runtime with
+`gh auth token --user`; it never runs `gh auth switch` and never writes a token
+to the registry. See [`docs/workflow/worker.md`](docs/workflow/worker.md) for
+macOS LaunchAgent and Linux systemd user-service examples. The worker is
+opt-in, has no Docker requirement, and explicit disablement persists.
+
 ## Daily use
 
 ```sh

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,8 +27,9 @@ class CommandError(RuntimeError):
 
 
 class Runner:
-    def __init__(self, cwd: Path | None = None):
+    def __init__(self, cwd: Path | None = None, env: Mapping[str, str] | None = None):
         self.cwd = cwd
+        self.env = dict(env) if env is not None else None
 
     def run(
         self,
@@ -43,6 +46,7 @@ class Runner:
             text=True,
             input=input_text,
             capture_output=capture,
+            env={**os.environ, **self.env} if self.env is not None else None,
         )
         result = CommandResult(
             args=tuple(args),

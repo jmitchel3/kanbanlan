@@ -143,6 +143,10 @@ def discover_default_branch(root: Path) -> str:
 
 
 def cache_dir(root: Path) -> Path:
+    return common_dir(root).parent / ".cache" / "kanbanlan"
+
+
+def common_dir(root: Path) -> Path:
+    """Return the resolved Git common directory shared by all worktrees."""
     result = Runner(root).run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
-    common_dir = Path(result.stdout.strip()).resolve()
-    return common_dir.parent / ".cache" / "kanbanlan"
+    return Path(result.stdout.strip()).resolve()
