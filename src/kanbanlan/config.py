@@ -143,6 +143,19 @@ def discover_default_branch(root: Path) -> str:
 
 
 def cache_dir(root: Path) -> Path:
+    return common_dir(root).parent / ".cache" / "kanbanlan"
+
+
+def common_dir(root: Path) -> Path:
+    """Return the resolved Git common directory shared by all worktrees."""
     result = Runner(root).run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
-    common_dir = Path(result.stdout.strip()).resolve()
-    return common_dir.parent / ".cache" / "kanbanlan"
+    return Path(result.stdout.strip()).resolve()
+
+
+def primary_worktree(root: Path) -> Path:
+    """Return the stable primary checkout instead of a disposable linked worktree."""
+    result = Runner(root).run(["git", "worktree", "list", "--porcelain"])
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).resolve()
+    raise RuntimeError("git did not report a primary worktree")

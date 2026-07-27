@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from kanbanlan.config import Config, discover_repository
+from kanbanlan.config import Config, discover_repository, primary_worktree
 
 
 class ConfigTests(unittest.TestCase):
@@ -44,6 +44,19 @@ class ConfigTests(unittest.TestCase):
 
         with mock.patch("kanbanlan.config.Runner", return_value=FakeRunner()):
             self.assertEqual("acme/widget", discover_repository(Path("/tmp")))
+
+    def test_primary_worktree_is_stable_from_a_linked_checkout(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value.stdout = (
+            "worktree /tmp/primary\nHEAD abc\nbranch refs/heads/main\n\n"
+            "worktree /tmp/linked\nHEAD def\nbranch refs/heads/work\n"
+        )
+
+        with mock.patch("kanbanlan.config.Runner", return_value=runner):
+            result = primary_worktree(Path("/tmp/linked"))
+
+        self.assertEqual(Path("/tmp/primary").resolve(), result)
+        runner.run.assert_called_once_with(["git", "worktree", "list", "--porcelain"])
 
     def test_malformed_config_has_repair_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
