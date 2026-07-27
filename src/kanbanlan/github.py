@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from kanbanlan.config import Config
-from kanbanlan.runner import CommandError, Runner
+from kanbanlan.runner import CommandError, CommandResult, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
 
 PROJECT_QUERY = """
@@ -145,8 +145,7 @@ query($owner: String!, $repo: String!) {
 
 OWNER_QUERY = """
 query($login: String!) {
-  organization(login: $login) { id login }
-  user(login: $login) { id login }
+  repositoryOwner(login: $login) { __typename id login }
 }
 """
 
@@ -200,6 +199,8 @@ class GitHub:
             return
         if not interactive:
             raise CommandError(status)
+        if not _is_auth_failure(status):
+            raise CommandError(status)
         print("GitHub authentication is missing or expired; opening the browser login flow.")
         self.runner.run(
             [
@@ -218,15 +219,33 @@ class GitHub:
         )
 
     def ensure_project_scope(
-        self, owner: str, hostname: str = "github.com", *, interactive: bool = True
+        self,
+        owner: str,
+        hostname: str = "github.com",
+        *,
+        owner_type: str | None = None,
+        interactive: bool = True,
     ) -> None:
+        probe_owner = "@me" if owner_type == "user" else owner
         probe = self.runner.run(
-            ["gh", "project", "list", "--owner", owner, "--limit", "1", "--format", "json"],
+            [
+                "gh",
+                "project",
+                "list",
+                "--owner",
+                probe_owner,
+                "--limit",
+                "1",
+                "--format",
+                "json",
+            ],
             check=False,
         )
         if probe.returncode == 0:
             return
         if not interactive:
+            raise CommandError(probe)
+        if not _is_missing_project_scope(probe):
             raise CommandError(probe)
         print("GitHub Project access needs approval; opening the scope authorization flow.")
         self.runner.run(
@@ -234,7 +253,17 @@ class GitHub:
             capture=False,
         )
         self.runner.run(
-            ["gh", "project", "list", "--owner", owner, "--limit", "1", "--format", "json"]
+            [
+                "gh",
+                "project",
+                "list",
+                "--owner",
+                probe_owner,
+                "--limit",
+                "1",
+                "--format",
+                "json",
+            ]
         )
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
@@ -259,9 +288,10 @@ class GitHub:
 
     def detect_owner_type(self, owner: str) -> str:
         data = self.graphql(OWNER_QUERY, {"login": owner})
-        if data.get("organization"):
+        value = data.get("repositoryOwner")
+        if value and value.get("__typename") == "Organization":
             return "organization"
-        if data.get("user"):
+        if value and value.get("__typename") == "User":
             return "user"
         raise RuntimeError(f"GitHub owner {owner} was not found")
 
@@ -614,3 +644,35 @@ def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
         if field and field.get("name") == "Status" and "options" in field:
             return field
     return None
+
+
+def _command_detail(result: CommandResult) -> str:
+    return f"{result.stdout}\n{result.stderr}".lower()
+
+
+def _is_auth_failure(result: CommandResult) -> bool:
+    detail = _command_detail(result)
+    return any(
+        marker in detail
+        for marker in (
+            "not logged into",
+            "not logged in",
+            "token is invalid",
+            "token in default is invalid",
+            "authentication failed",
+            "no oauth token",
+        )
+    )
+
+
+def _is_missing_project_scope(result: CommandResult) -> bool:
+    detail = _command_detail(result)
+    return any(
+        marker in detail
+        for marker in (
+            "missing required scopes",
+            "requires the project scope",
+            "requires the read:project scope",
+            "insufficient oauth scope",
+        )
+    )

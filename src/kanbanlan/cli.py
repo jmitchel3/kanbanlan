@@ -222,12 +222,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
         project_owner = project_owner or repository_info["owner"]["login"]
         if interactive and not args.project_owner and not args.project_url:
             project_owner = _prompt_text("Project owner", default=project_owner)
+        owner_type = args.owner_type or github.detect_owner_type(project_owner)
         github.ensure_project_scope(
             project_owner,
             args.hostname,
+            owner_type=owner_type,
             interactive=interactive,
         )
-        owner_type = args.owner_type or github.detect_owner_type(project_owner)
         choice = _choose_project(
             args,
             github,
@@ -516,7 +517,12 @@ def _project_number(payload: dict[str, Any]) -> int:
 def _cmd_auth(args: argparse.Namespace) -> int:
     _, config, github, _ = _context(args)
     github.ensure_auth(config.hostname, interactive=True)
-    github.ensure_project_scope(config.project_owner, config.hostname, interactive=True)
+    github.ensure_project_scope(
+        config.project_owner,
+        config.hostname,
+        owner_type=config.project_owner_type,
+        interactive=True,
+    )
     print("GitHub authentication and Project scope are ready.")
     return 0
 

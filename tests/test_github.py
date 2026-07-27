@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 from kanbanlan.config import Config
-from kanbanlan.github import GitHub
+from kanbanlan.github import OWNER_QUERY, GitHub
+from kanbanlan.runner import CommandError, CommandResult
 
 
 def config() -> Config:
@@ -32,6 +33,77 @@ class StubGitHub(GitHub):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_auth_does_not_reauthenticate_for_network_failure(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(
+            ("gh", "auth", "status"),
+            1,
+            "",
+            "error connecting to api.github.com",
+        )
+        github = GitHub(Path("/tmp"), runner=runner)
+
+        with self.assertRaises(CommandError):
+            github.ensure_auth()
+
+        runner.run.assert_called_once()
+
+    def test_detect_owner_type_uses_repository_owner_without_partial_errors(self) -> None:
+        github = GitHub(Path("/tmp"), runner=mock.Mock())
+        github.graphql = mock.Mock(
+            side_effect=[
+                {"repositoryOwner": {"__typename": "User", "login": "monalisa"}},
+                {"repositoryOwner": {"__typename": "Organization", "login": "github"}},
+            ]
+        )
+
+        self.assertEqual("user", github.detect_owner_type("monalisa"))
+        self.assertEqual("organization", github.detect_owner_type("github"))
+        self.assertEqual(
+            [
+                mock.call(OWNER_QUERY, {"login": "monalisa"}),
+                mock.call(OWNER_QUERY, {"login": "github"}),
+            ],
+            github.graphql.call_args_list,
+        )
+
+    def test_project_scope_probe_uses_at_me_for_user_owner(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(tuple(), 0, "{}", "")
+        github = GitHub(Path("/tmp"), runner=runner)
+
+        github.ensure_project_scope("monalisa", owner_type="user")
+
+        runner.run.assert_called_once_with(
+            [
+                "gh",
+                "project",
+                "list",
+                "--owner",
+                "@me",
+                "--limit",
+                "1",
+                "--format",
+                "json",
+            ],
+            check=False,
+        )
+
+    def test_project_scope_does_not_reauthenticate_for_unrelated_failure(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(
+            ("gh", "project", "list"),
+            1,
+            "",
+            "Could not resolve to an Organization",
+        )
+        github = GitHub(Path("/tmp"), runner=runner)
+
+        with self.assertRaises(CommandError):
+            github.ensure_project_scope("monalisa", owner_type="user")
+
+        runner.run.assert_called_once()
+
     def test_create_project_uses_valid_gh_command(self) -> None:
         runner = mock.Mock()
         runner.json.return_value = {"number": 3}
