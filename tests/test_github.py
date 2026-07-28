@@ -48,6 +48,41 @@ class GitHubTests(unittest.TestCase):
 
         runner.run.assert_called_once()
 
+    def test_auth_interactive_login_has_no_timeout(self) -> None:
+        runner = mock.Mock()
+        runner.run.side_effect = [
+            CommandResult(("gh", "auth", "status"), 1, "", "not logged in"),
+            CommandResult(("gh", "auth", "login"), 0, "", ""),
+        ]
+        github = GitHub(Path("/tmp"), runner=runner)
+
+        github.ensure_auth()
+
+        runner.run.assert_has_calls(
+            [
+                mock.call(
+                    ["gh", "auth", "status", "--active", "--hostname", "github.com"],
+                    check=False,
+                ),
+                mock.call(
+                    [
+                        "gh",
+                        "auth",
+                        "login",
+                        "--hostname",
+                        "github.com",
+                        "--git-protocol",
+                        "https",
+                        "--web",
+                        "--scopes",
+                        "project",
+                    ],
+                    capture=False,
+                    timeout=None,
+                ),
+            ]
+        )
+
     def test_detect_owner_type_uses_repository_owner_without_partial_errors(self) -> None:
         github = GitHub(Path("/tmp"), runner=mock.Mock())
         github.graphql = mock.Mock(

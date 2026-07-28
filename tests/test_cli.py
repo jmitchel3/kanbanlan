@@ -169,6 +169,7 @@ class CliTests(unittest.TestCase):
         runner.run.assert_called_once_with(
             ["uv", "tool", "upgrade", "kanbanlan"],
             capture=False,
+            timeout=None,
         )
 
     def test_upgrade_explains_when_uv_is_unavailable(self) -> None:

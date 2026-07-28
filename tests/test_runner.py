@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import unittest
 from unittest import mock
 
-from kanbanlan.runner import CommandResult, Runner
+from kanbanlan.runner import CommandError, CommandResult, Runner
 
 
 class RunnerTests(unittest.TestCase):
@@ -28,6 +29,43 @@ class RunnerTests(unittest.TestCase):
             runner.run(["true"])
 
         self.assertNotIn("GH_TOKEN", run.call_args.kwargs["env"])
+
+    def test_runner_uses_default_timeout(self) -> None:
+        runner = Runner()
+        with mock.patch("kanbanlan.runner.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            runner.run(["true"])
+
+        self.assertEqual(60.0, run.call_args.kwargs["timeout"])
+
+    def test_runner_allows_timeout_opt_out(self) -> None:
+        runner = Runner()
+        with mock.patch("kanbanlan.runner.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            runner.run(["interactive"], capture=False, timeout=None)
+
+        self.assertIsNone(run.call_args.kwargs["timeout"])
+
+    def test_runner_converts_timeout_to_command_error(self) -> None:
+        runner = Runner()
+        expired = subprocess.TimeoutExpired(
+            cmd=["gh", "api"],
+            timeout=2.5,
+            output=b"partial stdout",
+            stderr=b"partial stderr",
+        )
+        with (
+            mock.patch("kanbanlan.runner.subprocess.run", side_effect=expired),
+            self.assertRaises(CommandError) as raised,
+        ):
+            runner.run(["gh", "api"], timeout=2.5)
+
+        result = raised.exception.result
+        self.assertEqual(("gh", "api"), result.args)
+        self.assertEqual(124, result.returncode)
+        self.assertEqual("partial stdout", result.stdout)
+        self.assertEqual("partial stderr\ntimed out after 2.5 seconds", result.stderr)
+        self.assertIn("gh api", str(raised.exception))
 
     def test_invalid_json_error_includes_bounded_command_output(self) -> None:
         runner = Runner()
