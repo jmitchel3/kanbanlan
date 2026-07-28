@@ -853,7 +853,11 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
         )
     try:
         with status("Upgrading Kanbanlan"):
-            Runner().run(["uv", "tool", "upgrade", "kanbanlan"], capture=False)
+            Runner().run(
+                ["uv", "tool", "upgrade", "kanbanlan"],
+                capture=False,
+                timeout=None,
+            )
     except FileNotFoundError as exc:
         raise RuntimeError(
             "uv is required to upgrade Kanbanlan; install it from https://docs.astral.sh/uv/"

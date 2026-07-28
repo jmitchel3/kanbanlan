@@ -224,6 +224,7 @@ class GitHub:
                 "project",
             ],
             capture=False,
+            timeout=None,
         )
 
     def ensure_project_scope(
@@ -259,6 +260,7 @@ class GitHub:
         self.runner.run(
             ["gh", "auth", "refresh", "--hostname", hostname, "--scopes", "project"],
             capture=False,
+            timeout=None,
         )
         self.runner.run(
             [
@@ -710,6 +712,7 @@ class GitHub:
                 "--web",
             ],
             capture=False,
+            timeout=None,
         )
 
     def _config(self) -> Config:
