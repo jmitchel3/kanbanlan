@@ -406,8 +406,12 @@ asking to take over stale work.
 
 ## Optional agent session tracking
 
-Provider-native session attribution is disabled by default. Opt in during setup
-with `kanbanlan init --session-tracking`, or set this repository configuration:
+Provider-native session attribution is disabled by default. On an existing
+configuration, `kanbanlan init --session-tracking` enables it in place while
+preserving the repository and Project binding. Disable it with
+`kanbanlan init --no-session-tracking`; installed hook files remain inert and
+are not deleted. Use `kanbanlan init --reconfigure` only to intentionally rerun
+full Project setup. The repository configuration is:
 
 ```toml
 [session_tracking]

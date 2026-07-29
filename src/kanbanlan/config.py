@@ -99,7 +99,8 @@ class Config:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
-                f"{path} is incomplete or invalid ({exc}); rerun 'kanbanlan init' to repair it"
+                f"{path} is incomplete or invalid ({exc}); "
+                "rerun 'kanbanlan init --reconfigure' to repair it"
             ) from exc
 
     def to_toml(self) -> str:
