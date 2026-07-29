@@ -103,5 +103,5 @@ class ConfigTests(unittest.TestCase):
             root = Path(directory)
             (root / ".kanbanlan.toml").write_text("schema_version = 1\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(RuntimeError, "rerun 'kanbanlan init'"):
+            with self.assertRaisesRegex(RuntimeError, "init --reconfigure"):
                 Config.load(root)

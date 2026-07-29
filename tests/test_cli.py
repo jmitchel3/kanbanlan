@@ -41,6 +41,8 @@ from kanbanlan.workflow import Drift
 class CliTests(unittest.TestCase):
     def test_session_tracking_cli_options_are_explicit(self) -> None:
         init = build_parser().parse_args(["init", "--session-tracking"])
+        disabled = build_parser().parse_args(["init", "--no-session-tracking"])
+        reconfigure = build_parser().parse_args(["init", "--reconfigure"])
         claim = build_parser().parse_args(
             [
                 "claim",
@@ -53,6 +55,8 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertTrue(init.session_tracking)
+        self.assertFalse(disabled.session_tracking)
+        self.assertTrue(reconfigure.reconfigure)
         self.assertEqual("codex:019f-test", claim.actor_session)
 
     def test_sessions_displays_native_id_with_harness_and_resume_command(self) -> None:
@@ -606,6 +610,213 @@ class CliTests(unittest.TestCase):
     def test_boolean_prompt_retries_invalid_answers(self) -> None:
         with mock.patch("builtins.input", side_effect=["perhaps", "yes"]):
             self.assertTrue(_prompt_bool("Continue?", default=False))
+
+    def test_existing_init_enables_session_tracking_without_project_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+                default_branch="trunk",
+                stage_branch="staging",
+                production_branch="production",
+                stale_seconds=240,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(["init", "--session-tracking", "--non-interactive"])
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                mock.patch("kanbanlan.cli.discover_repository") as discover_repository,
+                mock.patch("kanbanlan.cli.discover_default_branch") as discover_default_branch,
+                mock.patch("kanbanlan.cli.GitHub") as github,
+            ):
+                self.assertEqual(0, _cmd_init(args))
+
+            updated = Config.load(root)
+            self.assertEqual(7, updated.project_number)
+            self.assertEqual("trunk", updated.default_branch)
+            self.assertEqual("staging", updated.stage_branch)
+            self.assertEqual("production", updated.production_branch)
+            self.assertEqual(240, updated.stale_seconds)
+            self.assertTrue(updated.session_tracking)
+            self.assertTrue((root / ".codex" / "hooks.json").exists())
+            discover_repository.assert_not_called()
+            discover_default_branch.assert_not_called()
+            github.assert_not_called()
+
+    def test_existing_init_can_disable_tracking_without_deleting_hook_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+                session_tracking=True,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            custom_hook = root / ".codex" / "hooks.json"
+            custom_hook.parent.mkdir(parents=True)
+            custom_hook.write_text('{"custom": true}\n', encoding="utf-8")
+            args = build_parser().parse_args(["init", "--no-session-tracking", "--non-interactive"])
+
+            with mock.patch("kanbanlan.cli._root", return_value=root):
+                self.assertEqual(0, _cmd_init(args))
+
+            self.assertFalse(Config.load(root).session_tracking)
+            self.assertEqual('{"custom": true}\n', custom_hook.read_text(encoding="utf-8"))
+
+    def test_existing_init_applies_local_overrides_and_preserves_unspecified_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+                default_branch="main",
+                stage_branch="staging",
+                production_branch="production",
+                stale_seconds=180,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(
+                [
+                    "init",
+                    "--default-branch",
+                    "trunk",
+                    "--production-branch",
+                    "",
+                    "--hostname",
+                    "github.example.test",
+                    "--stale-seconds",
+                    "60",
+                    "--non-interactive",
+                ]
+            )
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                mock.patch("kanbanlan.cli.GitHub") as github,
+            ):
+                self.assertEqual(0, _cmd_init(args))
+
+            updated = Config.load(root)
+            self.assertEqual("trunk", updated.default_branch)
+            self.assertEqual("staging", updated.stage_branch)
+            self.assertEqual("", updated.production_branch)
+            self.assertEqual("github.example.test", updated.hostname)
+            self.assertEqual(60, updated.stale_seconds)
+            self.assertFalse(updated.session_tracking)
+            self.assertEqual(7, updated.project_number)
+            github.assert_not_called()
+
+    def test_existing_init_without_overrides_refreshes_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(["init", "--non-interactive"])
+            output = StringIO()
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                mock.patch("kanbanlan.cli.GitHub") as github,
+                redirect_stdout(output),
+            ):
+                self.assertEqual(0, _cmd_init(args))
+
+            self.assertEqual(original, Config.load(root))
+            self.assertIn("refreshed in place", output.getvalue())
+            github.assert_not_called()
+
+    def test_existing_init_explains_reuse_and_can_be_cancelled_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+            )
+            config_path = root / ".kanbanlan.toml"
+            config_path.write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(["init", "--session-tracking"])
+            output = StringIO()
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                mock.patch("kanbanlan.cli.scaffold_repository") as scaffold,
+                mock.patch("builtins.input", return_value="no"),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(0, _cmd_init(args))
+
+            self.assertIn("Existing configuration detected", output.getvalue())
+            self.assertIn("Project", output.getvalue())
+            self.assertEqual(original, Config.load(root))
+            scaffold.assert_not_called()
+
+    def test_existing_init_requires_reconfigure_for_project_binding_options(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(["init", "--project-number", "9", "--non-interactive"])
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                self.assertRaisesRegex(RuntimeError, "--reconfigure"),
+            ):
+                _cmd_init(args)
+
+            self.assertEqual(original, Config.load(root))
+
+    def test_reconfigure_explicitly_runs_full_setup_for_existing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+            )
+            (root / ".kanbanlan.toml").write_text(original.to_toml(), encoding="utf-8")
+            args = build_parser().parse_args(
+                [
+                    "init",
+                    "--reconfigure",
+                    "--repository",
+                    "acme/widget",
+                    "--project-number",
+                    "9",
+                    "--owner-type",
+                    "organization",
+                    "--local-only",
+                    "--non-interactive",
+                ]
+            )
+
+            with (
+                mock.patch("kanbanlan.cli._root", return_value=root),
+                mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
+            ):
+                self.assertEqual(0, _cmd_init(args))
+
+            self.assertEqual(9, Config.load(root).project_number)
 
     def test_wizard_cancellation_does_not_create_or_configure_project(self) -> None:
         root = Path("/tmp/kanbanlan-wizard-test")

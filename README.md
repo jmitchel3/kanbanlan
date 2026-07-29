@@ -86,6 +86,23 @@ titled `<repository name> Delivery` by default and includes the template's
 preconfigured views. GitHub and cache work shows progress as it runs, including
 a clear failed step if setup stops.
 
+If `.kanbanlan.toml` already exists, `init` switches to a local update-in-place
+path before repository discovery or GitHub authentication. It reuses the stored
+repository and Project binding, preserves unspecified settings, and refreshes
+managed files without creating, copying, linking, or reconciling a Project.
+
+```sh
+kanbanlan init --session-tracking       # enable and scaffold hooks in place
+kanbanlan init --no-session-tracking    # disable attribution in place
+kanbanlan init                          # refresh managed files with stored settings
+```
+
+Disabling tracking leaves installed hook files in place but inert, which avoids
+deleting custom hook configuration. Use `--force` only when existing custom
+generated targets should be replaced. Repository- and Project-binding options
+are rejected on the update path; pass `--reconfigure` to intentionally rerun
+the complete setup wizard and choose or create a different Project.
+
 You can also provide any choice up front. Reuse an existing Project:
 
 ```sh
@@ -105,14 +122,14 @@ Copy a different Project template, including its useful views:
 kanbanlan init --template-project template-owner/1 --project-title "Product Delivery"
 ```
 
-`init` authenticates through
+On the new-setup path, `init` authenticates through
 `gh auth login --web` when necessary, ensures the GitHub token has the
 `project` scope, links the Project to the repository, repairs the Status field,
 creates the workflow labels, writes managed repository files, adds open issues,
 and reconciles their state.
 
-Use `--non-interactive` in automation; without a Project source it copies the
-default template. Provide `--project-number`, `--project-url`,
+Use `--non-interactive` in automation; for a new setup without a Project source
+it copies the default template. Provide `--project-number`, `--project-url`,
 `--create-project`, or `--template-project` to override that default. Use
 `--local-only` with an existing Project reference to generate repository files
 without GitHub mutations. Pass `--no-open` to suppress the wizard's browser
@@ -125,11 +142,11 @@ environment variable. Progress is written to stderr so commands such as
 `snapshot`, `path`, and `capture` keep clean, pipe-friendly stdout.
 
 Kanbanlan does not create custom Project views or GitHub's built-in auto-add
-workflow through the API. Plain `kanbanlan init` copies the default template so
-its views are present from the start. With `--create-project`, `--open` opens
-the empty Project so a Board view can be added manually. Kanbanlan's own
-`reconcile --apply` keeps item states correct even when GitHub Project workflows
-are not configured.
+workflow through the API. On a previously unconfigured repository, plain
+`kanbanlan init` copies the default template so its views are present from the
+start. With `--create-project`, `--open` opens the empty Project so a Board view
+can be added manually. Kanbanlan's own `reconcile --apply` keeps item states
+correct even when GitHub Project workflows are not configured.
 
 ### Optional background reconciliation
 
@@ -199,8 +216,9 @@ status and claim movements remain in the live canonical home rather than Git.
 
 ### Optional agent session tracking
 
-Provider-native session tracking is disabled by default. Enable it explicitly
-during setup with `kanbanlan init --session-tracking`, or in `.kanbanlan.toml`:
+Provider-native session tracking is disabled by default. Enable it during fresh
+setup or update an already configured repository in place with
+`kanbanlan init --session-tracking`. The repository configuration is:
 
 ```toml
 [session_tracking]

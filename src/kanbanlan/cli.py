@@ -9,13 +9,14 @@ import shlex
 import shutil
 import sys
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from kanbanlan import __version__
 from kanbanlan.config import (
+    CONFIG_FILENAME,
     Config,
     cache_dir,
     common_dir,
@@ -189,12 +190,15 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="configure a repository and GitHub Project",
         description=(
-            "Interactively detect repository settings, default to a fresh Project copied from "
-            "the Kanbanlan template, review the plan, and configure the coordination workflow."
+            "Update an existing Kanbanlan configuration in place, or interactively configure "
+            "a new repository and GitHub Project workflow."
         ),
         epilog=(
             "Examples:\n"
-            "  kanbanlan init  # copy the default template as <repository> Delivery\n"
+            "  kanbanlan init  # set up a new repo or refresh an existing one\n"
+            "  kanbanlan init --session-tracking  # update an existing repository in place\n"
+            "  kanbanlan init --no-session-tracking\n"
+            "  kanbanlan init --reconfigure  # intentionally rerun full Project setup\n"
             "  kanbanlan init --project-url https://github.com/orgs/acme/projects/2\n"
             "  kanbanlan init --create-project --project-title 'Product Delivery' --open\n"
             "  kanbanlan init --project-number 2 --local-only"
@@ -223,17 +227,22 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--default-branch", help="delivery branch; defaults from origin")
     init.add_argument("--stage-branch", help="branch deployed to staging")
     init.add_argument("--production-branch", help="optional production branch")
-    init.add_argument("--hostname", default="github.com")
+    init.add_argument("--hostname", help="GitHub hostname; preserved for existing configuration")
     init.add_argument(
         "--stale-seconds",
         type=int,
-        default=180,
-        help="snapshot freshness window (default: 180)",
+        help="snapshot freshness window; defaults to 180 for new configuration",
     )
     init.add_argument(
         "--session-tracking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable or disable provider-native agent session attribution",
+    )
+    init.add_argument(
+        "--reconfigure",
         action="store_true",
-        help="opt in to provider-native agent session attribution",
+        help="run full setup even when this repository already has configuration",
     )
     init.add_argument("--force", action="store_true", help="replace custom generated targets")
     init.add_argument(
@@ -540,10 +549,15 @@ def _record_session_activity(
 
 def _cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
+    if (root / CONFIG_FILENAME).exists() and not args.reconfigure:
+        return _cmd_init_update(args, root)
+
+    hostname = args.hostname or "github.com"
+    stale_seconds = args.stale_seconds if args.stale_seconds is not None else 180
     repository = args.repository or discover_repository(root)
     if repository.count("/") != 1 or any(not part for part in repository.split("/")):
         raise RuntimeError("--repository must use OWNER/NAME")
-    if args.stale_seconds < 1:
+    if stale_seconds < 1:
         raise RuntimeError("--stale-seconds must be positive")
     repo_owner, repo_name = repository.split("/", 1)
     detected_default_branch = args.default_branch or discover_default_branch(root)
@@ -564,7 +578,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         owner_type = args.owner_type or "organization"
         choice = ProjectChoice(mode="existing", number=project_number)
     else:
-        github.ensure_auth(args.hostname, interactive=interactive)
+        github.ensure_auth(hostname, interactive=interactive)
         with status("Reading GitHub repository settings"):
             repository_info = github.repository_info(repository)
         detected_default_branch = (
@@ -583,7 +597,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                 owner_type = github.detect_owner_type(project_owner)
         github.ensure_project_scope(
             project_owner,
-            args.hostname,
+            hostname,
             owner_type=owner_type,
             interactive=interactive,
         )
@@ -623,9 +637,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
         default_branch=default_branch,
         stage_branch=stage_branch,
         production_branch=production_branch,
-        hostname=args.hostname,
-        stale_seconds=args.stale_seconds,
-        session_tracking=args.session_tracking,
+        hostname=hostname,
+        stale_seconds=stale_seconds,
+        session_tracking=bool(args.session_tracking),
         reconcile=not args.skip_reconcile and not args.local_only,
         open_project=open_project and not args.local_only,
         local_only=args.local_only,
@@ -659,9 +673,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     )
     with status("Writing repository configuration"):
         results = scaffold_repository(root, config, force=args.force)
-    for result in results:
-        marker = style(f"{result.action:<10}", CYAN if result.action != "unchanged" else DIM)
-        print(f"  {marker} {result.path.relative_to(root)}")
+    _print_scaffold_results(results, root)
 
     if plan.local_only:
         success("Local setup complete.")
@@ -709,6 +721,93 @@ def _cmd_init(args: argparse.Namespace) -> int:
     success(f"Kanbanlan configured for {repository} and Project {project_owner}/{project_number}.")
     print("Next: run 'kanbanlan doctor' to verify the setup, then 'kanbanlan next'.")
     return 0
+
+
+def _cmd_init_update(args: argparse.Namespace, root: Path) -> int:
+    reconfiguration_options = [
+        option
+        for option, selected in (
+            ("--repository", args.repository is not None),
+            ("--project-owner", args.project_owner is not None),
+            ("--project-url", args.project_url is not None),
+            ("--project-number", args.project_number is not None),
+            ("--owner-type", args.owner_type is not None),
+            ("--create-project", args.create_project),
+            ("--template-project", args.template_project is not None),
+            ("--project-title", args.project_title is not None),
+        )
+        if selected
+    ]
+    if reconfiguration_options:
+        supplied = ", ".join(reconfiguration_options)
+        raise RuntimeError(
+            f"{supplied} would change the existing repository or Project binding; "
+            "rerun with --reconfigure to start full setup explicitly"
+        )
+    if args.stale_seconds is not None and args.stale_seconds < 1:
+        raise RuntimeError("--stale-seconds must be positive")
+
+    existing = Config.load(root)
+    updated = replace(
+        existing,
+        default_branch=args.default_branch or existing.default_branch,
+        stage_branch=args.stage_branch or existing.stage_branch,
+        production_branch=(
+            args.production_branch
+            if args.production_branch is not None
+            else existing.production_branch
+        ),
+        hostname=args.hostname or existing.hostname,
+        stale_seconds=(
+            args.stale_seconds if args.stale_seconds is not None else existing.stale_seconds
+        ),
+        session_tracking=(
+            args.session_tracking
+            if args.session_tracking is not None
+            else existing.session_tracking
+        ),
+    )
+    interactive = not args.non_interactive
+    changed = existing != updated
+    if interactive:
+        heading("Kanbanlan update")
+        print(
+            "Existing configuration detected. The repository and GitHub Project binding "
+            "will be reused."
+        )
+        section("Configuration")
+        field("Repository", updated.repository)
+        field("Project", f"{updated.project_owner}/{updated.project_number} (reused)")
+        field("Pull request target", updated.default_branch)
+        field("Staging branch", updated.stage_branch)
+        field("Production branch", updated.production_branch or "not configured")
+        field("Snapshot freshness", f"{updated.stale_seconds} seconds")
+        field("Agent session tracking", "enabled" if updated.session_tracking else "disabled")
+        if not changed:
+            print("No configuration overrides were supplied; managed files will be refreshed.")
+        if not _prompt_bool("Apply this in-place update?", default=True):
+            warning("Update cancelled; no repository files or Project settings were changed.")
+            return 0
+
+    with status("Updating existing repository configuration"):
+        results = scaffold_repository(root, updated, force=args.force)
+    _print_scaffold_results(results, root)
+    if args.open and not args.local_only:
+        GitHub(root, updated).open_project()
+    action = "updated" if changed else "refreshed"
+    success(
+        f"Kanbanlan configuration {action} in place; "
+        f"Project {updated.project_owner}/{updated.project_number} was reused."
+    )
+    if not updated.session_tracking:
+        print("Existing generated session hooks, if any, remain installed but inactive.")
+    return 0
+
+
+def _print_scaffold_results(results: list[Any], root: Path) -> None:
+    for result in results:
+        marker = style(f"{result.action:<10}", CYAN if result.action != "unchanged" else DIM)
+        print(f"  {marker} {result.path.relative_to(root)}")
 
 
 def _project_reference(
