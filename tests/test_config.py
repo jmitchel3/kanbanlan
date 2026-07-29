@@ -18,12 +18,44 @@ class ConfigTests(unittest.TestCase):
             default_branch="main",
             stage_branch="main",
             production_branch="prod",
+            session_tracking=True,
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".kanbanlan.toml").write_text(config.to_toml(), encoding="utf-8")
             loaded = Config.load(root)
         self.assertEqual(config, loaded)
+
+    def test_session_tracking_defaults_off_and_environment_can_override_it(self) -> None:
+        config = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+        )
+
+        self.assertFalse(config.session_tracking_enabled({}))
+        self.assertTrue(config.session_tracking_enabled({"KANBANLAN_SESSION_TRACKING": "true"}))
+        self.assertFalse(
+            Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=2,
+                session_tracking=True,
+            ).session_tracking_enabled({"KANBANLAN_SESSION_TRACKING": "off"})
+        )
+
+    def test_invalid_session_tracking_environment_is_rejected(self) -> None:
+        config = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "KANBANLAN_SESSION_TRACKING"):
+            config.session_tracking_enabled({"KANBANLAN_SESSION_TRACKING": "sometimes"})
 
     def test_invalid_repository_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

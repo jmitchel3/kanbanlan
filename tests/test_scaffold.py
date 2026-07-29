@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,52 @@ def config() -> Config:
 
 
 class ScaffoldTests(unittest.TestCase):
+    def test_session_hooks_are_created_only_after_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scaffold_repository(root, config())
+            self.assertFalse((root / ".codex" / "hooks.json").exists())
+
+            tracked = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+                session_tracking=True,
+            )
+            scaffold_repository(root, tracked)
+
+            codex = json.loads((root / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+            claude = json.loads((root / ".claude" / "settings.json").read_text(encoding="utf-8"))
+            grok = json.loads(
+                (root / ".grok" / "hooks" / "kanbanlan.json").read_text(encoding="utf-8")
+            )
+            agy = json.loads((root / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+
+        self.assertIn("session-hook --agent codex", str(codex))
+        self.assertIn("session-hook --agent claude", str(claude))
+        self.assertIn("session-hook --agent grok", str(grok))
+        self.assertIn("session-hook --agent agy", str(agy))
+
+    def test_session_hook_scaffolding_preserves_existing_custom_hook_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".codex" / "hooks.json"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"custom": true}\n', encoding="utf-8")
+            tracked = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=7,
+                session_tracking=True,
+            )
+
+            results = scaffold_repository(root, tracked)
+            result = next(value for value in results if value.path == path)
+
+        self.assertEqual("skipped (custom file)", result.action)
+
     def test_gitignore_adds_both_local_state_entries_on_first_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

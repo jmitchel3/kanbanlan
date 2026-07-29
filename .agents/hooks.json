@@ -1,0 +1,11 @@
+{
+  "kanbanlan-session-tracking": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "kanbanlan session-hook --agent agy",
+        "timeout": 5
+      }
+    ]
+  }
+}

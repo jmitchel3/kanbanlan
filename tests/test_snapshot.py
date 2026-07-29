@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from kanbanlan.config import Config
+from kanbanlan.sessions import AgentSession, activity_comment
 from kanbanlan.snapshot import CacheStore, active_claim, build_snapshot, isoformat
 
 
@@ -55,6 +56,42 @@ def issue_item(
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_session_history_is_normalized_and_comment_limit_is_reported(self) -> None:
+        body = activity_comment(
+            action="capture",
+            at="2026-07-29T12:00:00Z",
+            from_status=None,
+            to_status="Inbox",
+            actor=AgentSession("codex", "019f-test", "test"),
+        )
+        item = issue_item(
+            1,
+            "Inbox",
+            ["priority:p2", "status:intake"],
+            comments=[
+                {
+                    "body": body,
+                    "createdAt": "2026-07-29T12:00:01Z",
+                    "author": {"login": "agent-user"},
+                }
+            ],
+        )
+        item["content"]["comments"]["totalCount"] = 101
+        project = {
+            "id": "project",
+            "number": 2,
+            "title": "Delivery",
+            "url": "url",
+            "fields": {"nodes": []},
+            "items": [item],
+        }
+
+        snapshot = build_snapshot(config(), project, [], {}, datetime.now(UTC))
+        normalized = snapshot["items"][0]
+
+        self.assertEqual("019f-test · codex", normalized["session_history"][0]["actor"]["display"])
+        self.assertTrue(normalized["session_history_truncated"])
+
     def test_ready_cards_are_sorted_by_priority_then_number(self) -> None:
         project = {
             "id": "project",

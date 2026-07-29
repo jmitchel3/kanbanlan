@@ -19,3 +19,6 @@ number = 2
 
 [local]
 stale_seconds = 180
+
+[session_tracking]
+enabled = true

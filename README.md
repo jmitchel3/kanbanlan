@@ -172,6 +172,7 @@ error in `health.json`.
 
 ```sh
 kanbanlan capture "Add export audit log" --priority priority:p1
+kanbanlan triage KBL-...
 kanbanlan claim KBL-... --touchpoints "audit API; exports UI; migrations"
 kanbanlan record KBL-...
 kanbanlan review KBL-...
@@ -196,6 +197,55 @@ decisions, verification, and delivered-result sections in the implementation
 PR. Kanbanlan never overwrites manual changes to an existing record. Volatile
 status and claim movements remain in the live canonical home rather than Git.
 
+### Optional agent session tracking
+
+Provider-native session tracking is disabled by default. Enable it explicitly
+during setup with `kanbanlan init --session-tracking`, or in `.kanbanlan.toml`:
+
+```toml
+[session_tracking]
+enabled = true
+```
+
+The repository setting can be overridden for one process with
+`KANBANLAN_SESSION_TRACKING=true` or `false`. Session identity precedence is:
+
+1. `--actor-session HARNESS:SESSION_ID`;
+2. `KANBANLAN_AGENT_SESSION=HARNESS:SESSION_ID`;
+3. `KANBANLAN_AGENT` together with `KANBANLAN_SESSION_ID`;
+4. provider-native variables: `CODEX_THREAD_ID`, `CLAUDE_SESSION_ID`,
+   `GROK_SESSION_ID`, or `AGY_CONVERSATION_ID`; and
+5. unambiguous context registered by a generated agent lifecycle hook.
+
+When none of these yields a trustworthy native ID, Kanbanlan records the
+activity as unavailable instead of inventing a resumable session. A claim still
+gets its ordinary coordination identifier so ownership remains backward
+compatible.
+
+```sh
+kanbanlan sessions KBL-...                     # lifecycle sessions and resume commands
+kanbanlan sessions KBL-... --action triage
+kanbanlan resume KBL-...                       # print the latest resume command
+kanbanlan resume KBL-... --action claim --run # resume through the native harness
+```
+
+Session entries keep the native ID and harness separate and display them as
+`<session-id> · <harness>`. Resume adapters are included for Codex, Claude Code,
+Grok Build, and Google Antigravity AGY. The generated hooks pass native session
+context to `kanbanlan session-hook`; custom integrations can call that command
+with their lifecycle JSON on stdin or set the Kanbanlan environment variables.
+Other harness labels can still be attributed through explicit or environment
+configuration, but need a resume adapter before `kanbanlan resume` can launch them.
+Each event keeps its actor; claim and handoff events additionally distinguish
+the session responsible for the resulting in-progress work. Resume uses that
+responsible session, so a handoff resumes its recipient rather than its sender.
+
+Enabling this feature writes native session IDs to canonical request comments.
+Those IDs are not treated as credentials, but they can correlate local work and
+may be visible publicly. Transcript paths are never published; hook context is
+kept in a private local cache. Local sessions remain resumable only where the
+original harness history and account are available.
+
 ## Portable architecture
 
 The versioned configuration distinguishes the GitHub code host, the canonical
@@ -219,6 +269,10 @@ deliberately outside the current implementation.
 - `docs/workflow/kanbanlan.md`;
 - a marked Kanbanlan section in `AGENTS.md` and `CLAUDE.md`; and
 - `/.cache/kanbanlan/` and `/.worktrees/` in `.gitignore`.
+
+When session tracking is enabled, `init` also creates non-destructive project
+hooks for Codex, Claude Code, Grok Build, and AGY. Existing custom hook files are
+skipped unless `--force` is explicitly passed.
 
 Generated standalone files carry a marker. Existing custom templates are not
 overwritten unless `--force` is passed. Agent instruction sections are
