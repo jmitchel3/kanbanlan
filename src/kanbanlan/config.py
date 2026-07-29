@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,7 @@ class Config:
     code_host: str = "github"
     canonical_home: str = "github"
     projections: tuple[str, ...] = ("github_projects",)
+    session_tracking: bool = False
 
     def __post_init__(self) -> None:
         if self.repository.count("/") != 1:
@@ -44,6 +47,8 @@ class Config:
             raise ValueError(f"unsupported canonical kanban home: {self.canonical_home}")
         if not self.projections or any(not value for value in self.projections):
             raise ValueError("at least one valid kanban projection is required")
+        if not isinstance(self.session_tracking, bool):
+            raise ValueError("session_tracking must be true or false")
 
     @classmethod
     def load(cls, root: Path) -> Config:
@@ -64,6 +69,12 @@ class Config:
             repository = data.get("repository", {})
             local = data.get("local", {})
             coordination = data.get("coordination", {})
+            session_tracking = data.get("session_tracking", {})
+            if not isinstance(session_tracking, dict):
+                raise ValueError("session_tracking must be a table")
+            tracking_enabled = session_tracking.get("enabled", False)
+            if not isinstance(tracking_enabled, bool):
+                raise ValueError("session_tracking.enabled must be true or false")
             projections = coordination.get("projections", ["github_projects"])
             if not isinstance(projections, list) or not all(
                 isinstance(value, str) for value in projections
@@ -84,6 +95,7 @@ class Config:
                 code_host=coordination.get("code_host", "github"),
                 canonical_home=coordination.get("canonical_home", "github"),
                 projections=tuple(projections),
+                session_tracking=tracking_enabled,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -109,8 +121,25 @@ class Config:
             f'owner_type = "{_escape(self.project_owner_type)}"\n'
             f"number = {self.project_number}\n\n"
             "[local]\n"
-            f"stale_seconds = {self.stale_seconds}\n"
+            f"stale_seconds = {self.stale_seconds}\n\n"
+            "[session_tracking]\n"
+            f"enabled = {'true' if self.session_tracking else 'false'}\n"
         )
+
+    def session_tracking_enabled(
+        self,
+        environ: Mapping[str, str] | None = None,
+    ) -> bool:
+        values = environ if environ is not None else os.environ
+        override = values.get("KANBANLAN_SESSION_TRACKING")
+        if override is None:
+            return self.session_tracking
+        normalized = override.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("KANBANLAN_SESSION_TRACKING must be true/false, 1/0, yes/no, or on/off")
 
 
 def _escape(value: str) -> str:

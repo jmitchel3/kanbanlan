@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -17,6 +17,9 @@ from kanbanlan.cli import (
     _choose_project,
     _cmd_init,
     _cmd_reconcile,
+    _cmd_resume,
+    _cmd_session_hook,
+    _cmd_sessions,
     _cmd_upgrade,
     _cmd_worker,
     _materialize_project,
@@ -24,15 +27,173 @@ from kanbanlan.cli import (
     _project_number,
     _project_reference,
     _prompt_bool,
+    _record_session_activity,
     build_parser,
     main,
 )
+from kanbanlan.config import Config
 from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, CommandResult
+from kanbanlan.sessions import AgentSession
 from kanbanlan.workflow import Drift
 
 
 class CliTests(unittest.TestCase):
+    def test_session_tracking_cli_options_are_explicit(self) -> None:
+        init = build_parser().parse_args(["init", "--session-tracking"])
+        claim = build_parser().parse_args(
+            [
+                "claim",
+                "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--touchpoints",
+                "src",
+                "--actor-session",
+                "codex:019f-test",
+            ]
+        )
+
+        self.assertTrue(init.session_tracking)
+        self.assertEqual("codex:019f-test", claim.actor_session)
+
+    def test_sessions_displays_native_id_with_harness_and_resume_command(self) -> None:
+        item = self._session_item()
+        store = mock.Mock()
+        store.ensure.return_value = {"items": [item]}
+        args = build_parser().parse_args(["sessions", item["kanbanlan_id"]])
+        output = StringIO()
+
+        with (
+            mock.patch(
+                "kanbanlan.cli._context",
+                return_value=(Path("/repo"), mock.Mock(), mock.Mock(), store),
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(0, _cmd_sessions(args))
+
+        self.assertIn("019f-test · codex", output.getvalue())
+        self.assertIn("codex resume 019f-test", output.getvalue())
+
+    def test_resume_selects_handoff_recipient_as_responsible_session(self) -> None:
+        item = self._session_item()
+        item["session_history"].append(
+            {
+                "action": "handoff",
+                "at": "2026-07-29T12:01:00Z",
+                "actor": {
+                    "display": "019f-test · codex",
+                    "resume_command": ["codex", "resume", "019f-test"],
+                },
+                "responsible": {
+                    "display": "claude-test · claude",
+                    "resume_command": ["claude", "--resume", "claude-test"],
+                },
+            }
+        )
+        store = mock.Mock()
+        store.ensure.return_value = {"items": [item]}
+        args = build_parser().parse_args(["resume", item["kanbanlan_id"], "--action", "handoff"])
+        output = StringIO()
+
+        with (
+            mock.patch(
+                "kanbanlan.cli._context",
+                return_value=(Path("/repo"), mock.Mock(), mock.Mock(), store),
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(0, _cmd_resume(args))
+
+        self.assertEqual("claude --resume claude-test", output.getvalue().strip())
+
+    def test_session_hook_registers_native_context_only_when_enabled(self) -> None:
+        root = Path("/repo")
+        config = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+            session_tracking=True,
+        )
+        context = mock.Mock()
+        args = build_parser().parse_args(["session-hook", "--agent", "agy"])
+        output = StringIO()
+
+        with (
+            mock.patch("kanbanlan.cli._root", return_value=root),
+            mock.patch("kanbanlan.cli.Config.load", return_value=config),
+            mock.patch("kanbanlan.cli.cache_dir", return_value=Path("/cache")),
+            mock.patch("kanbanlan.cli.SessionContextStore", return_value=context),
+            mock.patch("sys.stdin", StringIO('{"conversationId":"agy-test","cwd":"/repo"}')),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(0, _cmd_session_hook(args))
+
+        registered = context.register.call_args.args[0]
+        self.assertEqual("agy-test · agy", registered.display)
+        self.assertEqual("{}", output.getvalue().strip())
+
+    def test_activity_comment_is_opt_in(self) -> None:
+        provider = mock.Mock()
+        session = AgentSession("codex", "019f-test", "test")
+        disabled = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+        )
+        enabled = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+            session_tracking=True,
+        )
+
+        _record_session_activity(
+            config=disabled,
+            provider=provider,
+            reference=1,
+            action="triage",
+            from_status="Inbox",
+            to_status="Ready",
+            actor=session,
+        )
+        provider.comment_request.assert_not_called()
+
+        _record_session_activity(
+            config=enabled,
+            provider=provider,
+            reference=1,
+            action="triage",
+            from_status="Inbox",
+            to_status="Ready",
+            actor=session,
+        )
+        self.assertIn("019f-test · codex", provider.comment_request.call_args.args[1])
+
+    @staticmethod
+    def _session_item() -> dict:
+        return {
+            "type": "ISSUE",
+            "number": 1,
+            "title": "Tracked request",
+            "kanbanlan_id": "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "provider_ref": "github:acme/widget#1",
+            "session_history": [
+                {
+                    "action": "triage",
+                    "at": "2026-07-29T12:00:00Z",
+                    "to_status": "Ready",
+                    "actor": {
+                        "display": "019f-test · codex",
+                        "resume_command": ["codex", "resume", "019f-test"],
+                    },
+                }
+            ],
+            "session_history_truncated": False,
+        }
+
     def test_worker_lifecycle_parser_accepts_scoped_account(self) -> None:
         args = build_parser().parse_args(
             ["worker", "enable", "--github-login", "alice", "--interval", "60"]

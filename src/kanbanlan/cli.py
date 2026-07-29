@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import re
+import shlex
 import shutil
 import sys
 import uuid
@@ -30,6 +32,14 @@ from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
+from kanbanlan.sessions import (
+    AgentSession,
+    SessionContextStore,
+    activity_comment,
+    detect_agent_session,
+    hook_workspaces,
+    session_from_hook_payload,
+)
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.ui import (
     BOLD,
@@ -73,10 +83,14 @@ COMMAND_NAMES = (
     "next",
     "reconcile",
     "capture",
+    "triage",
     "claim",
     "release",
     "review",
     "handoff",
+    "sessions",
+    "resume",
+    "session-hook",
     "record",
     "worker",
 )
@@ -102,6 +116,7 @@ class InitPlan:
     production_branch: str
     hostname: str
     stale_seconds: int
+    session_tracking: bool
     reconcile: bool
     open_project: bool
     local_only: bool
@@ -127,6 +142,14 @@ class KanbanlanParser(argparse.ArgumentParser):
                 )
         error(message, hint=hint)
         raise SystemExit(2)
+
+
+def _add_actor_session_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--actor-session",
+        metavar="HARNESS:SESSION_ID",
+        help="provider-native session that performed this lifecycle action",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=180,
         help="snapshot freshness window (default: 180)",
     )
+    init.add_argument(
+        "--session-tracking",
+        action="store_true",
+        help="opt in to provider-native agent session attribution",
+    )
     init.add_argument("--force", action="store_true", help="replace custom generated targets")
     init.add_argument(
         "--non-interactive",
@@ -252,6 +280,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="priority:p2",
         help="request priority (default: priority:p2)",
     )
+    _add_actor_session_argument(capture)
+
+    triage = commands.add_parser("triage", help="move one Inbox request to Ready")
+    triage.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    _add_actor_session_argument(triage)
 
     claim = commands.add_parser("claim", help="claim one Ready issue")
     claim.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
@@ -264,14 +297,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="claim using the current branch/worktree instead of creating one",
     )
+    _add_actor_session_argument(claim)
 
     release = commands.add_parser("release", help="release an active claim")
     release.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     release.add_argument("--reason", required=True, help="why the claim is being released")
     release.add_argument("--blocked", action="store_true", help="move to Blocked instead of Ready")
+    _add_actor_session_argument(release)
 
     review = commands.add_parser("review", help="move an issue with an open PR to review")
     review.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    _add_actor_session_argument(review)
 
     handoff = commands.add_parser("handoff", help="transfer an active claim")
     handoff.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
@@ -279,6 +315,36 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--branch", required=True, help="branch the new owner should continue")
     handoff.add_argument("--worktree", required=True, help="worktree the new owner should continue")
     handoff.add_argument("--reason", required=True, help="handoff context")
+    _add_actor_session_argument(handoff)
+
+    sessions = commands.add_parser(
+        "sessions",
+        help="show agent sessions that performed lifecycle activity on one request",
+    )
+    sessions.add_argument("request", help="Kanbanlan ID or canonical provider reference")
+    sessions.add_argument("--action", help="only show one lifecycle action")
+
+    resume = commands.add_parser(
+        "resume",
+        help="print or run the latest recorded agent resume command for one request",
+    )
+    resume.add_argument("request", help="Kanbanlan ID or canonical provider reference")
+    resume.add_argument("--action", help="select the latest session for one lifecycle action")
+    resume.add_argument(
+        "--run",
+        action="store_true",
+        help="replace Kanbanlan with the native agent resume command",
+    )
+
+    session_hook = commands.add_parser(
+        "session-hook",
+        help="register provider-native session context from an agent lifecycle hook",
+    )
+    session_hook.add_argument(
+        "--agent",
+        required=True,
+        help="agent harness supplying the hook payload (codex, claude, grok, or agy)",
+    )
 
     record = commands.add_parser(
         "record",
@@ -312,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_color(args.color)
     configure_progress(not args.json_output)
-    if args.command != "upgrade" and not args.json_output:
+    if args.command not in {"upgrade", "session-hook"} and not args.json_output:
         notify_if_update_available(__version__)
     try:
         handler = globals()[f"_cmd_{args.command.replace('-', '_')}"]
@@ -426,6 +492,52 @@ def _context(
     return root, config, provider, store
 
 
+def _actor_session(
+    args: argparse.Namespace,
+    root: Path,
+    config: Config,
+) -> AgentSession | None:
+    explicit = getattr(args, "actor_session", None)
+    if not config.session_tracking_enabled():
+        if explicit:
+            raise RuntimeError(
+                "--actor-session requires session tracking; set "
+                "[session_tracking].enabled = true or KANBANLAN_SESSION_TRACKING=true"
+            )
+        return None
+    return detect_agent_session(
+        explicit=explicit,
+        store=SessionContextStore(cache_dir(root)),
+        root=root,
+    )
+
+
+def _record_session_activity(
+    *,
+    config: Config,
+    provider: CoordinationProvider,
+    reference: int | str,
+    action: str,
+    from_status: str | None,
+    to_status: str | None,
+    actor: AgentSession | None,
+    owner_session: str | None = None,
+) -> None:
+    if not config.session_tracking_enabled():
+        return
+    provider.comment_request(
+        reference,
+        activity_comment(
+            action=action,
+            at=_utc_timestamp(),
+            from_status=from_status,
+            to_status=to_status,
+            actor=actor,
+            owner_session=owner_session,
+        ),
+    )
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
     repository = args.repository or discover_repository(root)
@@ -513,6 +625,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         production_branch=production_branch,
         hostname=args.hostname,
         stale_seconds=args.stale_seconds,
+        session_tracking=args.session_tracking,
         reconcile=not args.skip_reconcile and not args.local_only,
         open_project=open_project and not args.local_only,
         local_only=args.local_only,
@@ -542,6 +655,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         production_branch=plan.production_branch,
         hostname=plan.hostname,
         stale_seconds=plan.stale_seconds,
+        session_tracking=plan.session_tracking,
     )
     with status("Writing repository configuration"):
         results = scaffold_repository(root, config, force=args.force)
@@ -808,6 +922,7 @@ def _print_init_summary(plan: InitPlan) -> None:
     field("Pull request target", plan.default_branch)
     field("Staging branch", plan.stage_branch)
     field("Production branch", plan.production_branch or "not configured")
+    field("Agent session tracking", "enabled" if plan.session_tracking else "disabled")
     field("Reconcile open issues", "yes" if plan.reconcile else "no")
     if not plan.local_only:
         field("Open Project after setup", "yes" if plan.open_project else "no")
@@ -1140,7 +1255,8 @@ def _cmd_worker(args: argparse.Namespace) -> int:
 
 
 def _cmd_capture(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
     kanbanlan_id = new_kanbanlan_id()
     body = args.body or (
         "## Outcome\n\n"
@@ -1155,7 +1271,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
             provider.add_to_projection(url)
         with status("Reconciling initial issue state"):
             snapshot = store.refresh(provider)
-            remaining, _ = apply_reconciliation(
+            remaining, refreshed = apply_reconciliation(
                 provider,
                 store,
                 snapshot,
@@ -1167,15 +1283,68 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         ) from exc
     if remaining:
         raise RuntimeError("the issue was created but its Project state did not reconcile")
-    if _emit_result(args, {"kanbanlan_id": kanbanlan_id, "url": url}):
+    item = _issue(refreshed, kanbanlan_id)
+    _record_session_activity(
+        config=config,
+        provider=provider,
+        reference=item["number"],
+        action="capture",
+        from_status=None,
+        to_status="Inbox",
+        actor=actor,
+    )
+    if config.session_tracking_enabled():
+        store.refresh(provider)
+    result = {
+        "kanbanlan_id": kanbanlan_id,
+        "url": url,
+        "actor_session": actor.to_dict() if actor else None,
+    }
+    if _emit_result(args, result):
         return 0
     print(f"Kanbanlan: {kanbanlan_id}")
     print(url)
     return 0
 
 
+def _cmd_triage(args: argparse.Namespace) -> int:
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
+    with status(f"Checking request {args.issue}"):
+        snapshot = store.refresh(provider)
+    item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
+    if item.get("state") != "OPEN":
+        raise RuntimeError(f"request {label} is not open")
+    if item.get("status") != "Inbox":
+        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Inbox")
+    with status(f"Moving {label} to Ready"):
+        _set_state(provider, snapshot, number, "status:ready", "Ready")
+        _record_session_activity(
+            config=config,
+            provider=provider,
+            reference=number,
+            action="triage",
+            from_status="Inbox",
+            to_status="Ready",
+            actor=actor,
+        )
+        store.refresh(provider)
+    result = {
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "status": "Ready",
+        "actor_session": actor.to_dict() if actor else None,
+    }
+    if _emit_result(args, result):
+        return 0
+    success(f"Moved {label} to Ready")
+    return 0
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
     with status(f"Checking request {args.issue}"):
         snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
@@ -1188,7 +1357,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     if item.get("active_claim"):
         raise RuntimeError(f"request {label} already has an active claim")
 
-    session = args.session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
+    session = args.session or (actor.reference if actor else None)
+    session = session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
     branch, worktree = _claim_checkout(args, root, config, item)
     timestamp = _utc_timestamp()
     with status(f"Posting claim for {label}"):
@@ -1227,11 +1397,22 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         latest = store.refresh(provider)
         _set_state(provider, latest, number, "status:ready", "Ready")
         raise
+    _record_session_activity(
+        config=config,
+        provider=provider,
+        reference=number,
+        action="claim",
+        from_status="Ready",
+        to_status="In progress",
+        actor=actor,
+        owner_session=session,
+    )
     store.refresh(provider)
     result = {
         "kanbanlan_id": item.get("kanbanlan_id"),
         "provider_ref": item.get("provider_ref"),
         "session": session,
+        "actor_session": actor.to_dict() if actor else None,
         "branch": branch,
         "worktree": worktree,
     }
@@ -1297,7 +1478,8 @@ def _create_worktree(root: Path, config: Config, branch: str, worktree: Path) ->
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
         snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
@@ -1318,10 +1500,25 @@ def _cmd_release(args: argparse.Namespace) -> int:
             _set_state(provider, latest, number, "status:blocked", "Blocked")
         else:
             _set_state(provider, latest, number, "status:ready", "Ready")
+        _record_session_activity(
+            config=config,
+            provider=provider,
+            reference=number,
+            action="release",
+            from_status="In progress",
+            to_status=destination,
+            actor=actor,
+            owner_session=session,
+        )
         store.refresh(provider)
     if _emit_result(
         args,
-        {"kanbanlan_id": item.get("kanbanlan_id"), "session": session, "status": destination},
+        {
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "session": session,
+            "status": destination,
+            "actor_session": actor.to_dict() if actor else None,
+        },
     ):
         return 0
     success(f"Released {label} from {session}")
@@ -1329,7 +1526,8 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
     with status(f"Checking pull requests for request {args.issue}"):
         snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
@@ -1339,15 +1537,33 @@ def _cmd_review(args: argparse.Namespace) -> int:
         raise RuntimeError(f"request {label} has no linked open pull request")
     with status("Moving request to In review"):
         _set_state(provider, snapshot, number, "status:review", "In review")
+        _record_session_activity(
+            config=config,
+            provider=provider,
+            reference=number,
+            action="review",
+            from_status=item.get("status"),
+            to_status="In review",
+            actor=actor,
+            owner_session=(item.get("active_claim") or {}).get("session"),
+        )
         store.refresh(provider)
-    if _emit_result(args, {"kanbanlan_id": item.get("kanbanlan_id"), "status": "In review"}):
+    if _emit_result(
+        args,
+        {
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "status": "In review",
+            "actor_session": actor.to_dict() if actor else None,
+        },
+    ):
         return 0
     success(f"Moved {label} to In review")
     return 0
 
 
 def _cmd_handoff(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
         snapshot = store.refresh(provider)
     item = _issue(snapshot, args.issue)
@@ -1368,14 +1584,131 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
         )
         refreshed = store.refresh(provider)
         _set_state(provider, refreshed, number, "status:in-progress", "In progress")
+        _record_session_activity(
+            config=config,
+            provider=provider,
+            reference=number,
+            action="handoff",
+            from_status="In progress",
+            to_status="In progress",
+            actor=actor,
+            owner_session=args.session,
+        )
         store.refresh(provider)
     if _emit_result(
         args,
-        {"kanbanlan_id": item.get("kanbanlan_id"), "session": args.session},
+        {
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "session": args.session,
+            "actor_session": actor.to_dict() if actor else None,
+        },
     ):
         return 0
     success(f"Handed off {label} to {args.session}")
     return 0
+
+
+def _cmd_sessions(args: argparse.Namespace) -> int:
+    _, _, provider, store = _context(args)
+    with status(f"Loading session activity for request {args.request}"):
+        snapshot = store.ensure(provider)
+    item = _issue(snapshot, args.request)
+    history = _session_activity(item, action=args.action)
+    result = {
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "provider_ref": item.get("provider_ref"),
+        "history_truncated": item.get("session_history_truncated", False),
+        "events": history,
+    }
+    if _emit_result(args, result):
+        return 0
+    if not history:
+        print("No matching agent session activity is recorded.")
+        return 0
+    for event in history:
+        actor = event.get("actor")
+        responsible = event.get("responsible") or actor
+        display = responsible.get("display") if responsible else "unavailable"
+        destination = event.get("to_status") or "no status change"
+        print(f"{event['action']:<10} {destination:<12} {display}  {event.get('at') or ''}")
+        command = responsible.get("resume_command") if responsible else None
+        if command:
+            print(f"  resume: {shlex.join(command)}")
+        if actor and responsible and actor.get("reference") != responsible.get("reference"):
+            print(f"  actor:  {actor.get('display')}")
+    if item.get("session_history_truncated"):
+        warning("Only the most recent 100 request comments were available; history may be partial.")
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    _, _, provider, store = _context(args)
+    with status(f"Loading resumable sessions for request {args.request}"):
+        snapshot = store.ensure(provider)
+    item = _issue(snapshot, args.request)
+    history = _session_activity(item, action=args.action)
+    resumable: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for event in history:
+        responsible = event.get("responsible") or event.get("actor")
+        if responsible and responsible.get("resume_command"):
+            resumable.append((event, responsible))
+    if not resumable:
+        scope = f" for action {args.action!r}" if args.action else ""
+        raise RuntimeError(f"request {request_label(item)} has no resumable agent session{scope}")
+    selected, selected_session = resumable[-1]
+    command = [str(value) for value in selected_session["resume_command"]]
+    result = {
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "action": selected["action"],
+        "at": selected.get("at"),
+        "session": selected_session,
+        "actor_session": selected.get("actor"),
+        "command": command,
+    }
+    if args.json_output:
+        _emit_result(args, result)
+        return 0
+    if args.run:
+        os.execvp(command[0], command)
+        raise AssertionError("os.execvp returned unexpectedly")
+    print(shlex.join(command))
+    return 0
+
+
+def _cmd_session_hook(args: argparse.Namespace) -> int:
+    root = _root(args)
+    config = Config.load(root)
+    try:
+        payload = json.load(sys.stdin)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not parse agent hook JSON from stdin: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("agent hook input must be a JSON object")
+    if config.session_tracking_enabled():
+        harness = "grok" if os.environ.get("GROK_SESSION_ID") else args.agent
+        session = session_from_hook_payload(payload, harness)
+        workspaces = hook_workspaces(payload)
+        cwd = payload.get("cwd")
+        if not cwd and workspaces:
+            cwd = workspaces[0]
+        SessionContextStore(cache_dir(root)).register(
+            session,
+            workspaces=workspaces or [str(root)],
+            cwd=str(cwd or root),
+        )
+    print("{}")
+    return 0
+
+
+def _session_activity(
+    item: dict[str, Any],
+    *,
+    action: str | None,
+) -> list[dict[str, Any]]:
+    history = item.get("session_history", [])
+    if action:
+        return [value for value in history if value.get("action") == action]
+    return list(history)
 
 
 def _cmd_record(args: argparse.Namespace) -> int:

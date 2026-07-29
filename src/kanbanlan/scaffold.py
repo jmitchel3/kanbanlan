@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,8 +55,61 @@ def scaffold_repository(root: Path, config: Config, *, force: bool = False) -> l
     block = agent_instructions(config)
     results.append(_upsert_section(root / "AGENTS.md", "# AGENTS.md", block))
     results.append(_upsert_section(root / "CLAUDE.md", "# CLAUDE.md", block))
+    if config.session_tracking:
+        for relative_path, content in session_tracking_hooks().items():
+            results.append(_write(root / relative_path, content, force=force))
     results.append(_append_gitignore(root / ".gitignore"))
     return results
+
+
+def session_tracking_hooks() -> dict[Path, str]:
+    def session_start(harness: str) -> str:
+        return (
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "matcher": "startup|resume|clear|compact",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"kanbanlan session-hook --agent {harness}",
+                                        "timeout": 5,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+    agy = (
+        json.dumps(
+            {
+                "kanbanlan-session-tracking": {
+                    "PreInvocation": [
+                        {
+                            "type": "command",
+                            "command": "kanbanlan session-hook --agent agy",
+                            "timeout": 5,
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return {
+        Path(".codex/hooks.json"): session_start("codex"),
+        Path(".claude/settings.json"): session_start("claude"),
+        Path(".grok/hooks/kanbanlan.json"): session_start("grok"),
+        Path(".agents/hooks.json"): agy,
+    }
 
 
 def _write(path: Path, content: str, *, force: bool) -> WriteResult:
@@ -260,6 +314,13 @@ def agent_instructions(config: Config) -> str:
         f"https://github.com/{owner_segment}/{config.project_owner}/projects/"
         f"{config.project_number}"
     )
+    tracking = ""
+    if config.session_tracking:
+        tracking = """\
+- Provider-native session tracking is enabled. Keep the generated agent hook
+  active, and let lifecycle commands auto-detect the current agent session. Use
+  `--actor-session HARNESS:SESSION_ID` only when automatic context is unavailable.
+"""
     return f"""## Request Coordination Workflow
 
 The canonical kanban home is `{config.canonical_home}`. GitHub Issues currently
@@ -281,7 +342,7 @@ and durable delivery records remain versioned here. Follow
   `kanbanlan claim <kanbanlan-id-or-provider-ref> --touchpoints ...`.
 - Use a dedicated request branch and worktree. Block semantic conflicts even when
   filenames differ. Do not expand a claimed card into another useful outcome.
-- Run `kanbanlan record <kanbanlan-id-or-provider-ref>` in the implementation
+{tracking}- Run `kanbanlan record <kanbanlan-id-or-provider-ref>` in the implementation
   worktree and complete its durable decisions, verification, and delivered result.
 - A pull request closes its issue and moves it to In review. Ownership lasts
   until merge, explicit release, or handoff. Project Done means delivered to
@@ -340,8 +401,43 @@ kanbanlan review KBL-...
 ```
 
 The earliest unreleased CLAIM comment owns the card. Claims do not expire
-automatically. Check the issue, branch, worktree, and PR before asking to take
-over stale work.
+automatically. Check the canonical request, branch, worktree, and PR before
+asking to take over stale work.
+
+## Optional agent session tracking
+
+Provider-native session attribution is disabled by default. Opt in during setup
+with `kanbanlan init --session-tracking`, or set this repository configuration:
+
+```toml
+[session_tracking]
+enabled = true
+```
+
+`KANBANLAN_SESSION_TRACKING=true` or `false` overrides the repository setting
+for one process. When enabled, Kanbanlan checks `--actor-session`, then
+`KANBANLAN_AGENT_SESSION=HARNESS:SESSION_ID`, then the paired
+`KANBANLAN_AGENT` and `KANBANLAN_SESSION_ID` variables, provider-native
+variables, and finally fresh context registered by the generated agent hooks.
+If no trustworthy ID is available, activity is recorded as unavailable rather
+than being presented as resumable.
+
+```sh
+kanbanlan triage KBL-...
+kanbanlan sessions KBL-...
+kanbanlan resume KBL-...                 # print the native resume command
+kanbanlan resume KBL-... --action claim --run
+```
+
+Supported resume adapters are Codex, Claude Code, Grok Build, and Google
+Antigravity AGY. Session entries display as `<session-id> · <harness>`. Native
+IDs are written to canonical request comments when tracking is enabled, so
+enable it only where that visibility is acceptable. Local sessions still
+require their original transcript store and account; an ID cannot recreate a
+deleted or non-persisted transcript.
+Claim and handoff history distinguishes the session that performed the action
+from the session responsible for the resulting work. Resume follows the
+responsible session, so a handoff targets its recipient.
 
 ## Durable request records
 

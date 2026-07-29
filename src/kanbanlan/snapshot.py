@@ -12,6 +12,7 @@ from typing import Any
 
 from kanbanlan.config import Config
 from kanbanlan.identity import extract_kanbanlan_id, find_kanbanlan_ids
+from kanbanlan.sessions import session_history
 
 SCHEMA_VERSION = 2
 CLAIM_RE = re.compile(r"^CLAIM:\s*(?P<claimed_at>[^\n]+)", re.MULTILINE)
@@ -163,6 +164,8 @@ def build_snapshot(
             "updated_at": content.get("updatedAt"),
         }
         if item_type == "ISSUE":
+            comments = content.get("comments", {})
+            comment_nodes = comments.get("nodes", [])
             labels = _labels(content)
             label_names = [label["name"] for label in labels]
             priority = next(
@@ -193,10 +196,13 @@ def build_snapshot(
                         for assignee in content.get("assignees", {}).get("nodes", [])
                     ),
                     "active_claim": (
-                        active_claim(content.get("comments", {}).get("nodes", []))
-                        if content.get("state") == "OPEN"
-                        else None
+                        active_claim(comment_nodes) if content.get("state") == "OPEN" else None
                     ),
+                    "session_history": session_history(comment_nodes),
+                    "session_history_truncated": int(
+                        comments.get("totalCount") or len(comment_nodes)
+                    )
+                    > len(comment_nodes),
                     "linked_open_pull_requests": _merge_pull_requests(
                         linked_pull_requests.get(number, []),
                         linked_pull_requests_by_kanbanlan_id.get(kanbanlan_id, [])

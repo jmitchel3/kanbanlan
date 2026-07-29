@@ -22,6 +22,9 @@ Repository policy and durable delivery records remain versioned here. Follow
   `kanbanlan claim <kanbanlan-id-or-provider-ref> --touchpoints ...`.
 - Use a dedicated request branch and worktree. Block semantic conflicts even when
   filenames differ. Do not expand a claimed card into another useful outcome.
+- Provider-native session tracking is enabled. Keep the generated agent hook
+  active, and let lifecycle commands auto-detect the current agent session. Use
+  `--actor-session HARNESS:SESSION_ID` only when automatic context is unavailable.
 - Run `kanbanlan record <kanbanlan-id-or-provider-ref>` in the implementation
   worktree and complete its durable decisions, verification, and delivered result.
 - A pull request closes its issue and moves it to In review. Ownership lasts

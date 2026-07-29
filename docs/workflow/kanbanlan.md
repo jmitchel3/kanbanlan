@@ -51,6 +51,41 @@ The earliest unreleased CLAIM comment owns the card. Claims do not expire
 automatically. Check the canonical request, branch, worktree, and PR before
 asking to take over stale work.
 
+## Optional agent session tracking
+
+Provider-native session attribution is disabled by default. Opt in during setup
+with `kanbanlan init --session-tracking`, or set this repository configuration:
+
+```toml
+[session_tracking]
+enabled = true
+```
+
+`KANBANLAN_SESSION_TRACKING=true` or `false` overrides the repository setting
+for one process. When enabled, Kanbanlan checks `--actor-session`, then
+`KANBANLAN_AGENT_SESSION=HARNESS:SESSION_ID`, then the paired
+`KANBANLAN_AGENT` and `KANBANLAN_SESSION_ID` variables, provider-native
+variables, and finally fresh context registered by the generated agent hooks.
+If no trustworthy ID is available, activity is recorded as unavailable rather
+than being presented as resumable.
+
+```sh
+kanbanlan triage KBL-...
+kanbanlan sessions KBL-...
+kanbanlan resume KBL-...                 # print the native resume command
+kanbanlan resume KBL-... --action claim --run
+```
+
+Supported resume adapters are Codex, Claude Code, Grok Build, and Google
+Antigravity AGY. Session entries display as `<session-id> · <harness>`. Native
+IDs are written to canonical request comments when tracking is enabled, so
+enable it only where that visibility is acceptable. Local sessions still
+require their original transcript store and account; an ID cannot recreate a
+deleted or non-persisted transcript.
+Claim and handoff history distinguishes the session that performed the action
+from the session responsible for the resulting work. Resume follows the
+responsible session, so a handoff targets its recipient.
+
 ## Durable request records
 
 After claiming a request, create its repository record:

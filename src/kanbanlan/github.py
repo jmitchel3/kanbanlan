@@ -72,6 +72,7 @@ query($owner: String!, $number: Int!, $after: String) {
               labels(first: 50) { nodes { name color } }
               assignees(first: 20) { nodes { login } }
               comments(last: 100) {
+                totalCount
                 nodes { body createdAt author { login } }
               }
               repository { nameWithOwner }
