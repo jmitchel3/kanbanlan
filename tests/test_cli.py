@@ -620,6 +620,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("cannot resolve the owner", output)
         self.assertIn("githubstatus.com", output)
 
+    def test_failed_command_is_reported_as_a_runnable_command(self) -> None:
+        stderr = StringIO()
+        failure = CommandError(
+            CommandResult(
+                (
+                    "gh",
+                    "project",
+                    "copy",
+                    "6",
+                    "--title",
+                    "prevenir-automations Delivery",
+                ),
+                1,
+                "",
+                "unknown owner type",
+            )
+        )
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, main(["status"]))
+
+        output = stderr.getvalue()
+        self.assertIn("--title 'prevenir-automations Delivery'", output)
+        self.assertNotIn("--title prevenir-automations Delivery", output)
+
     def test_mistyped_command_suggests_the_closest_command(self) -> None:
         stderr = StringIO()
 

@@ -467,7 +467,7 @@ def _friendly_error(exc: Exception) -> tuple[str, str | None]:
         return message, hint
 
     result = exc.result
-    command = " ".join(result.args)
+    command = shlex.join(result.args)
     detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
     normalized = detail.lower()
     hint = f"Run `{command}` directly for more detail."
