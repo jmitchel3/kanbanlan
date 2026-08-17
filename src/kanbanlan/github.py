@@ -250,6 +250,7 @@ class GitHub:
                 "json",
             ],
             check=False,
+            retry=True,
         )
         if probe.returncode == 0:
             return
@@ -277,10 +278,23 @@ class GitHub:
             ]
         )
 
-    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def graphql(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        *,
+        retry: bool = False,
+    ) -> dict[str, Any]:
+        """Run one GraphQL document.
+
+        Callers pass ``retry=True`` only for reads. Mutations stay on a single
+        attempt because a request that reached GitHub may have applied before
+        the response was lost.
+        """
         result = self.runner.run(
             ["gh", "api", "graphql", "--input", "-"],
             input_text=json.dumps({"query": query, "variables": variables}),
+            retry=retry,
         )
         payload = json.loads(result.stdout)
         errors = payload.get("errors")
@@ -291,14 +305,14 @@ class GitHub:
 
     def repository_info(self, repository: str) -> dict[str, Any]:
         owner, repo = repository.split("/", 1)
-        data = self.graphql(REPOSITORY_QUERY, {"owner": owner, "repo": repo})
+        data = self.graphql(REPOSITORY_QUERY, {"owner": owner, "repo": repo}, retry=True)
         value = data.get("repository")
         if not value:
             raise RuntimeError(f"repository {repository} was not found")
         return value
 
     def detect_owner_type(self, owner: str) -> str:
-        data = self.graphql(OWNER_QUERY, {"login": owner})
+        data = self.graphql(OWNER_QUERY, {"login": owner}, retry=True)
         value = data.get("repositoryOwner")
         if value and value.get("__typename") == "Organization":
             return "organization"
@@ -308,7 +322,8 @@ class GitHub:
 
     def list_projects(self, owner: str) -> list[dict[str, Any]]:
         payload = self.runner.json(
-            ["gh", "project", "list", "--owner", owner, "--limit", "100", "--format", "json"]
+            ["gh", "project", "list", "--owner", owner, "--limit", "100", "--format", "json"],
+            retry=True,
         )
         if isinstance(payload, list):
             return payload
@@ -463,6 +478,7 @@ class GitHub:
                     "number": config.project_number,
                     "after": cursor,
                 },
+                retry=True,
             )
             owner = payload.get(
                 "organization" if config.project_owner_type == "organization" else "user"
@@ -495,6 +511,7 @@ class GitHub:
             payload = self.graphql(
                 PULL_REQUEST_QUERY,
                 {"owner": owner, "repo": repo, "after": cursor},
+                retry=True,
             )
             repository = payload.get("repository")
             if not repository:
@@ -523,7 +540,8 @@ class GitHub:
                 "1000",
                 "--json",
                 "number,title,url,labels",
-            ]
+            ],
+            retry=True,
         )
         return payload
 
@@ -593,7 +611,8 @@ class GitHub:
                 config.repository,
                 "--json",
                 "labels",
-            ]
+            ],
+            retry=True,
         )
         current = {
             value["name"]
@@ -679,7 +698,8 @@ class GitHub:
                 config.repository,
                 "--json",
                 "body",
-            ]
+            ],
+            retry=True,
         )
         body = payload.get("body") or ""
         existing = extract_kanbanlan_id(body)
