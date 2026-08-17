@@ -31,7 +31,7 @@ from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id
 from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
-from kanbanlan.runner import CommandError, Runner
+from kanbanlan.runner import CommandError, Runner, is_transient_failure
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.sessions import (
     AgentSession,
@@ -472,7 +472,18 @@ def _friendly_error(exc: Exception) -> tuple[str, str | None]:
     normalized = detail.lower()
     hint = f"Run `{command}` directly for more detail."
     if result.args and result.args[0] == "gh":
-        if any(value in normalized for value in ("auth", "credential", "401", "scope")):
+        if is_transient_failure(result):
+            hint = (
+                "GitHub returned a temporary server error and retries did not clear it. "
+                "Check https://www.githubstatus.com, then run this command again."
+            )
+        elif "unknown owner type" in normalized:
+            hint = (
+                "The GitHub CLI reports this whenever it cannot resolve the owner, "
+                "including during a GitHub outage. Confirm the owner name, check "
+                "https://www.githubstatus.com, then run this command again."
+            )
+        elif any(value in normalized for value in ("auth", "credential", "401", "scope")):
             hint = "Run 'kanbanlan auth' to repair GitHub login and Project access."
         elif any(
             value in normalized for value in ("connect", "network", "resolve host", "timed out")

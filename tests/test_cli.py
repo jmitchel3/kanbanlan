@@ -582,6 +582,44 @@ class CliTests(unittest.TestCase):
 
         self.assertIn("Hint: Run 'kanbanlan auth'", stderr.getvalue())
 
+    def test_upstream_outage_hint_points_at_github_status(self) -> None:
+        stderr = StringIO()
+        failure = CommandError(
+            CommandResult(
+                ("gh", "api", "graphql"),
+                1,
+                "",
+                "gh: No server is currently available to service your request. (HTTP 503)",
+            )
+        )
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, main(["status"]))
+
+        output = stderr.getvalue()
+        self.assertIn("temporary server error", output)
+        self.assertIn("githubstatus.com", output)
+        self.assertNotIn("kanbanlan auth", output)
+
+    def test_unknown_owner_type_hint_names_the_outage_possibility(self) -> None:
+        stderr = StringIO()
+        failure = CommandError(
+            CommandResult(("gh", "project", "copy", "6"), 1, "", "unknown owner type")
+        )
+        with (
+            mock.patch("kanbanlan.cli.notify_if_update_available"),
+            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, main(["status"]))
+
+        output = stderr.getvalue()
+        self.assertIn("cannot resolve the owner", output)
+        self.assertIn("githubstatus.com", output)
+
     def test_mistyped_command_suggests_the_closest_command(self) -> None:
         stderr = StringIO()
 

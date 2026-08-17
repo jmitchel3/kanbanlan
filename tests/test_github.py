@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from kanbanlan.config import Config
-from kanbanlan.github import OWNER_QUERY, GitHub
+from kanbanlan.github import OWNER_QUERY, UPDATE_STATUS_FIELD, GitHub
 from kanbanlan.runner import CommandError, CommandResult
 
 
@@ -27,7 +27,7 @@ class StubGitHub(GitHub):
     def project_metadata(self):
         return self.project
 
-    def graphql(self, query, variables):
+    def graphql(self, query, variables, *, retry=False):
         self.mutations.append((query, variables))
         return {}
 
@@ -96,8 +96,8 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual("organization", github.detect_owner_type("github"))
         self.assertEqual(
             [
-                mock.call(OWNER_QUERY, {"login": "monalisa"}),
-                mock.call(OWNER_QUERY, {"login": "github"}),
+                mock.call(OWNER_QUERY, {"login": "monalisa"}, retry=True),
+                mock.call(OWNER_QUERY, {"login": "github"}, retry=True),
             ],
             github.graphql.call_args_list,
         )
@@ -122,6 +122,7 @@ class GitHubTests(unittest.TestCase):
                 "json",
             ],
             check=False,
+            retry=True,
         )
 
     def test_project_scope_does_not_reauthenticate_for_unrelated_failure(self) -> None:
@@ -158,6 +159,39 @@ class GitHubTests(unittest.TestCase):
                 "json",
             ]
         )
+
+    def test_graphql_retries_reads_but_never_mutations(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(
+            ("gh", "api", "graphql"), 0, '{"data": {"ok": true}}', ""
+        )
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        github.graphql(OWNER_QUERY, {"login": "acme"}, retry=True)
+        self.assertTrue(runner.run.call_args.kwargs["retry"])
+
+        # A mutation may have applied before the response was lost, so the
+        # default must stay single-attempt.
+        github.graphql(UPDATE_STATUS_FIELD, {"field": "abc", "options": []})
+        self.assertFalse(runner.run.call_args.kwargs["retry"])
+
+    def test_project_creation_is_not_retried(self) -> None:
+        runner = mock.Mock()
+        runner.json.return_value = {"number": 3}
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        github.create_project("acme", "Delivery")
+
+        self.assertNotIn("retry", runner.json.call_args.kwargs)
+
+    def test_open_issue_listing_is_retried(self) -> None:
+        runner = mock.Mock()
+        runner.json.return_value = []
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        github.open_issues()
+
+        self.assertTrue(runner.json.call_args.kwargs["retry"])
 
     def test_status_aliases_are_reused_without_clearing_ids(self) -> None:
         github = StubGitHub(
