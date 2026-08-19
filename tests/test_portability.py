@@ -16,7 +16,7 @@ from kanbanlan.identity import (
     strip_kanbanlan_metadata,
 )
 from kanbanlan.records import create_record
-from kanbanlan.snapshot import CacheStore, build_snapshot
+from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, build_snapshot
 from kanbanlan.workflow import apply_reconciliation, plan_reconciliation
 
 KANBANLAN_ID = "KBL-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -104,7 +104,7 @@ class IdentityTests(unittest.TestCase):
         )
         item = snapshot["items"][0]
 
-        self.assertEqual(2, snapshot["schema_version"])
+        self.assertEqual(SCHEMA_VERSION, snapshot["schema_version"])
         self.assertEqual(KANBANLAN_ID, item["kanbanlan_id"])
         self.assertEqual("github:acme/widget#7", item["provider_ref"])
         self.assertEqual(11, item["linked_open_pull_requests"][0]["number"])

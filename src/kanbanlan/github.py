@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
 from kanbanlan.runner import CommandError, CommandResult, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
-from kanbanlan.snapshot import build_snapshot
+from kanbanlan.snapshot import SCOPE_PROJECT, SCOPE_REPOSITORY, build_snapshot
 
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!, $after: String) {
@@ -120,6 +121,7 @@ query($owner: String!, $repo: String!, $after: String) {
         title
         body
         url
+        repository { nameWithOwner }
         headRefName
         baseRefName
         isDraft
@@ -182,6 +184,28 @@ STATUS_ALIASES = {
     "In progress": {"In Progress", "Doing"},
     "In review": {"Review"},
 }
+
+
+@dataclass(frozen=True)
+class ProjectRead:
+    """One Project read plus the open pull requests its scope needed."""
+
+    project: dict[str, Any]
+    pull_requests: list[dict[str, Any]] = field(default_factory=list)
+    rate_limit: dict[str, Any] = field(default_factory=dict)
+    unavailable_repositories: list[dict[str, Any]] = field(default_factory=list)
+
+
+def project_repositories(project: dict[str, Any]) -> set[str]:
+    """Return every repository the Project already references."""
+
+    repositories: set[str] = set()
+    for item in project.get("items", []):
+        content = item.get("content") or {}
+        name = (content.get("repository") or {}).get("nameWithOwner")
+        if name:
+            repositories.add(name)
+    return repositories
 
 
 class GitHub:
@@ -442,23 +466,59 @@ class GitHub:
                 ]
             )
 
-    def fetch(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-        project, project_rate_limit = self._fetch_project()
-        pull_requests, pr_rate_limit = self._fetch_pull_requests()
-        rate_limit = min(
-            (project_rate_limit, pr_rate_limit),
-            key=lambda value: value.get("remaining", 10**12),
-        )
-        return project, pull_requests, rate_limit
+    def collect(self, *, scope: str = SCOPE_REPOSITORY) -> ProjectRead:
+        """Read the Project once and the open pull requests each scope needs.
 
-    def snapshot(self, *, generated_at: datetime) -> dict[str, Any]:
-        project, pull_requests, rate_limit = self.fetch()
+        Project scope stays bounded to repositories the Project already
+        references; it never enumerates repositories owned by the account. A
+        peer repository that cannot be read is reported instead of failing the
+        whole read, because the configured repository still has usable state.
+        """
+
+        config = self._config()
+        project, project_rate_limit = self._fetch_project()
+        targets = [config.repository]
+        if scope == SCOPE_PROJECT:
+            targets = sorted({config.repository, *project_repositories(project)})
+        pull_requests: list[dict[str, Any]] = []
+        unavailable: list[dict[str, Any]] = []
+        rate_limits = [project_rate_limit]
+        for target in targets:
+            try:
+                values, rate_limit = self._fetch_pull_requests(target)
+            except (CommandError, RuntimeError) as exc:
+                if target == config.repository:
+                    raise
+                unavailable.append({"repository": target, "error": str(exc)})
+                continue
+            pull_requests.extend(values)
+            rate_limits.append(rate_limit)
+        return ProjectRead(
+            project=project,
+            pull_requests=pull_requests,
+            rate_limit=min(rate_limits, key=lambda value: value.get("remaining", 10**12)),
+            unavailable_repositories=unavailable,
+        )
+
+    def fetch(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        read = self.collect()
+        return read.project, read.pull_requests, read.rate_limit
+
+    def snapshot(
+        self,
+        *,
+        generated_at: datetime,
+        scope: str = SCOPE_REPOSITORY,
+    ) -> dict[str, Any]:
+        read = self.collect(scope=scope)
         return build_snapshot(
             self._config(),
-            project,
-            pull_requests,
-            rate_limit,
+            read.project,
+            read.pull_requests,
+            read.rate_limit,
             generated_at=generated_at,
+            scope=scope,
+            unavailable_repositories=read.unavailable_repositories,
         )
 
     def _fetch_project(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -501,9 +561,12 @@ class GitHub:
         metadata["items"] = items
         return metadata, rate_limit
 
-    def _fetch_pull_requests(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        config = self._config()
-        owner, repo = config.repository.split("/", 1)
+    def _fetch_pull_requests(
+        self,
+        repository: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        target = repository or self._config().repository
+        owner, repo = target.split("/", 1)
         values: list[dict[str, Any]] = []
         cursor: str | None = None
         rate_limit: dict[str, Any] = {}
@@ -513,10 +576,10 @@ class GitHub:
                 {"owner": owner, "repo": repo, "after": cursor},
                 retry=True,
             )
-            repository = payload.get("repository")
-            if not repository:
-                raise RuntimeError(f"repository {config.repository} was not found")
-            connection = repository["pullRequests"]
+            repository_payload = payload.get("repository")
+            if not repository_payload:
+                raise RuntimeError(f"repository {target} was not found")
+            connection = repository_payload["pullRequests"]
             values.extend(connection.get("nodes", []))
             rate_limit = payload.get("rateLimit", rate_limit)
             page_info = connection["pageInfo"]
@@ -743,9 +806,9 @@ class GitHub:
 
 
 def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
-    for field in project.get("fields", {}).get("nodes", []):
-        if field and field.get("name") == "Status" and "options" in field:
-            return field
+    for value in project.get("fields", {}).get("nodes", []):
+        if value and value.get("name") == "Status" and "options" in value:
+            return value
     return None
 
 

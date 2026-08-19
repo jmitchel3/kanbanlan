@@ -41,7 +41,7 @@ from kanbanlan.sessions import (
     hook_workspaces,
     session_from_hook_payload,
 )
-from kanbanlan.snapshot import CacheStore
+from kanbanlan.snapshot import SCOPE_PROJECT, CacheStore, utc_now
 from kanbanlan.ui import (
     BOLD,
     CYAN,
@@ -143,6 +143,15 @@ class KanbanlanParser(argparse.ArgumentParser):
                 )
         error(message, hint=hint)
         raise SystemExit(2)
+
+
+def _add_project_scope_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--project",
+        dest="project_scope",
+        action="store_true",
+        help="read every repository on the configured Project instead of this one",
+    )
 
 
 def _add_actor_session_argument(command: argparse.ArgumentParser) -> None:
@@ -272,10 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="check local config, auth, fields, and labels")
     commands.add_parser("ensure", help="ensure the shared snapshot is fresh")
     commands.add_parser("refresh", help="refresh the shared snapshot now")
-    commands.add_parser("status", help="show local cache and board summary")
-    commands.add_parser("snapshot", help="print the current snapshot JSON")
+    status_command = commands.add_parser("status", help="show local cache and board summary")
+    _add_project_scope_argument(status_command)
+    snapshot_command = commands.add_parser("snapshot", help="print the current snapshot JSON")
+    _add_project_scope_argument(snapshot_command)
     commands.add_parser("path", help="print the shared snapshot path")
     commands.add_parser("next", help="show the first unblocked Ready card")
+    commands.add_parser(
+        "overlap",
+        help="list open requests and pull requests across the whole Project",
+    )
 
     reconcile = commands.add_parser("reconcile", help="report label/claim/PR/Project drift")
     reconcile.add_argument("--apply", action="store_true", help="apply the displayed repairs")
@@ -410,9 +425,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _write_json(value: dict[str, Any], *, stream: Any = sys.stdout) -> None:
-    json.dump(value, stream, indent=2, sort_keys=True)
-    stream.write("\n")
+def _write_json(value: dict[str, Any], *, stream: Any = None) -> None:
+    # Resolve the stream on each call so a redirected stdout is honored.
+    target = stream if stream is not None else sys.stdout
+    json.dump(value, target, indent=2, sort_keys=True)
+    target.write("\n")
 
 
 def _emit_result(args: argparse.Namespace, value: dict[str, Any]) -> bool:
@@ -1182,7 +1199,43 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_snapshot(provider: CoordinationProvider, label: str) -> dict[str, Any]:
+    """Read the whole Project live without disturbing the repository cache.
+
+    The shared cache is repository-scoped by contract, so a project-scoped read
+    stays in memory. Every project scope command is read-only.
+    """
+
+    if not provider.capabilities.project_scope:
+        raise RuntimeError(
+            f"canonical home {provider.provider_name!r} does not support project scope"
+        )
+    with status(label):
+        return provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+
+
+def _project_source(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return snapshot.get("source", {})
+
+
+def _warn_unavailable_repositories(snapshot: dict[str, Any]) -> None:
+    for entry in _project_source(snapshot).get("unavailable_repositories", []):
+        warning(f"peer repository {entry['repository']} could not be read: {entry['error']}")
+
+
+def _repository_status_counts(snapshot: dict[str, Any]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for item in snapshot.get("items", []):
+        repository = item.get("repository") or "unknown"
+        name = item.get("status") or "Unspecified"
+        counts.setdefault(repository, {})
+        counts[repository][name] = counts[repository].get(name, 0) + 1
+    return {key: dict(sorted(value.items())) for key, value in sorted(counts.items())}
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
+    if getattr(args, "project_scope", False):
+        return _cmd_status_project(args)
     _, _, _, store = _context(args)
     inspection = store.inspect()
     if _emit_result(args, inspection):
@@ -1205,13 +1258,122 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_status_project(args: argparse.Namespace) -> int:
+    _, config, provider, _ = _context(args)
+    snapshot = _project_snapshot(provider, "Reading every repository on the Project")
+    source = _project_source(snapshot)
+    per_repository = _repository_status_counts(snapshot)
+    result = {
+        "scope": source.get("scope"),
+        "repository": config.repository,
+        "repositories": source.get("repositories", []),
+        "unavailable_repositories": source.get("unavailable_repositories", []),
+        "generated_at": snapshot.get("generated_at"),
+        "project": snapshot.get("project"),
+        "status_counts": snapshot.get("status_counts", {}),
+        "repository_status_counts": per_repository,
+    }
+    if _emit_result(args, result):
+        return 0
+    heading("Kanbanlan status (project scope)")
+    project = snapshot.get("project", {})
+    field("Project", f"{project.get('title')} (#{project.get('number')})")
+    field("Generated", snapshot.get("generated_at"))
+    counts = snapshot.get("status_counts", {})
+    board = ", ".join(f"{status_value(name)}={count}" for name, count in counts.items()) or "empty"
+    field("Board", board)
+    for repository, values in per_repository.items():
+        marker = repository
+        if repository == config.repository:
+            marker = f"{repository} (this repository)"
+        summary = ", ".join(f"{status_value(name)}={count}" for name, count in values.items())
+        field(marker, summary or "empty")
+    _warn_unavailable_repositories(snapshot)
+    return 0
+
+
 def _cmd_snapshot(args: argparse.Namespace) -> int:
-    _, _, _, store = _context(args)
-    snapshot = store.snapshot()
-    if snapshot is None:
-        raise RuntimeError("no snapshot is available; run 'kanbanlan ensure'")
+    if getattr(args, "project_scope", False):
+        _, _, provider, _ = _context(args)
+        snapshot = _project_snapshot(provider, "Reading every repository on the Project")
+    else:
+        _, _, _, store = _context(args)
+        snapshot = store.snapshot()
+        if snapshot is None:
+            raise RuntimeError("no snapshot is available; run 'kanbanlan ensure'")
     json.dump(snapshot, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+    return 0
+
+
+def _cmd_overlap(args: argparse.Namespace) -> int:
+    _, config, provider, _ = _context(args)
+    snapshot = _project_snapshot(provider, "Checking every open card and pull request")
+    source = _project_source(snapshot)
+    requests = [
+        {
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "provider_ref": item.get("provider_ref"),
+            "display_id": item.get("display_id"),
+            "repository": item.get("repository"),
+            "title": item.get("title"),
+            "status": item.get("status"),
+            "priority": item.get("priority"),
+            "url": item.get("canonical_url") or item.get("url"),
+            "active_claim": item.get("active_claim"),
+            "linked_open_pull_requests": item.get("linked_open_pull_requests", []),
+        }
+        for item in snapshot.get("items", [])
+        if item.get("type") == "ISSUE" and item.get("state") == "OPEN"
+    ]
+    linked_urls = {
+        pull_request["url"]
+        for request in requests
+        for pull_request in request["linked_open_pull_requests"]
+    }
+    unlinked = [
+        pull_request
+        for pull_request in snapshot.get("open_pull_requests", [])
+        if pull_request["url"] not in linked_urls
+    ]
+    result = {
+        "scope": source.get("scope"),
+        "repository": config.repository,
+        "repositories": source.get("repositories", []),
+        "unavailable_repositories": source.get("unavailable_repositories", []),
+        "generated_at": snapshot.get("generated_at"),
+        "project": snapshot.get("project"),
+        "open_requests": requests,
+        "unlinked_open_pull_requests": unlinked,
+    }
+    if _emit_result(args, result):
+        return 0
+    heading("Project overlap check")
+    project = snapshot.get("project", {})
+    field("Project", f"{project.get('title')} (#{project.get('number')})")
+    field("Repositories", ", ".join(source.get("repositories", [])) or "none")
+    _warn_unavailable_repositories(snapshot)
+    if not requests:
+        print("No open requests are on the Project.")
+    for request in requests:
+        section(
+            f"{request['provider_ref']} [{status_value(request.get('status') or 'Unspecified')}] "
+            f"{request['title']}"
+        )
+        if request["kanbanlan_id"]:
+            field("Kanbanlan", request["kanbanlan_id"])
+        claim = request.get("active_claim")
+        if claim:
+            owner = claim.get("session") or claim.get("author") or "unknown session"
+            field("Claim", f"{owner} at {claim['claimed_at']}")
+            if claim.get("touchpoints"):
+                field("Touchpoints", claim["touchpoints"])
+        for pull_request in request["linked_open_pull_requests"]:
+            field("Pull request", f"{pull_request['provider_ref']} {pull_request['url']}")
+    if unlinked:
+        section("Open pull requests with no linked request")
+        for pull_request in unlinked:
+            field(pull_request["provider_ref"], pull_request["url"])
     return 0
 
 

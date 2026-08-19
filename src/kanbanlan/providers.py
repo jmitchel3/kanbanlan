@@ -16,6 +16,7 @@ class ProviderCapabilities:
     pull_request_links: bool = True
     projections: bool = True
     repository_records: bool = True
+    project_scope: bool = True
 
 
 class CoordinationProvider(Protocol):
