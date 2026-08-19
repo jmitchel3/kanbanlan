@@ -331,8 +331,10 @@ and durable delivery records remain versioned here. Follow
 
 - At session start run `kanbanlan ensure`. Before mutations run
   `kanbanlan reconcile` and inspect all open cards and pull requests for
-  semantic overlap. If live coordination state is unavailable, do not start
-  potentially overlapping implementation.
+  semantic overlap. When this repository shares its Project with other
+  repositories, run `kanbanlan overlap` so the check covers them too. If live
+  coordination state is unavailable, do not start potentially overlapping
+  implementation.
 - Status questions are read-only. “Remember this” creates an Inbox card.
   “Let's work on this” authorizes a live overlap check and one claim.
 - Create or reuse one request per independently reviewable outcome. Each request
@@ -378,6 +380,43 @@ kanbanlan --json next
 requests, and projections. It also reports requests that need a Kanbanlan ID.
 Use `kanbanlan reconcile --apply` only after reviewing the plan. `--json`
 provides stable structured output for agents without requiring an MCP server.
+
+## Repository scope and Project scope
+
+One GitHub Project can serve several repositories. Kanbanlan reads it at two
+scopes, and the difference is visible in stable JSON as `source.scope`.
+
+| Scope | Value | What it contains |
+| --- | --- | --- |
+| Repository | `repository` | Only content owned by `{config.repository}`. |
+| Project | `project` | Every repository the Project already references. |
+
+Repository scope is the default and the only scope lifecycle commands use.
+`next`, `capture`, `claim`, `release`, `review`, `handoff`, and ordinary
+`reconcile` stay repository-local, so a shared Project never hands this
+repository another repository's work. Queue selection (`ready_cards` and
+`next_ready`) stays repository-local even in project scope.
+
+Project scope is read-only and always live; it never writes the shared cache.
+
+```sh
+kanbanlan overlap                 # open cards and pull requests Project-wide
+kanbanlan status --project        # board counts per repository
+kanbanlan --json snapshot --project
+```
+
+Project-scoped reads are bounded to repositories the Project already
+references. They never enumerate repositories owned by the account. A peer
+repository that cannot be read is reported in
+`source.unavailable_repositories` rather than failing the read.
+
+Every issue and pull request carries `repository` and a repository-qualified
+`provider_ref` such as `github:{config.repository}#123`, so identically
+numbered content in different repositories never collides. `display_id` stays
+short (`#123`) for this repository and is qualified (`owner/repo#123`) for a
+peer. A bare number is always a local reference: `kanbanlan record 123`
+resolves in `{config.repository}` only, and a peer request needs its Kanbanlan
+ID or a qualified reference.
 
 ## States
 

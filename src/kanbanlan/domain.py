@@ -32,6 +32,7 @@ class KanbanlanRequest:
     active_claim: dict[str, Any] | None
     linked_open_pull_requests: tuple[dict[str, Any], ...]
     number: int | None = None
+    repository: str | None = None
 
     @classmethod
     def from_snapshot_item(cls, item: dict[str, Any]) -> KanbanlanRequest:
@@ -53,17 +54,35 @@ class KanbanlanRequest:
             active_claim=item.get("active_claim"),
             linked_open_pull_requests=tuple(item.get("linked_open_pull_requests", [])),
             number=number,
+            repository=item.get("repository"),
         )
 
-    def matches(self, reference: str | int) -> bool:
+    def matches(self, reference: str | int, *, local_repository: str | None = None) -> bool:
+        """Report whether ``reference`` names this request.
+
+        A bare issue number is only ever a local reference. When
+        ``local_repository`` is known, a bare number must not match a peer
+        repository's identically numbered request.
+        """
+
         value = str(reference).strip()
         normalized = normalize_kanbanlan_id(value)
         if normalized:
             return normalized == self.kanbanlan_id
+        folded = value.casefold()
         candidates = {self.display_id.casefold(), self.provider_ref.casefold()}
-        if self.number is not None:
-            candidates.update({str(self.number), f"#{self.number}"})
-        return value.casefold() in candidates
+        if self.repository and self.number is not None:
+            qualified = f"{self.repository}#{self.number}".casefold()
+            candidates.update({qualified, f"{self.provider}:{qualified}"})
+        if folded in candidates:
+            return True
+        if self.number is not None and folded in {str(self.number), f"#{self.number}"}:
+            return (
+                local_repository is None
+                or self.repository is None
+                or self.repository == local_repository
+            )
+        return False
 
     @property
     def label(self) -> str:
@@ -73,11 +92,14 @@ class KanbanlanRequest:
 
 
 def resolve_request_item(snapshot: dict[str, Any], reference: str | int) -> dict[str, Any]:
+    local_repository = snapshot.get("source", {}).get("repository")
     matches = [
         item
         for item in snapshot.get("items", [])
         if item.get("type") == "ISSUE"
-        and KanbanlanRequest.from_snapshot_item(item).matches(reference)
+        and KanbanlanRequest.from_snapshot_item(item).matches(
+            reference, local_repository=local_repository
+        )
     ]
     if not matches:
         raise RuntimeError(f"request {reference!r} is not on the configured kanban home")

@@ -185,6 +185,31 @@ The cache lives at `<primary-checkout>/.cache/kanbanlan/` with private file
 permissions. A failed refresh preserves the last good snapshot and records the
 error in `health.json`.
 
+## Shared Projects across repositories
+
+One GitHub Project can serve several repositories. Every command above reads at
+repository scope, which keeps only content owned by the configured repository,
+so a shared Project never hands this repository another repository's work.
+
+Project scope is an explicit, read-only opt-in for the cross-repository overlap
+check an agent owes before claiming work:
+
+```sh
+kanbanlan overlap                   # open cards and pull requests Project-wide
+kanbanlan status --project          # board counts per repository
+kanbanlan --json snapshot --project # project-scoped stable JSON
+```
+
+Project-scoped reads are live and never write the shared cache. They are
+bounded to repositories the Project already references and never enumerate
+repositories owned by the account. A peer repository that cannot be read is
+reported in `source.unavailable_repositories` instead of failing the read.
+
+Snapshots carry `source.scope`, and every issue and pull request carries
+`repository` plus a repository-qualified `provider_ref` such as
+`github:owner/repo#123`, so identically numbered content in different
+repositories never collides. A bare issue number stays a local reference.
+
 ## Request lifecycle
 
 ```sh
@@ -268,8 +293,8 @@ original harness history and account are available.
 
 The versioned configuration distinguishes the GitHub code host, the canonical
 kanban home, and board projections. Normalized snapshots expose a Kanbanlan ID,
-provider ID, display ID, provider reference, canonical URL, lifecycle state,
-claims, and linked pull requests. Workflow reconciliation depends on a provider
+provider ID, display ID, repository-qualified provider reference, canonical URL,
+lifecycle state, claims, and linked pull requests. Workflow reconciliation depends on a provider
 contract; GitHub is its first implementation.
 
 This keeps the CLI as the portable agent interface. MCP integrations may wrap

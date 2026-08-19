@@ -3,16 +3,18 @@
 <!-- kanbanlan:start -->
 ## Request Coordination Workflow
 
-The canonical kanban home is `github`. GitHub Issues currently store canonical
-requests, and [jmitchel3 Project
-2](https://github.com/users/jmitchel3/projects/2) is their projection.
-Repository policy and durable delivery records remain versioned here. Follow
+The canonical kanban home is `github`. GitHub Issues currently
+store canonical requests, and [jmitchel3 Project
+2](https://github.com/users/jmitchel3/projects/2) is their projection. Repository policy
+and durable delivery records remain versioned here. Follow
 `docs/workflow/kanbanlan.md`.
 
 - At session start run `kanbanlan ensure`. Before mutations run
   `kanbanlan reconcile` and inspect all open cards and pull requests for
-  semantic overlap. If live coordination state is unavailable, do not start
-  potentially overlapping implementation.
+  semantic overlap. When this repository shares its Project with other
+  repositories, run `kanbanlan overlap` so the check covers them too. If live
+  coordination state is unavailable, do not start potentially overlapping
+  implementation.
 - Status questions are read-only. “Remember this” creates an Inbox card.
   “Let's work on this” authorizes a live overlap check and one claim.
 - Create or reuse one request per independently reviewable outcome. Each request

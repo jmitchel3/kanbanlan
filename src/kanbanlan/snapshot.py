@@ -14,7 +14,10 @@ from kanbanlan.config import Config
 from kanbanlan.identity import extract_kanbanlan_id, find_kanbanlan_ids
 from kanbanlan.sessions import session_history
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+SCOPE_REPOSITORY = "repository"
+SCOPE_PROJECT = "project"
+SCOPES = (SCOPE_REPOSITORY, SCOPE_PROJECT)
 CLAIM_RE = re.compile(r"^CLAIM:\s*(?P<claimed_at>[^\n]+)", re.MULTILINE)
 CLAIM_FIELD_RE = re.compile(
     r"^(Session|Branch|Worktree|Touchpoints):\s*(.+)$",
@@ -90,14 +93,48 @@ def active_claim(comments: list[dict[str, Any]]) -> dict[str, Any] | None:
     return active
 
 
-def _normalize_pull_request(pull_request: dict[str, Any], repository: str) -> dict[str, Any]:
-    closing_numbers = []
+def qualified_reference(repository: str | None, number: int | None) -> str:
+    """Return the repository-qualified provider reference for one issue or PR."""
+
+    if repository is None or number is None:
+        return f"#{number}" if number is not None else "unknown"
+    return f"github:{repository}#{number}"
+
+
+def display_reference(repository: str | None, number: int | None, local: str | None) -> str:
+    """Return a short reference that stays unambiguous outside ``local``."""
+
+    if number is None:
+        return "unknown"
+    if repository is None or repository == local:
+        return f"#{number}"
+    return f"{repository}#{number}"
+
+
+def _normalize_pull_request(
+    pull_request: dict[str, Any],
+    fallback_repository: str,
+) -> dict[str, Any]:
+    repository = (pull_request.get("repository") or {}).get("nameWithOwner") or fallback_repository
+    closing_references = []
     for issue in pull_request.get("closingIssuesReferences", {}).get("nodes", []):
-        issue_repository = issue.get("repository", {}).get("nameWithOwner")
-        if issue_repository == repository:
-            closing_numbers.append(issue["number"])
+        issue_repository = (issue.get("repository") or {}).get("nameWithOwner") or repository
+        closing_references.append(
+            {
+                "repository": issue_repository,
+                "number": issue["number"],
+                "url": issue.get("url"),
+                "provider_ref": qualified_reference(issue_repository, issue["number"]),
+            }
+        )
+    closing_numbers = [
+        value["number"] for value in closing_references if value["repository"] == repository
+    ]
     return {
         "number": pull_request["number"],
+        "repository": repository,
+        "provider": "github",
+        "provider_ref": qualified_reference(repository, pull_request["number"]),
         "title": pull_request["title"],
         "body": pull_request.get("body"),
         "url": pull_request["url"],
@@ -110,6 +147,10 @@ def _normalize_pull_request(pull_request: dict[str, Any], repository: str) -> di
         "author": (pull_request.get("author") or {}).get("login"),
         "labels": _labels(pull_request),
         "closing_issue_numbers": sorted(closing_numbers),
+        "closing_issue_references": sorted(
+            closing_references,
+            key=lambda value: (value["repository"], value["number"]),
+        ),
         "kanbanlan_ids": find_kanbanlan_ids(pull_request.get("body")),
     }
 
@@ -119,7 +160,10 @@ def _merge_pull_requests(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for group in groups:
         for pull_request in group:
             by_url[pull_request["url"]] = pull_request
-    return sorted(by_url.values(), key=lambda value: value.get("number", 0))
+    return sorted(
+        by_url.values(),
+        key=lambda value: (value.get("repository") or "", value.get("number", 0)),
+    )
 
 
 def build_snapshot(
@@ -128,18 +172,35 @@ def build_snapshot(
     raw_pull_requests: list[dict[str, Any]],
     rate_limit: dict[str, Any],
     generated_at: datetime | None = None,
+    *,
+    scope: str = SCOPE_REPOSITORY,
+    unavailable_repositories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Normalize one Project read into the stable snapshot document.
+
+    ``scope`` selects how much of a shared Project the snapshot keeps.
+    ``repository`` scope, the default every lifecycle command uses, keeps only
+    content owned by ``config.repository``. ``project`` scope keeps every
+    Project item so an agent can inspect peer repositories before claiming
+    work. Queue selection stays repository-local in both scopes.
+    """
+
+    if scope not in SCOPES:
+        raise ValueError(f"unsupported snapshot scope: {scope!r}")
     generated_at = generated_at or utc_now()
     pull_requests = [
         _normalize_pull_request(value, config.repository) for value in raw_pull_requests
     ]
-    linked_pull_requests: dict[int, list[dict[str, Any]]] = {}
-    linked_pull_requests_by_kanbanlan_id: dict[str, list[dict[str, Any]]] = {}
+    linked_pull_requests: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    linked_pull_requests_by_kanbanlan_id: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for pull_request in pull_requests:
+        repository = pull_request["repository"]
         for issue_number in pull_request["closing_issue_numbers"]:
-            linked_pull_requests.setdefault(issue_number, []).append(pull_request)
+            linked_pull_requests.setdefault((repository, issue_number), []).append(pull_request)
         for kanbanlan_id in pull_request["kanbanlan_ids"]:
-            linked_pull_requests_by_kanbanlan_id.setdefault(kanbanlan_id, []).append(pull_request)
+            linked_pull_requests_by_kanbanlan_id.setdefault((repository, kanbanlan_id), []).append(
+                pull_request
+            )
 
     items: list[dict[str, Any]] = []
     for raw_item in project.get("items", []):
@@ -147,8 +208,12 @@ def build_snapshot(
             continue
         content = raw_item.get("content") or {}
         item_type = raw_item.get("type", "UNKNOWN")
-        content_repository = content.get("repository", {}).get("nameWithOwner")
-        if item_type in {"ISSUE", "PULL_REQUEST"} and content_repository != config.repository:
+        content_repository = (content.get("repository") or {}).get("nameWithOwner")
+        if (
+            scope == SCOPE_REPOSITORY
+            and item_type in {"ISSUE", "PULL_REQUEST"}
+            and content_repository != config.repository
+        ):
             continue
         if item_type == "DRAFT_ISSUE":
             continue
@@ -162,6 +227,7 @@ def build_snapshot(
             "url": content.get("url"),
             "created_at": content.get("createdAt"),
             "updated_at": content.get("updatedAt"),
+            "repository": content_repository,
         }
         if item_type == "ISSUE":
             comments = content.get("comments", {})
@@ -174,14 +240,14 @@ def build_snapshot(
             )
             number = content["number"]
             kanbanlan_id = extract_kanbanlan_id(content.get("body"))
-            provider_ref = f"github:{content_repository}#{number}"
+            provider_ref = qualified_reference(content_repository, number)
             normalized.update(
                 {
                     "kanbanlan_id": kanbanlan_id,
                     "provider": "github",
                     "provider_id": content.get("id"),
                     "provider_ref": provider_ref,
-                    "display_id": f"#{number}",
+                    "display_id": display_reference(content_repository, number, config.repository),
                     "canonical_url": content.get("url"),
                     "content_id": content.get("id"),
                     "number": number,
@@ -204,8 +270,10 @@ def build_snapshot(
                     )
                     > len(comment_nodes),
                     "linked_open_pull_requests": _merge_pull_requests(
-                        linked_pull_requests.get(number, []),
-                        linked_pull_requests_by_kanbanlan_id.get(kanbanlan_id, [])
+                        linked_pull_requests.get((content_repository, number), []),
+                        linked_pull_requests_by_kanbanlan_id.get(
+                            (content_repository, kanbanlan_id), []
+                        )
                         if kanbanlan_id
                         else [],
                     ),
@@ -216,7 +284,11 @@ def build_snapshot(
                 {
                     "content_id": content.get("id"),
                     "number": content.get("number"),
-                    "repository": content_repository,
+                    "provider": "github",
+                    "provider_ref": qualified_reference(content_repository, content.get("number")),
+                    "display_id": display_reference(
+                        content_repository, content.get("number"), config.repository
+                    ),
                     "state": content.get("state"),
                     "is_draft": content.get("isDraft", False),
                     "merged_at": content.get("mergedAt"),
@@ -229,10 +301,13 @@ def build_snapshot(
         status = item.get("status") or "Unspecified"
         status_counts[status] = status_counts.get(status, 0) + 1
 
+    # Queue selection stays repository-local even under project scope so a
+    # shared Project never hands one repository another repository's work.
     ready = [
         item
         for item in items
         if item["type"] == "ISSUE"
+        and item.get("repository") in (config.repository, None)
         and item.get("state") == "OPEN"
         and item.get("status") == "Ready"
         and not item.get("active_claim")
@@ -249,7 +324,23 @@ def build_snapshot(
         "generated_at": isoformat(generated_at),
         "fresh_for_seconds": config.stale_seconds,
         "source": {
+            "scope": scope,
             "repository": config.repository,
+            "repositories": sorted(
+                {
+                    value
+                    for value in (
+                        [config.repository]
+                        + [item.get("repository") for item in items]
+                        + [value["repository"] for value in pull_requests]
+                    )
+                    if value
+                }
+            ),
+            "unavailable_repositories": sorted(
+                unavailable_repositories or [],
+                key=lambda value: value.get("repository", ""),
+            ),
             "project_owner": config.project_owner,
             "project_number": config.project_number,
             "authoritative": "github",
