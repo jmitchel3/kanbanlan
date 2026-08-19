@@ -1218,6 +1218,26 @@ def _project_source(snapshot: dict[str, Any]) -> dict[str, Any]:
     return snapshot.get("source", {})
 
 
+def _warn_linkage_problems(snapshot: dict[str, Any]) -> None:
+    """Report pull requests that named a request too ambiguously to link."""
+
+    for problem in snapshot.get("linkage_problems", []):
+        warning(
+            f"{problem['pull_request']} was not linked ({problem['kind']}): {problem['detail']}"
+        )
+
+
+def _linkage_problems_for(snapshot: dict[str, Any], item: dict[str, Any]) -> list[dict[str, Any]]:
+    kanbanlan_id = item.get("kanbanlan_id")
+    if not kanbanlan_id:
+        return []
+    return [
+        problem
+        for problem in snapshot.get("linkage_problems", [])
+        if kanbanlan_id in problem.get("kanbanlan_ids", [])
+    ]
+
+
 def _warn_unavailable_repositories(snapshot: dict[str, Any]) -> None:
     for entry in _project_source(snapshot).get("unavailable_repositories", []):
         warning(f"peer repository {entry['repository']} could not be read: {entry['error']}")
@@ -1345,6 +1365,7 @@ def _cmd_overlap(args: argparse.Namespace) -> int:
         "project": snapshot.get("project"),
         "open_requests": requests,
         "unlinked_open_pull_requests": unlinked,
+        "linkage_problems": snapshot.get("linkage_problems", []),
     }
     if _emit_result(args, result):
         return 0
@@ -1353,6 +1374,7 @@ def _cmd_overlap(args: argparse.Namespace) -> int:
     field("Project", f"{project.get('title')} (#{project.get('number')})")
     field("Repositories", ", ".join(source.get("repositories", [])) or "none")
     _warn_unavailable_repositories(snapshot)
+    _warn_linkage_problems(snapshot)
     if not requests:
         print("No open requests are on the Project.")
     for request in requests:
@@ -1369,7 +1391,11 @@ def _cmd_overlap(args: argparse.Namespace) -> int:
             if claim.get("touchpoints"):
                 field("Touchpoints", claim["touchpoints"])
         for pull_request in request["linked_open_pull_requests"]:
-            field("Pull request", f"{pull_request['provider_ref']} {pull_request['url']}")
+            routes = ", ".join(pull_request.get("linked_by", [])) or "link"
+            field(
+                "Pull request",
+                f"{pull_request['provider_ref']} {pull_request['url']} ({routes})",
+            )
     if unlinked:
         section("Open pull requests with no linked request")
         for pull_request in unlinked:
@@ -1409,15 +1435,33 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         snapshot = store.refresh(provider)
         open_issues = provider.list_open_requests()
     drift = plan_reconciliation(snapshot, open_issues)
+    if not args.json_output:
+        _warn_linkage_problems(snapshot)
     if not drift:
         _activate_worker(_root(args), Config.load(_root(args)))
-        if _emit_result(args, {"applied": False, "drift": [], "remaining": []}):
+        if _emit_result(
+            args,
+            {
+                "applied": False,
+                "drift": [],
+                "remaining": [],
+                "linkage_problems": snapshot.get("linkage_problems", []),
+            },
+        ):
             return 0
         success("GitHub Issues and Project Status are reconciled.")
         return 0
     drift_payload = [asdict(value) for value in drift]
     if args.json_output and not args.apply:
-        _emit_result(args, {"applied": False, "drift": drift_payload, "remaining": drift_payload})
+        _emit_result(
+            args,
+            {
+                "applied": False,
+                "drift": drift_payload,
+                "remaining": drift_payload,
+                "linkage_problems": snapshot.get("linkage_problems", []),
+            },
+        )
         return 2
     for value in drift:
         print(format_drift(value))
@@ -1433,6 +1477,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
                 "applied": True,
                 "drift": drift_payload,
                 "remaining": [asdict(value) for value in remaining],
+                "linkage_problems": snapshot.get("linkage_problems", []),
             },
         )
         return 1 if remaining else 0
@@ -1805,7 +1850,18 @@ def _cmd_review(args: argparse.Namespace) -> int:
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
-    if not item.get("linked_open_pull_requests"):
+    linked = item.get("linked_open_pull_requests") or []
+    if not linked:
+        blocked = _linkage_problems_for(snapshot, item)
+        if blocked:
+            detail = "; ".join(
+                f"{problem['pull_request']} ({problem['kind']}): {problem['detail']}"
+                for problem in blocked
+            )
+            raise RuntimeError(
+                f"request {label} has no linked open pull request; "
+                f"an ambiguous reference was not associated: {detail}"
+            )
         raise RuntimeError(f"request {label} has no linked open pull request")
     with status("Moving request to In review"):
         _set_state(provider, snapshot, number, "status:review", "In review")
@@ -1826,10 +1882,23 @@ def _cmd_review(args: argparse.Namespace) -> int:
             "kanbanlan_id": item.get("kanbanlan_id"),
             "status": "In review",
             "actor_session": actor.to_dict() if actor else None,
+            "linked_open_pull_requests": [
+                {
+                    "provider_ref": pull_request["provider_ref"],
+                    "repository": pull_request["repository"],
+                    "url": pull_request["url"],
+                    "is_draft": pull_request.get("is_draft", False),
+                    "linked_by": pull_request.get("linked_by", []),
+                }
+                for pull_request in linked
+            ],
         },
     ):
         return 0
     success(f"Moved {label} to In review")
+    for pull_request in linked:
+        routes = ", ".join(pull_request.get("linked_by", [])) or "link"
+        field(pull_request["provider_ref"], f"{pull_request['url']} ({routes})")
     return 0
 
 

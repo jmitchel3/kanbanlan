@@ -151,19 +151,114 @@ def _normalize_pull_request(
             closing_references,
             key=lambda value: (value["repository"], value["number"]),
         ),
+        "declared_kanbanlan_id": extract_kanbanlan_id(pull_request.get("body")),
         "kanbanlan_ids": find_kanbanlan_ids(pull_request.get("body")),
     }
 
 
-def _merge_pull_requests(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _merge_pull_requests(entries: list[tuple[dict[str, Any], str]]) -> list[dict[str, Any]]:
+    """Collapse one request's linkage entries into stable pull request records.
+
+    A pull request can reach the same request through more than one route, so
+    ``linked_by`` reports every route that justified the link.
+    """
+
     by_url: dict[str, dict[str, Any]] = {}
-    for group in groups:
-        for pull_request in group:
-            by_url[pull_request["url"]] = pull_request
+    reasons: dict[str, set[str]] = {}
+    for pull_request, reason in entries:
+        url = pull_request["url"]
+        by_url[url] = pull_request
+        reasons.setdefault(url, set()).add(reason)
+    merged = [
+        {**pull_request, "linked_by": sorted(reasons[url])} for url, pull_request in by_url.items()
+    ]
     return sorted(
-        by_url.values(),
+        merged,
         key=lambda value: (value.get("repository") or "", value.get("number", 0)),
     )
+
+
+def _project_identity_owners(project: dict[str, Any]) -> dict[str, list[tuple[str, int]]]:
+    """Map each declared Kanbanlan ID to the Project requests that carry it.
+
+    Every repository on the Project is considered, whatever the read scope,
+    because a duplicated identity in a peer repository makes an identity link
+    ambiguous here too.
+    """
+
+    owners: dict[str, list[tuple[str, int]]] = {}
+    for raw_item in project.get("items", []):
+        if raw_item.get("isArchived") or raw_item.get("type") != "ISSUE":
+            continue
+        content = raw_item.get("content") or {}
+        repository = (content.get("repository") or {}).get("nameWithOwner")
+        number = content.get("number")
+        kanbanlan_id = extract_kanbanlan_id(content.get("body"))
+        if kanbanlan_id and repository and number is not None:
+            owners.setdefault(kanbanlan_id, []).append((repository, number))
+    return owners
+
+
+def _link_pull_requests(
+    pull_requests: list[dict[str, Any]],
+    identity_owners: dict[str, list[tuple[str, int]]],
+) -> tuple[dict[tuple[str, int], list[tuple[dict[str, Any], str]]], list[dict[str, Any]]]:
+    """Associate open pull requests with the requests they deliver.
+
+    Two routes are explicit enough to cross a repository boundary. A closing
+    reference is one: GitHub only resolves a closing reference to another
+    repository when the author qualified it, so a bare ``Closes #34`` stays in
+    the pull request's own repository without any check here. A declared
+    Kanbanlan ID is the other.
+
+    Anything ambiguous is reported and linked to nothing.
+    """
+
+    linked: dict[tuple[str, int], list[tuple[dict[str, Any], str]]] = {}
+    problems: list[dict[str, Any]] = []
+    for pull_request in pull_requests:
+        targets: list[tuple[tuple[str, int], str]] = [
+            ((reference["repository"], reference["number"]), "closing_reference")
+            for reference in pull_request["closing_issue_references"]
+        ]
+        declared = pull_request["declared_kanbanlan_id"]
+        mentioned = pull_request["kanbanlan_ids"]
+        candidate = declared or (mentioned[0] if len(mentioned) == 1 else None)
+        if candidate is None and len(mentioned) > 1:
+            problems.append(
+                {
+                    "kind": "conflicting_kanbanlan_ids",
+                    "pull_request": pull_request["provider_ref"],
+                    "repository": pull_request["repository"],
+                    "url": pull_request["url"],
+                    "kanbanlan_ids": mentioned,
+                    "detail": ("pull request names more than one Kanbanlan ID and declares none"),
+                }
+            )
+        elif candidate:
+            owners = identity_owners.get(candidate, [])
+            if len(owners) > 1:
+                problems.append(
+                    {
+                        "kind": "duplicate_kanbanlan_id",
+                        "pull_request": pull_request["provider_ref"],
+                        "repository": pull_request["repository"],
+                        "url": pull_request["url"],
+                        "kanbanlan_ids": [candidate],
+                        "detail": (
+                            f"Kanbanlan ID {candidate} is carried by "
+                            + ", ".join(
+                                qualified_reference(repository, number)
+                                for repository, number in sorted(owners)
+                            )
+                        ),
+                    }
+                )
+            elif owners:
+                targets.append((owners[0], "kanbanlan_id"))
+        for key, reason in targets:
+            linked.setdefault(key, []).append((pull_request, reason))
+    return linked, sorted(problems, key=lambda value: value["pull_request"])
 
 
 def build_snapshot(
@@ -191,16 +286,10 @@ def build_snapshot(
     pull_requests = [
         _normalize_pull_request(value, config.repository) for value in raw_pull_requests
     ]
-    linked_pull_requests: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    linked_pull_requests_by_kanbanlan_id: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for pull_request in pull_requests:
-        repository = pull_request["repository"]
-        for issue_number in pull_request["closing_issue_numbers"]:
-            linked_pull_requests.setdefault((repository, issue_number), []).append(pull_request)
-        for kanbanlan_id in pull_request["kanbanlan_ids"]:
-            linked_pull_requests_by_kanbanlan_id.setdefault((repository, kanbanlan_id), []).append(
-                pull_request
-            )
+    linked_pull_requests, linkage_problems = _link_pull_requests(
+        pull_requests,
+        _project_identity_owners(project),
+    )
 
     items: list[dict[str, Any]] = []
     for raw_item in project.get("items", []):
@@ -270,12 +359,7 @@ def build_snapshot(
                     )
                     > len(comment_nodes),
                     "linked_open_pull_requests": _merge_pull_requests(
-                        linked_pull_requests.get((content_repository, number), []),
-                        linked_pull_requests_by_kanbanlan_id.get(
-                            (content_repository, kanbanlan_id), []
-                        )
-                        if kanbanlan_id
-                        else [],
+                        linked_pull_requests.get((content_repository, number), [])
                     ),
                 }
             )
@@ -295,6 +379,25 @@ def build_snapshot(
                 }
             )
         items.append(normalized)
+
+    # A peer repository's pull request stays in the document only while it
+    # delivers a request kept by this scope. Repository scope therefore never
+    # lists unrelated peer work, but never hides the delivery of its own card.
+    relevant_pull_request_urls = {
+        pull_request["url"]
+        for item in items
+        if item["type"] == "ISSUE"
+        for pull_request in item["linked_open_pull_requests"]
+    }
+    pull_requests = [
+        pull_request
+        for pull_request in pull_requests
+        if scope == SCOPE_PROJECT
+        or pull_request["repository"] == config.repository
+        or pull_request["url"] in relevant_pull_request_urls
+    ]
+    reported_urls = {pull_request["url"] for pull_request in pull_requests}
+    linkage_problems = [problem for problem in linkage_problems if problem["url"] in reported_urls]
 
     status_counts: dict[str, int] = {}
     for item in items:
@@ -361,6 +464,7 @@ def build_snapshot(
         "ready_cards": ready,
         "next_ready": ready[0] if ready else None,
         "open_pull_requests": pull_requests,
+        "linkage_problems": linkage_problems,
         "rate_limit": rate_limit,
     }
 

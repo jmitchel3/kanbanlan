@@ -418,6 +418,36 @@ peer. A bare number is always a local reference: `kanbanlan record 123`
 resolves in `{config.repository}` only, and a peer request needs its Kanbanlan
 ID or a qualified reference.
 
+## Cross-repository delivery
+
+A request here can be delivered by a pull request in a peer repository. Two
+references are explicit enough to cross that boundary:
+
+- a repository-qualified closing reference, such as
+  `Closes {config.repository}#123`; or
+- the request's exact Kanbanlan ID declared in the pull request body, which the
+  generated pull request template already asks for.
+
+A bare `Closes #123` is only ever read inside the pull request's own
+repository, so it can never reach a peer request by accident.
+
+Each entry in `linked_open_pull_requests` reports `repository`, a qualified
+`provider_ref`, and `linked_by`, which lists the routes that justified the link
+(`closing_reference`, `kanbanlan_id`, or both). `kanbanlan review` accepts a
+qualifying open cross-repository pull request and keeps the responsible claim.
+
+Open pull requests are discovered across the repositories linked to the Project
+or already carrying Project items, never across the account. In repository
+scope a peer pull request is reported only while it delivers a request in
+`{config.repository}`.
+
+Ambiguity is reported rather than guessed. A pull request that names several
+Kanbanlan IDs without declaring one, or that declares an ID carried by more
+than one request, is listed in `linkage_problems` and linked to nothing.
+`reconcile`, `overlap`, and `review` all surface those entries. Declaring one
+ID on the `Kanbanlan:` line keeps a passing mention of another request
+harmless.
+
 ## States
 
 | Issue label | Project Status | Meaning |
