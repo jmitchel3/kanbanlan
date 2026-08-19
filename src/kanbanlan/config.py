@@ -14,6 +14,10 @@ CONFIG_SCHEMA_VERSION = 2
 REMOTE_RE = re.compile(
     r"(?:git@[^:]+:|https?://[^/]+/|ssh://git@[^/]+/)(?P<repo>[^/]+/[^/]+?)(?:\.git)?$"
 )
+REPOSITORY_TARGET_RE = re.compile(r"^(?P<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$")
+REPOSITORY_URL_RE = re.compile(
+    r"^(?:https?://|ssh://git@|git@)(?P<host>[^/:]+)[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$"
+)
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,31 @@ def discover_default_branch(root: Path) -> str:
     if symbolic.returncode == 0 and "/" in symbolic.stdout:
         return symbolic.stdout.strip().split("/", 1)[1]
     return "main"
+
+
+def normalize_repository_target(value: str, *, hostname: str) -> str:
+    """Return ``OWNER/REPO`` for an explicitly named repository.
+
+    A bare ``OWNER/REPO`` is accepted as-is. A URL is accepted only when its
+    host matches the configured one, because a request on another GitHub host
+    is not addressable by the same authenticated client.
+    """
+
+    text = value.strip().removesuffix("/")
+    if not text:
+        raise RuntimeError("repository target must not be empty")
+    match = REPOSITORY_TARGET_RE.match(text)
+    if match:
+        return match.group("repo")
+    url = REPOSITORY_URL_RE.match(text)
+    if not url:
+        raise RuntimeError(f"repository target must use OWNER/REPO format: {value!r}")
+    if url.group("host").casefold() != hostname.casefold():
+        raise RuntimeError(
+            f"repository target {value!r} is on {url.group('host')}, "
+            f"but this repository is configured for {hostname}"
+        )
+    return url.group("repo")
 
 
 def cache_dir(root: Path) -> Path:

@@ -448,6 +448,35 @@ than one request, is listed in `linkage_problems` and linked to nothing.
 ID on the `Kanbanlan:` line keeps a passing mention of another request
 harmless.
 
+## Capturing into another repository
+
+A client-level Project can hold requests owned by several repositories. The
+request belongs in the repository whose code will change, because that is the
+repository whose queue must offer it and whose branch will deliver it.
+
+```sh
+kanbanlan capture "Add the HSA/FSA page" --repository OWNER/REPO
+```
+
+`capture` defaults to `{config.repository}` and never infers a destination from
+the title or body. A target is only ever this repository or one you name.
+
+Before any request is created, the target is validated and prepared: it must
+parse as `OWNER/REPO` (a URL is accepted only on `{config.hostname}`), be
+accessible, and be linked to the configured Project, and the workflow status
+and priority labels are provisioned there. A target that cannot be reached or
+linked fails while nothing has been created.
+
+The new request keeps one Kanbanlan ID, joins the configured Project, and
+reaches Inbox in the repository that owns it. Success output reports the
+repository, the Kanbanlan ID, the qualified provider reference, and the
+canonical URL.
+
+If something fails after the request exists, the error names the exact created
+URL and the repair to run. Do not run `capture` again: a second run creates a
+second request with a new identity. Run `kanbanlan reconcile --apply` in the
+repository that owns the request instead.
+
 ## States
 
 | Issue label | Project Status | Meaning |

@@ -17,6 +17,7 @@ class ProviderCapabilities:
     projections: bool = True
     repository_records: bool = True
     project_scope: bool = True
+    repository_routing: bool = True
 
 
 class CoordinationProvider(Protocol):
@@ -29,7 +30,13 @@ class CoordinationProvider(Protocol):
 
     def add_to_projection(self, url: str) -> dict[str, Any]: ...
 
-    def set_request_status(self, reference: int | str, label: str | None) -> None: ...
+    def set_request_status(
+        self,
+        reference: int | str,
+        label: str | None,
+        *,
+        repository: str | None = None,
+    ) -> None: ...
 
     def set_projection_status(
         self,
@@ -38,14 +45,29 @@ class CoordinationProvider(Protocol):
         status: str,
     ) -> None: ...
 
-    def comment_request(self, reference: int | str, body: str) -> None: ...
+    def comment_request(
+        self,
+        reference: int | str,
+        body: str,
+        *,
+        repository: str | None = None,
+    ) -> None: ...
 
-    def create_request(self, title: str, body: str, priority: str) -> str: ...
+    def create_request(
+        self,
+        title: str,
+        body: str,
+        priority: str,
+        *,
+        repository: str | None = None,
+    ) -> str: ...
 
     def ensure_request_identity(
         self,
         reference: int | str,
         kanbanlan_id: str,
+        *,
+        repository: str | None = None,
     ) -> str: ...
 
 

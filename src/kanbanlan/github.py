@@ -155,6 +155,22 @@ query($owner: String!, $repo: String!) {
 }
 """
 
+PROJECT_REPOSITORIES_QUERY = """
+query($owner: String!, $number: Int!) {
+  OWNER(login: $owner) {
+    projectV2(number: $number) {
+      id
+      title
+      url
+      repositories(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+
 OWNER_QUERY = """
 query($login: String!) {
   repositoryOwner(login: $login) { __typename id login }
@@ -406,7 +422,10 @@ class GitHub:
             ]
         )
 
-    def link_project(self) -> None:
+    def _repository(self, repository: str | None = None) -> str:
+        return repository or self._config().repository
+
+    def link_project(self, repository: str | None = None) -> None:
         config = self._config()
         self.runner.run(
             [
@@ -417,9 +436,65 @@ class GitHub:
                 "--owner",
                 config.project_owner,
                 "--repo",
-                config.repository,
+                self._repository(repository),
             ]
         )
+
+    def project_repository_bindings(self) -> dict[str, Any]:
+        """Read only the Project identity and its linked repositories.
+
+        Preflight runs before any request exists, so it must not pay for a full
+        paginated item read.
+        """
+
+        config = self._config()
+        query = PROJECT_REPOSITORIES_QUERY.replace(
+            "OWNER", "organization" if config.project_owner_type == "organization" else "user"
+        )
+        data = self.graphql(
+            query,
+            {"owner": config.project_owner, "number": config.project_number},
+            retry=True,
+        )
+        owner = data.get("organization" if config.project_owner_type == "organization" else "user")
+        project = owner and owner.get("projectV2")
+        if not project:
+            raise RuntimeError(
+                f"Project {config.project_owner}/{config.project_number} was not found"
+            )
+        return project
+
+    def prepare_capture_target(self, repository: str) -> dict[str, Any]:
+        """Validate and prepare a repository before any request is created.
+
+        Everything that can fail is done first, so a failure leaves no
+        half-created request behind.
+        """
+
+        config = self._config()
+        info = self.repository_info(repository)
+        target = info["nameWithOwner"]
+        project = self.project_repository_bindings()
+        linked = {
+            node["nameWithOwner"]
+            for node in project.get("repositories", {}).get("nodes", [])
+            if node and node.get("nameWithOwner")
+        }
+        already_linked = target in linked
+        if not already_linked:
+            try:
+                self.link_project(target)
+            except (CommandError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"repository {target} could not be linked to Project "
+                    f"{config.project_owner}/{config.project_number}: {exc}"
+                ) from exc
+        self.ensure_labels(target)
+        return {
+            "repository": target,
+            "already_linked": already_linked,
+            "project_url": project.get("url"),
+        }
 
     def project_metadata(self) -> dict[str, Any]:
         project, _ = self._fetch_project()
@@ -461,8 +536,8 @@ class GitHub:
         self.graphql(UPDATE_STATUS_FIELD, {"field": status_field["id"], "options": updated})
         return True
 
-    def ensure_labels(self) -> None:
-        config = self._config()
+    def ensure_labels(self, repository: str | None = None) -> None:
+        target = self._repository(repository)
         for name, (color, description) in {**STATUS_LABELS, **PRIORITY_LABELS}.items():
             self.runner.run(
                 [
@@ -471,7 +546,7 @@ class GitHub:
                     "create",
                     name,
                     "--repo",
-                    config.repository,
+                    target,
                     "--color",
                     color,
                     "--description",
@@ -677,8 +752,14 @@ class GitHub:
     ) -> None:
         self.set_project_status(item_id, projection, status)
 
-    def set_issue_status_label(self, number: int, label: str | None) -> None:
-        config = self._config()
+    def set_issue_status_label(
+        self,
+        number: int,
+        label: str | None,
+        *,
+        repository: str | None = None,
+    ) -> None:
+        target = self._repository(repository)
         payload = self.runner.json(
             [
                 "gh",
@@ -686,7 +767,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--repo",
-                config.repository,
+                target,
                 "--json",
                 "labels",
             ],
@@ -706,7 +787,7 @@ class GitHub:
             "edit",
             str(number),
             "--repo",
-            config.repository,
+            target,
         ]
         for value in sorted(current - wanted):
             args.extend(["--remove-label", value])
@@ -714,11 +795,16 @@ class GitHub:
             args.extend(["--add-label", value])
         self.runner.run(args)
 
-    def set_request_status(self, reference: int | str, label: str | None) -> None:
-        self.set_issue_status_label(_issue_number(reference), label)
+    def set_request_status(
+        self,
+        reference: int | str,
+        label: str | None,
+        *,
+        repository: str | None = None,
+    ) -> None:
+        self.set_issue_status_label(_issue_number(reference), label, repository=repository)
 
-    def comment_issue(self, number: int, body: str) -> None:
-        config = self._config()
+    def comment_issue(self, number: int, body: str, *, repository: str | None = None) -> None:
         self.runner.run(
             [
                 "gh",
@@ -726,24 +812,36 @@ class GitHub:
                 "comment",
                 str(number),
                 "--repo",
-                config.repository,
+                self._repository(repository),
                 "--body",
                 body,
             ]
         )
 
-    def comment_request(self, reference: int | str, body: str) -> None:
-        self.comment_issue(_issue_number(reference), body)
+    def comment_request(
+        self,
+        reference: int | str,
+        body: str,
+        *,
+        repository: str | None = None,
+    ) -> None:
+        self.comment_issue(_issue_number(reference), body, repository=repository)
 
-    def create_issue(self, title: str, body: str, priority: str) -> str:
-        config = self._config()
+    def create_issue(
+        self,
+        title: str,
+        body: str,
+        priority: str,
+        *,
+        repository: str | None = None,
+    ) -> str:
         result = self.runner.run(
             [
                 "gh",
                 "issue",
                 "create",
                 "--repo",
-                config.repository,
+                self._repository(repository),
                 "--title",
                 title,
                 "--body",
@@ -756,16 +854,25 @@ class GitHub:
         )
         return result.stdout.strip()
 
-    def create_request(self, title: str, body: str, priority: str) -> str:
-        return self.create_issue(title, body, priority)
+    def create_request(
+        self,
+        title: str,
+        body: str,
+        priority: str,
+        *,
+        repository: str | None = None,
+    ) -> str:
+        return self.create_issue(title, body, priority, repository=repository)
 
     def ensure_request_identity(
         self,
         reference: int | str,
         kanbanlan_id: str,
+        *,
+        repository: str | None = None,
     ) -> str:
         number = _issue_number(reference)
-        config = self._config()
+        target = self._repository(repository)
         payload = self.runner.json(
             [
                 "gh",
@@ -773,7 +880,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--repo",
-                config.repository,
+                target,
                 "--json",
                 "body",
             ],
@@ -791,7 +898,7 @@ class GitHub:
                 "edit",
                 str(number),
                 "--repo",
-                config.repository,
+                target,
                 "--body",
                 updated,
             ]
