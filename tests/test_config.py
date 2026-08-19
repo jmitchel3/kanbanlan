@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from kanbanlan.config import Config, discover_repository, primary_worktree
+from kanbanlan.config import (
+    Config,
+    discover_repository,
+    primary_worktree,
+    resolve_config_path,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -105,3 +110,89 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "init --reconfigure"):
                 Config.load(root)
+
+
+class ResolveConfigPathTests(unittest.TestCase):
+    """Linked worktrees only materialize tracked files.
+
+    A repository that has not committed its ``.kanbanlan.toml`` leaves every
+    linked worktree without one, which breaks the very workflow this tool
+    prescribes (a dedicated worktree per request).
+    """
+
+    def _config(self) -> Config:
+        return Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+        )
+
+    def test_local_config_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".kanbanlan.toml").write_text("x", encoding="utf-8")
+            with mock.patch("kanbanlan.config.primary_worktree") as primary:
+                self.assertEqual(resolve_config_path(root), root / ".kanbanlan.toml")
+            primary.assert_not_called()
+
+    def test_falls_back_to_the_primary_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            primary_root = base / "primary"
+            linked = base / "linked"
+            primary_root.mkdir()
+            linked.mkdir()
+            (primary_root / ".kanbanlan.toml").write_text("x", encoding="utf-8")
+
+            with mock.patch("kanbanlan.config.primary_worktree", return_value=primary_root):
+                self.assertEqual(resolve_config_path(linked), primary_root / ".kanbanlan.toml")
+
+    def test_load_succeeds_from_a_linked_worktree(self) -> None:
+        """End to end: the failure this fixes was Config.load, not path lookup."""
+        config = self._config()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            primary_root = base / "primary"
+            linked = base / "linked"
+            primary_root.mkdir()
+            linked.mkdir()
+            (primary_root / ".kanbanlan.toml").write_text(config.to_toml(), encoding="utf-8")
+
+            with mock.patch("kanbanlan.config.primary_worktree", return_value=primary_root):
+                self.assertEqual(Config.load(linked), config)
+
+    def test_primary_equal_to_root_reports_the_local_path(self) -> None:
+        """Error messages must name the path the caller actually asked for."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch("kanbanlan.config.primary_worktree", return_value=root):
+                self.assertEqual(resolve_config_path(root), root / ".kanbanlan.toml")
+
+    def test_missing_in_both_places_reports_the_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            primary_root = base / "primary"
+            linked = base / "linked"
+            primary_root.mkdir()
+            linked.mkdir()
+
+            with mock.patch("kanbanlan.config.primary_worktree", return_value=primary_root):
+                self.assertEqual(resolve_config_path(linked), linked / ".kanbanlan.toml")
+
+    def test_git_failure_does_not_mask_the_original_problem(self) -> None:
+        """Outside git, or with git unavailable, report the caller's path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch(
+                "kanbanlan.config.primary_worktree",
+                side_effect=RuntimeError("not a worktree"),
+            ):
+                self.assertEqual(resolve_config_path(root), root / ".kanbanlan.toml")
+
+            with mock.patch(
+                "kanbanlan.config.primary_worktree",
+                side_effect=RuntimeError("not a worktree"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "is missing"):
+                    Config.load(root)

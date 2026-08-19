@@ -52,7 +52,7 @@ class Config:
 
     @classmethod
     def load(cls, root: Path) -> Config:
-        path = root / CONFIG_FILENAME
+        path = resolve_config_path(root)
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -145,6 +145,38 @@ class Config:
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def resolve_config_path(root: Path) -> Path:
+    """Locate the config, falling back to the primary checkout.
+
+    Git worktrees only materialize *tracked* files, so a repository that has
+    not committed its ``.kanbanlan.toml`` leaves every linked worktree without
+    one, and the workflow this tool describes asks for a dedicated worktree per
+    request. That combination makes ``kanbanlan ensure`` fail on first use in
+    the exact environment the workflow prescribes.
+
+    The shared snapshot already resolves across worktrees via
+    :func:`cache_dir`, so this follows the established pattern: prefer the
+    config in the current root, and otherwise read the primary checkout's.
+
+    Committing the config is still the better answer for a repository, since it
+    also gives a fresh clone a working setup. This only keeps an uncommitted
+    config from breaking linked worktrees.
+    """
+    local = root / CONFIG_FILENAME
+    if local.exists():
+        return local
+    try:
+        primary = primary_worktree(root)
+    except Exception:
+        # Not a git worktree, or git is unavailable. Report against the path
+        # the caller asked for rather than masking the original problem.
+        return local
+    if primary == root:
+        return local
+    shared = primary / CONFIG_FILENAME
+    return shared if shared.exists() else local
 
 
 def find_repo_root(start: Path | None = None) -> Path:
