@@ -23,6 +23,7 @@ from kanbanlan.config import (
     discover_default_branch,
     discover_repository,
     find_repo_root,
+    normalize_repository_target,
     primary_worktree,
 )
 from kanbanlan.domain import request_label, resolve_request_item
@@ -304,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="priority:p2",
         help="request priority (default: priority:p2)",
     )
+    capture.add_argument(
+        "--repository",
+        help=(
+            "create the request in OWNER/REPO instead of this repository, "
+            "keeping the configured Project"
+        ),
+    )
     _add_actor_session_argument(capture)
 
     triage = commands.add_parser("triage", help="move one Inbox request to Ready")
@@ -559,6 +567,7 @@ def _record_session_activity(
     to_status: str | None,
     actor: AgentSession | None,
     owner_session: str | None = None,
+    repository: str | None = None,
 ) -> None:
     if not config.session_tracking_enabled():
         return
@@ -572,6 +581,7 @@ def _record_session_activity(
             actor=actor,
             owner_session=owner_session,
         ),
+        repository=repository,
     )
 
 
@@ -1571,9 +1581,66 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _capture_target(
+    args: argparse.Namespace,
+    config: Config,
+    provider: CoordinationProvider,
+) -> tuple[str, dict[str, Any] | None]:
+    """Resolve where a new request belongs, without ever guessing.
+
+    A target is only ever the configured repository or one the caller named.
+    Nothing is inferred from the title or body.
+    """
+
+    requested = getattr(args, "repository", None)
+    if not requested:
+        return config.repository, None
+    if not provider.capabilities.repository_routing:
+        raise RuntimeError(
+            f"canonical home {provider.provider_name!r} does not support repository routing"
+        )
+    target = normalize_repository_target(requested, hostname=config.hostname)
+    if target == config.repository:
+        return config.repository, None
+    with status(f"Preparing {target} for capture"):
+        preparation = provider.prepare_capture_target(target)
+    return preparation["repository"], preparation
+
+
+def _reconcile_captured_request(
+    provider: CoordinationProvider,
+    store: CacheStore,
+    kanbanlan_id: str,
+    target: str,
+    config: Config,
+) -> dict[str, Any]:
+    """Bring one freshly created request to Inbox in the repository that owns it."""
+
+    if target == config.repository:
+        snapshot = store.refresh(provider)
+        remaining, refreshed = apply_reconciliation(
+            provider,
+            store,
+            snapshot,
+            provider.list_open_requests(),
+        )
+        if remaining:
+            raise RuntimeError("its Project state did not reconcile")
+        return _issue(refreshed, kanbanlan_id)
+    # A peer repository owns this request, so repository-scoped reconciliation
+    # cannot see it. Set exactly this request's initial state instead of
+    # reconciling a repository this session does not own.
+    snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+    item = _issue(snapshot, kanbanlan_id)
+    provider.set_request_status(item["number"], "status:intake", repository=target)
+    provider.set_projection_status(item["project_item_id"], snapshot["project"], "Inbox")
+    return item
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
+    target, preparation = _capture_target(args, config, provider)
     kanbanlan_id = new_kanbanlan_id()
     body = args.body or (
         "## Outcome\n\n"
@@ -1581,26 +1648,19 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         "## Acceptance criteria\n\n- [ ] "
     )
     body = attach_kanbanlan_id(body, kanbanlan_id)
-    with status("Creating Inbox issue"):
-        url = provider.create_request(args.title, body, args.priority)
+    with status(f"Creating Inbox issue in {target}"):
+        url = provider.create_request(args.title, body, args.priority, repository=target)
     try:
         with status("Adding issue to the configured Project"):
             provider.add_to_projection(url)
         with status("Reconciling initial issue state"):
-            snapshot = store.refresh(provider)
-            remaining, refreshed = apply_reconciliation(
-                provider,
-                store,
-                snapshot,
-                provider.list_open_requests(),
-            )
+            item = _reconcile_captured_request(provider, store, kanbanlan_id, target, config)
     except (CommandError, RuntimeError) as exc:
         raise RuntimeError(
-            f"the issue was created at {url}, but Project setup failed: {exc}"
+            f"the issue was created at {url}, but Project setup failed: {exc}. "
+            f"Do not run capture again; repair the existing request with "
+            f"{shlex.join(['kanbanlan', 'reconcile', '--apply'])} in {target}"
         ) from exc
-    if remaining:
-        raise RuntimeError("the issue was created but its Project state did not reconcile")
-    item = _issue(refreshed, kanbanlan_id)
     _record_session_activity(
         config=config,
         provider=provider,
@@ -1609,17 +1669,25 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         from_status=None,
         to_status="Inbox",
         actor=actor,
+        repository=target,
     )
-    if config.session_tracking_enabled():
+    if config.session_tracking_enabled() and target == config.repository:
         store.refresh(provider)
     result = {
         "kanbanlan_id": kanbanlan_id,
+        "repository": target,
+        "provider_ref": item.get("provider_ref"),
+        "canonical_url": item.get("canonical_url") or url,
         "url": url,
+        "routed": target != config.repository,
+        "project_link": preparation,
         "actor_session": actor.to_dict() if actor else None,
     }
     if _emit_result(args, result):
         return 0
     print(f"Kanbanlan: {kanbanlan_id}")
+    if target != config.repository:
+        print(f"repository: {target}")
     print(url)
     return 0
 

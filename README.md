@@ -224,6 +224,20 @@ declaring one, or declaring an ID that more than one request carries, appears
 in `linkage_problems` and links to nothing; `reconcile`, `overlap`, and
 `review` surface it.
 
+A request can also be captured into the repository that will implement it,
+while staying on the shared Project:
+
+```sh
+kanbanlan capture "Add the HSA/FSA page" --repository OWNER/REPO
+```
+
+`capture` defaults to the configured repository and never infers a destination
+from the title or body. The target is validated and prepared before anything is
+created: it must be on the configured host, accessible, and linked to the
+Project, and workflow labels are provisioned there. If a later step fails, the
+error names the created URL and the repair to run, so a retry never creates a
+second request.
+
 ## Request lifecycle
 
 ```sh
