@@ -32,6 +32,7 @@ from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id
 from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
+from kanbanlan.rehome import format_plan, plan_rehome, rehome_result
 from kanbanlan.runner import CommandError, Runner, is_transient_failure
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.sessions import (
@@ -63,6 +64,7 @@ from kanbanlan.ui import (
 from kanbanlan.updates import notify_if_update_available
 from kanbanlan.worker import Worker, start_worker, stop_worker, worker_status
 from kanbanlan.workflow import (
+    STATUS_TO_LABEL,
     apply_reconciliation,
     format_drift,
     plan_reconciliation,
@@ -83,11 +85,13 @@ COMMAND_NAMES = (
     "snapshot",
     "path",
     "next",
+    "overlap",
     "reconcile",
     "capture",
     "triage",
     "claim",
     "release",
+    "rehome",
     "review",
     "handoff",
     "sessions",
@@ -336,6 +340,23 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("--reason", required=True, help="why the claim is being released")
     release.add_argument("--blocked", action="store_true", help="move to Blocked instead of Ready")
     _add_actor_session_argument(release)
+
+    rehome = commands.add_parser(
+        "rehome",
+        help="move a request to another repository without changing its identity",
+    )
+    rehome.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    rehome.add_argument(
+        "--repository",
+        required=True,
+        help="destination repository as OWNER/REPO",
+    )
+    rehome.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the displayed move instead of only planning it",
+    )
+    _add_actor_session_argument(rehome)
 
     review = commands.add_parser("review", help="move an issue with an open PR to review")
     review.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
@@ -1908,6 +1929,117 @@ def _cmd_release(args: argparse.Namespace) -> int:
         return 0
     success(f"Released {label} from {session}")
     return 0
+
+
+def _cmd_rehome(args: argparse.Namespace) -> int:
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
+    if not provider.capabilities.request_rehoming:
+        raise RuntimeError(
+            f"canonical home {provider.provider_name!r} does not support rehoming a request"
+        )
+    target = normalize_repository_target(args.repository, hostname=config.hostname)
+    # A request that belongs elsewhere may already live in a peer repository,
+    # so it is resolved across the Project rather than locally.
+    snapshot = _project_snapshot(provider, f"Checking request {args.issue}")
+    item = _issue(snapshot, args.issue)
+    with status(f"Inspecting {target}"):
+        inspection = provider.inspect_repository_target(target)
+    plan = plan_rehome(item, target, inspection)
+
+    if not args.apply:
+        if _emit_result(args, {"applied": False, **plan.to_dict()}):
+            return 2 if plan.blocked else 0
+        heading("Rehome plan")
+        for line in format_plan(plan):
+            print(line)
+        if plan.blocked:
+            warning(f"{len(plan.blockers)} blocker(s); resolve them before rerunning with --apply.")
+            return 2
+        warning("Nothing was changed; rerun with --apply to perform the move.")
+        return 0
+
+    if plan.blocked:
+        detail = "; ".join(f"{value.kind}: {value.detail}" for value in plan.blockers)
+        raise RuntimeError(f"request {plan.kanbanlan_id} cannot be rehomed ({detail})")
+
+    with status(f"Preparing {target}"):
+        provider.prepare_repository_target(target)
+    with status(f"Transferring {plan.source_provider_ref} to {target}"):
+        moved_url = provider.transfer_request(
+            plan.source_number,
+            target,
+            repository=plan.source_repository,
+        )
+    try:
+        with status("Reconciling the moved request"):
+            moved = _reconcile_rehomed_request(provider, plan, moved_url, config)
+    except (CommandError, RuntimeError) as exc:
+        recovery = shlex.join(
+            ["kanbanlan", "rehome", plan.kanbanlan_id, "--repository", target, "--apply"]
+        )
+        raise RuntimeError(
+            f"the request moved to {moved_url}, but reconciling it failed: {exc}. "
+            f"The request was not duplicated; rerun {recovery} to finish, or repair it with "
+            f"{shlex.join(['kanbanlan', 'reconcile', '--apply'])} in {target}"
+        ) from exc
+    _record_session_activity(
+        config=config,
+        provider=provider,
+        reference=moved["number"],
+        action="rehome",
+        from_status=plan.status,
+        to_status=moved.get("status"),
+        actor=actor,
+        repository=target,
+    )
+    if plan.source_repository == config.repository or target == config.repository:
+        store.refresh(provider)
+    result = rehome_result(plan, moved)
+    result["actor_session"] = actor.to_dict() if actor else None
+    if _emit_result(args, result):
+        return 0
+    success(f"Rehomed {plan.kanbanlan_id} to {target}")
+    print(f"{plan.source_provider_ref} -> {result['target']['provider_ref']}")
+    print(result["target"]["url"])
+    for value in plan.dropped:
+        warning(f"dropped {value['field']} {value['value']}: {value['reason']}")
+    return 0
+
+
+def _reconcile_rehomed_request(
+    provider: CoordinationProvider,
+    plan: Any,
+    moved_url: str,
+    config: Config,
+) -> dict[str, Any]:
+    """Restore the request's Project state after the transfer.
+
+    Resolution is by Kanbanlan ID, which the transfer preserved, so this never
+    creates a replacement request even when it runs more than once.
+    """
+
+    snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+    try:
+        item = _issue(snapshot, plan.kanbanlan_id)
+    except RuntimeError:
+        provider.add_to_projection(moved_url)
+        snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+        item = _issue(snapshot, plan.kanbanlan_id)
+    if not item.get("project_item_id"):
+        provider.add_to_projection(item.get("canonical_url") or moved_url)
+        snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+        item = _issue(snapshot, plan.kanbanlan_id)
+    label = STATUS_TO_LABEL.get(plan.status or "")
+    if label:
+        provider.set_request_status(item["number"], label, repository=plan.target_repository)
+    if plan.status:
+        provider.set_projection_status(
+            item["project_item_id"],
+            snapshot["project"],
+            plan.status,
+        )
+    return item
 
 
 def _cmd_review(args: argparse.Namespace) -> int:

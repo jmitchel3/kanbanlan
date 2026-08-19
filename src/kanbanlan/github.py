@@ -75,6 +75,7 @@ query($owner: String!, $number: Int!, $after: String) {
               updatedAt
               closedAt
               labels(first: 50) { nodes { name color } }
+              milestone { title }
               assignees(first: 20) { nodes { login } }
               comments(last: 100) {
                 totalCount
@@ -464,14 +465,30 @@ class GitHub:
             )
         return project
 
-    def prepare_capture_target(self, repository: str) -> dict[str, Any]:
-        """Validate and prepare a repository before any request is created.
+    def repository_labels(self, repository: str) -> set[str]:
+        payload = self.runner.json(
+            [
+                "gh",
+                "label",
+                "list",
+                "--repo",
+                repository,
+                "--limit",
+                "500",
+                "--json",
+                "name",
+            ],
+            retry=True,
+        )
+        return {value["name"] for value in payload}
 
-        Everything that can fail is done first, so a failure leaves no
-        half-created request behind.
+    def inspect_repository_target(self, repository: str) -> dict[str, Any]:
+        """Report what a repository would need, changing nothing.
+
+        A plan must be able to describe the work without doing any of it, so
+        every mutation stays in ``prepare_repository_target``.
         """
 
-        config = self._config()
         info = self.repository_info(repository)
         target = info["nameWithOwner"]
         project = self.project_repository_bindings()
@@ -480,8 +497,25 @@ class GitHub:
             for node in project.get("repositories", {}).get("nodes", [])
             if node and node.get("nameWithOwner")
         }
-        already_linked = target in linked
-        if not already_linked:
+        required = set(STATUS_LABELS) | set(PRIORITY_LABELS)
+        return {
+            "repository": target,
+            "already_linked": target in linked,
+            "missing_labels": sorted(required - self.repository_labels(target)),
+            "project_url": project.get("url"),
+        }
+
+    def prepare_repository_target(self, repository: str) -> dict[str, Any]:
+        """Validate and prepare a repository before anything is created or moved.
+
+        Everything that can fail is done first, so a failure leaves no
+        half-created request behind.
+        """
+
+        config = self._config()
+        inspection = self.inspect_repository_target(repository)
+        target = inspection["repository"]
+        if not inspection["already_linked"]:
             try:
                 self.link_project(target)
             except (CommandError, RuntimeError) as exc:
@@ -490,11 +524,35 @@ class GitHub:
                     f"{config.project_owner}/{config.project_number}: {exc}"
                 ) from exc
         self.ensure_labels(target)
-        return {
-            "repository": target,
-            "already_linked": already_linked,
-            "project_url": project.get("url"),
-        }
+        return inspection
+
+    def prepare_capture_target(self, repository: str) -> dict[str, Any]:
+        return self.prepare_repository_target(repository)
+
+    def transfer_request(
+        self,
+        reference: int | str,
+        target: str,
+        *,
+        repository: str | None = None,
+    ) -> str:
+        """Move one issue to another repository, preserving its discussion."""
+
+        result = self.runner.run(
+            [
+                "gh",
+                "issue",
+                "transfer",
+                str(_issue_number(reference)),
+                target,
+                "--repo",
+                self._repository(repository),
+            ]
+        )
+        url = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
+        if not url:
+            raise RuntimeError(f"GitHub did not report the new location of {reference} in {target}")
+        return url
 
     def project_metadata(self) -> dict[str, Any]:
         project, _ = self._fetch_project()

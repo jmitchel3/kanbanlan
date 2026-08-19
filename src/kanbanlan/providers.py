@@ -18,6 +18,7 @@ class ProviderCapabilities:
     repository_records: bool = True
     project_scope: bool = True
     repository_routing: bool = True
+    request_rehoming: bool = True
 
 
 class CoordinationProvider(Protocol):
@@ -66,6 +67,18 @@ class CoordinationProvider(Protocol):
         self,
         reference: int | str,
         kanbanlan_id: str,
+        *,
+        repository: str | None = None,
+    ) -> str: ...
+
+    def inspect_repository_target(self, repository: str) -> dict[str, Any]: ...
+
+    def prepare_repository_target(self, repository: str) -> dict[str, Any]: ...
+
+    def transfer_request(
+        self,
+        reference: int | str,
+        target: str,
         *,
         repository: str | None = None,
     ) -> str: ...
