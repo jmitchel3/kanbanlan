@@ -314,7 +314,22 @@ class ProjectScopeCollectionTests(unittest.TestCase):
 
         self.assertEqual({LOCAL, PEER}, project_repositories(value))
 
-    def test_repository_scope_reads_only_the_configured_repository(self) -> None:
+    def test_a_linked_repository_qualifies_before_it_has_any_card(self) -> None:
+        value = project([issue_item(7)])
+        value["repositories"] = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"nameWithOwner": LOCAL}, {"nameWithOwner": PEER}],
+        }
+
+        self.assertEqual({LOCAL, PEER}, project_repositories(value))
+
+    def test_pull_request_discovery_is_project_bounded_in_both_scopes(self) -> None:
+        """A peer pull request can deliver this repository's request.
+
+        Discovery therefore covers every Project repository at either scope.
+        What each scope *reports* is decided later, in the snapshot.
+        """
+
         github = FakeGitHub(
             project_pages=[project_page([issue_item(7), issue_item(8, repository=PEER)])],
             pull_request_pages={
@@ -325,8 +340,24 @@ class ProjectScopeCollectionTests(unittest.TestCase):
 
         read = github.collect()
 
-        self.assertEqual([LOCAL], [repository for repository, _ in github.pull_request_calls])
-        self.assertEqual([11], [value["number"] for value in read.pull_requests])
+        self.assertEqual(
+            sorted([LOCAL, PEER]),
+            sorted({repository for repository, _ in github.pull_request_calls}),
+        )
+        self.assertEqual([11, 12], sorted(value["number"] for value in read.pull_requests))
+
+    def test_repository_scope_reports_only_relevant_pull_requests(self) -> None:
+        github = FakeGitHub(
+            project_pages=[project_page([issue_item(7), issue_item(8, repository=PEER)])],
+            pull_request_pages={
+                LOCAL: [pull_request_page([pull_request(11)])],
+                PEER: [pull_request_page([pull_request(12, repository=PEER)])],
+            },
+        )
+
+        snapshot = github.snapshot(generated_at=GENERATED_AT)
+
+        self.assertEqual([11], [value["number"] for value in snapshot["open_pull_requests"]])
 
     def test_project_scope_reads_every_project_repository_and_no_others(self) -> None:
         github = FakeGitHub(

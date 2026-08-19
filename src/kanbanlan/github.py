@@ -12,7 +12,7 @@ from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
 from kanbanlan.runner import CommandError, CommandResult, Runner
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
-from kanbanlan.snapshot import SCOPE_PROJECT, SCOPE_REPOSITORY, build_snapshot
+from kanbanlan.snapshot import SCOPE_REPOSITORY, build_snapshot
 
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!, $after: String) {
@@ -23,6 +23,10 @@ query($owner: String!, $number: Int!, $after: String) {
       title
       url
       updatedAt
+      repositories(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { nameWithOwner }
+      }
       fields(first: 50) {
         nodes {
           ... on ProjectV2Field {
@@ -197,9 +201,19 @@ class ProjectRead:
 
 
 def project_repositories(project: dict[str, Any]) -> set[str]:
-    """Return every repository the Project already references."""
+    """Return every repository the Project already references.
 
-    repositories: set[str] = set()
+    Both routes matter. A linked repository qualifies before it has any card,
+    which is how a peer repository's first delivery is recognized. Item content
+    qualifies a repository whose work is already on the board even when the
+    Project link is absent.
+    """
+
+    repositories: set[str] = {
+        node["nameWithOwner"]
+        for node in project.get("repositories", {}).get("nodes", [])
+        if node and node.get("nameWithOwner")
+    }
     for item in project.get("items", []):
         content = item.get("content") or {}
         name = (content.get("repository") or {}).get("nameWithOwner")
@@ -469,17 +483,18 @@ class GitHub:
     def collect(self, *, scope: str = SCOPE_REPOSITORY) -> ProjectRead:
         """Read the Project once and the open pull requests each scope needs.
 
-        Project scope stays bounded to repositories the Project already
-        references; it never enumerates repositories owned by the account. A
-        peer repository that cannot be read is reported instead of failing the
-        whole read, because the configured repository still has usable state.
+        Open pull requests are discovered across every repository the Project
+        already references, whatever the scope, because a request here can be
+        delivered by a pull request in a peer repository. Discovery never
+        enumerates repositories owned by the account: a repository joins the
+        read by already being on the board. A peer repository that cannot be
+        read is reported instead of failing the whole read, because the
+        configured repository still has usable state.
         """
 
         config = self._config()
         project, project_rate_limit = self._fetch_project()
-        targets = [config.repository]
-        if scope == SCOPE_PROJECT:
-            targets = sorted({config.repository, *project_repositories(project)})
+        targets = sorted({config.repository, *project_repositories(project)})
         pull_requests: list[dict[str, Any]] = []
         unavailable: list[dict[str, Any]] = []
         rate_limits = [project_rate_limit]

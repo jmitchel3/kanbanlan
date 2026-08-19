@@ -210,6 +210,20 @@ Snapshots carry `source.scope`, and every issue and pull request carries
 `github:owner/repo#123`, so identically numbered content in different
 repositories never collides. A bare issue number stays a local reference.
 
+A request in one repository can be delivered by a pull request in another. The
+pull request must say so explicitly, either with a repository-qualified closing
+reference such as `Closes owner/repo#123` or by declaring the request's exact
+Kanbanlan ID in its body. A bare `Closes #123` is only ever read inside the
+pull request's own repository. `linked_open_pull_requests` reports the
+`repository`, qualified `provider_ref`, and the `linked_by` routes that
+justified each link, and `kanbanlan review` accepts a qualifying
+cross-repository pull request while keeping the responsible claim.
+
+Ambiguity is never guessed. A pull request naming several Kanbanlan IDs without
+declaring one, or declaring an ID that more than one request carries, appears
+in `linkage_problems` and links to nothing; `reconcile`, `overlap`, and
+`review` surface it.
+
 ## Request lifecycle
 
 ```sh
