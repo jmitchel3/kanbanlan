@@ -102,15 +102,22 @@ class RepositoryTargetTests(unittest.TestCase):
 
 
 class StubRunner:
-    def __init__(self, *, unlinkable: bool = False):
+    def __init__(self, *, unlinkable: bool = False, labels: list[str] | None = None):
         self.calls: list[list[str]] = []
         self.unlinkable = unlinkable
+        self.labels = labels or []
 
     def run(self, args, **kwargs):
         self.calls.append(list(args))
         if self.unlinkable and args[:3] == ["gh", "project", "link"]:
             raise CommandError(CommandResult(tuple(args), 1, "", "permission denied"))
         return CommandResult(tuple(args), 0, "", "")
+
+    def json(self, args, **kwargs):
+        self.calls.append(list(args))
+        if args[:3] == ["gh", "label", "list"]:
+            return [{"name": name} for name in self.labels]
+        return []
 
 
 class PrepareCaptureTargetTests(unittest.TestCase):

@@ -238,6 +238,23 @@ Project, and workflow labels are provisioned there. If a later step fails, the
 error names the created URL and the repair to run, so a retry never creates a
 second request.
 
+A request that already exists moves with `rehome`, which preserves its
+Kanbanlan ID, discussion, and Project state instead of fragmenting history into
+a replacement:
+
+```sh
+kanbanlan rehome KBL-... --repository OWNER/REPO           # plan only
+kanbanlan rehome KBL-... --repository OWNER/REPO --apply   # perform the move
+```
+
+The plan is the default and changes nothing; it reports what transfers, what
+the target needs, what GitHub drops, and anything that blocks the move. A move
+is refused while the request has an active claim or a linked open pull request,
+when it is closed, or when the destination is where it already lives. It moves
+the canonical request only: branches, worktrees, commits, and pull requests stay
+where they are, and the request keeps its Kanbanlan ID while receiving a new
+issue number.
+
 ## Request lifecycle
 
 ```sh
@@ -245,6 +262,7 @@ kanbanlan capture "Add export audit log" --priority priority:p1
 kanbanlan triage KBL-...
 kanbanlan claim KBL-... --touchpoints "audit API; exports UI; migrations"
 kanbanlan record KBL-...
+kanbanlan rehome KBL-... --repository other-owner/other-repo
 kanbanlan review KBL-...
 kanbanlan release KBL-... --reason "Waiting for product decision" --blocked
 kanbanlan handoff KBL-... --session codex-next --branch work/kbl-audit \\

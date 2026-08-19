@@ -477,6 +477,36 @@ URL and the repair to run. Do not run `capture` again: a second run creates a
 second request with a new identity. Run `kanbanlan reconcile --apply` in the
 repository that owns the request instead.
 
+## Moving a request that landed in the wrong repository
+
+A request that already exists moves with `rehome`, which preserves its
+Kanbanlan ID, its discussion, and its Project state. Recreating it elsewhere
+would fragment its history and break the portable identity.
+
+```sh
+kanbanlan rehome KBL-... --repository OWNER/REPO           # plan only
+kanbanlan rehome KBL-... --repository OWNER/REPO --apply   # perform the move
+```
+
+The plan is the default and changes nothing. It reports what transfers, what
+the target still needs, what GitHub will drop (a milestone, and any label the
+target does not have), and anything that blocks the move.
+
+A move is refused while the request has an active claim or a linked open pull
+request, when it is closed, or when the destination is where it already lives.
+Release the claim, or merge or close the pull request, and then move it. Only
+same-host moves to the configured Project are supported; anything else fails
+before a single mutation.
+
+This moves the canonical request, not its implementation. Branches, worktrees,
+commits, and pull requests stay where they are, and the request receives a new
+issue number in its new repository. Look it up by its Kanbanlan ID, which never
+changes.
+
+If the transfer succeeds but reconciling the Project state fails, the error
+names the new canonical URL and a retryable repair. Rerunning `rehome` finishes
+the move; it never creates a replacement request.
+
 ## States
 
 | Issue label | Project Status | Meaning |

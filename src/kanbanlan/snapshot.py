@@ -345,6 +345,7 @@ def build_snapshot(
                     "state_reason": content.get("stateReason"),
                     "closed_at": content.get("closedAt"),
                     "labels": labels,
+                    "milestone": (content.get("milestone") or {}).get("title"),
                     "priority": priority,
                     "assignees": sorted(
                         assignee["login"]
