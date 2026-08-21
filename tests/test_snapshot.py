@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
 from kanbanlan.config import Config
+from kanbanlan.locks import FileLock
 from kanbanlan.runner import RateLimitError
 from kanbanlan.sessions import AgentSession, activity_comment
 from kanbanlan.snapshot import (
@@ -143,6 +145,68 @@ class SnapshotTests(unittest.TestCase):
             },
         ]
         self.assertEqual("winner", active_claim(comments)["session"])
+
+
+class FileLockTests(unittest.TestCase):
+    def _aged(self, path: Path, seconds: float) -> None:
+        old = time.time() - seconds
+        os.utime(path, (old, old))
+
+    def test_live_owner_lock_is_not_stolen_even_when_old(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            path.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
+            self._aged(path, 3600)
+            with self.assertRaises(RuntimeError):
+                with FileLock(path, timeout=0.2):
+                    pass
+            self.assertEqual(os.getpid(), json.loads(path.read_text(encoding="utf-8"))["pid"])
+
+    def test_legacy_bare_pid_lock_of_a_live_owner_is_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            path.write_text(str(os.getpid()), encoding="utf-8")
+            self._aged(path, 3600)
+            with self.assertRaises(RuntimeError):
+                with FileLock(path, timeout=0.2):
+                    pass
+            self.assertTrue(path.exists())
+
+    def test_dead_owner_lock_is_atomically_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            path.write_text('{"pid": 999999, "started_at": "earlier"}\n', encoding="utf-8")
+            with mock.patch("kanbanlan.locks.pid_running", return_value=False):
+                with FileLock(path, timeout=1.0):
+                    owner = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertEqual(os.getpid(), owner["pid"])
+            self.assertFalse(path.exists())
+
+    def test_release_leaves_a_lock_the_holder_no_longer_owns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            with FileLock(path, timeout=1.0):
+                path.unlink()
+                path.write_text('{"pid": 424242}\n', encoding="utf-8")
+            self.assertTrue(path.exists())
+            self.assertEqual(424242, json.loads(path.read_text(encoding="utf-8"))["pid"])
+
+    def test_unreadable_lock_falls_back_to_mtime_staleness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            path.write_text("not an owner record", encoding="utf-8")
+            self._aged(path, 120)
+            with FileLock(path, timeout=1.0):
+                self.assertEqual(os.getpid(), json.loads(path.read_text(encoding="utf-8"))["pid"])
+
+    def test_fresh_unreadable_lock_keeps_waiters_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            path.write_text("not an owner record", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                with FileLock(path, timeout=0.2):
+                    pass
+            self.assertTrue(path.exists())
 
 
 class CacheTests(unittest.TestCase):

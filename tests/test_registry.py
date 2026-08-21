@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from kanbanlan.locks import FileLock
 from kanbanlan.registry import RegistryStore
 
 
@@ -125,3 +129,43 @@ class RegistryTests(unittest.TestCase):
             )
             self.assertEqual("0600", oct((Path(directory) / "registry.json").stat().st_mode)[-4:])
             self.assertEqual("0700", oct(Path(directory).stat().st_mode)[-4:])
+
+    def test_registry_lock_never_steals_from_a_live_owner(self) -> None:
+        """The registry uses the owner-verified lock: age alone frees nothing."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            store.lock_path.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(store.lock_path, (old, old))
+            with mock.patch(
+                "kanbanlan.registry.FileLock",
+                lambda path: FileLock(path, timeout=0.2),
+            ):
+                with self.assertRaises(RuntimeError):
+                    store.register(
+                        common_dir=Path(directory) / "common",
+                        root=Path(directory),
+                        repository="acme/one",
+                        hostname="github.com",
+                        github_login="alice",
+                    )
+            owner = json.loads(store.lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(os.getpid(), owner["pid"])
+
+    def test_registry_lock_replaces_a_provably_dead_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            store.lock_path.write_text(
+                '{"pid": 999999, "started_at": "earlier"}\n', encoding="utf-8"
+            )
+            with mock.patch("kanbanlan.locks.pid_running", return_value=False):
+                registration = store.register(
+                    common_dir=Path(directory) / "common",
+                    root=Path(directory),
+                    repository="acme/one",
+                    hostname="github.com",
+                    github_login="alice",
+                )
+            self.assertEqual("acme/one", registration.repository)
+            self.assertFalse(store.lock_path.exists())

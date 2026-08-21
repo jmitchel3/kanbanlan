@@ -5,13 +5,13 @@ import os
 import re
 import sys
 import tempfile
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from kanbanlan.config import Config
 from kanbanlan.identity import extract_kanbanlan_id, find_kanbanlan_ids
+from kanbanlan.locks import FileLock
 from kanbanlan.runner import RateLimitError
 from kanbanlan.sessions import session_history
 
@@ -469,47 +469,6 @@ def build_snapshot(
         "linkage_problems": linkage_problems,
         "rate_limit": rate_limit,
     }
-
-
-class FileLock:
-    def __init__(self, path: Path, timeout: float = 10.0):
-        self.path = path
-        self.timeout = timeout
-        self.fd: int | None = None
-
-    def __enter__(self) -> FileLock:
-        deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                self.fd = os.open(
-                    self.path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-                os.write(self.fd, str(os.getpid()).encode())
-                return self
-            except FileExistsError:
-                try:
-                    stale = time.time() - self.path.stat().st_mtime > 60
-                except FileNotFoundError:
-                    continue
-                if stale:
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"timed out waiting for cache lock {self.path}")
-                time.sleep(0.05)
-
-    def __exit__(self, *_args: Any) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 class CacheStore:

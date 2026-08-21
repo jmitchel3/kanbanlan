@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import signal
 import subprocess
@@ -13,6 +12,11 @@ from typing import Any
 
 from kanbanlan.config import Config, cache_dir
 from kanbanlan.github import GitHub
+from kanbanlan.locks import file_identity as _file_identity
+from kanbanlan.locks import lock_pid as _lock_pid
+from kanbanlan.locks import pid_running as _pid_running
+from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
+from kanbanlan.locks import write_owner_record
 from kanbanlan.registry import Registration, RegistryStore, utc_now
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
@@ -68,14 +72,7 @@ class WorkerLock:
                 continue
 
             try:
-                payload = (
-                    json.dumps({"pid": os.getpid(), "started_at": utc_now()}) + "\n"
-                ).encode()
-                if os.write(descriptor, payload) != len(payload):
-                    raise OSError("could not write the complete worker lock")
-                os.fsync(descriptor)
-                stat = os.fstat(descriptor)
-                self.identity = (stat.st_dev, stat.st_ino)
+                self.identity = write_owner_record(descriptor)
             except Exception:
                 os.close(descriptor)
                 _unlink_if_unchanged(self.path, _file_identity(self.path))
@@ -88,46 +85,6 @@ class WorkerLock:
     def __exit__(self, *_args: Any) -> None:
         if self.acquired:
             _unlink_if_unchanged(self.path, self.identity)
-
-
-def _file_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return None
-    return stat.st_dev, stat.st_ino
-
-
-def _unlink_if_unchanged(path: Path, identity: tuple[int, int] | None) -> None:
-    if identity is None or _file_identity(path) != identity:
-        return
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _lock_pid(path: Path) -> int | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        pid = int(value.get("pid", 0))
-    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-        return None
-    return pid if pid > 0 else None
-
-
-def _pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def token_env_name(hostname: str, login: str) -> str:
