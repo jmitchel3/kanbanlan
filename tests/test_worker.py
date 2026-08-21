@@ -143,9 +143,49 @@ class WorkerTests(unittest.TestCase):
             updated = store.registrations()[0]
             self.assertEqual(0, updated.consecutive_failures)
             self.assertIsNotNone(updated.last_success_at)
+            # A clean cycle pays for exactly one refresh and one issue sweep;
+            # verification only re-reads live state after a repair.
+            self.assertEqual([mock.call(provider)], cache.refresh.call_args_list)
+            provider.list_open_requests.assert_called_once()
+
+    def test_applied_repair_is_verified_with_a_second_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            store.register(
+                common_dir=Path(directory) / "common",
+                root=Path(directory),
+                repository="acme/one",
+                hostname="github.com",
+                github_login="alice",
+            )
+            provider = mock.Mock()
+            provider.list_open_requests.return_value = []
+            cache = mock.Mock()
+            cache.refresh.return_value = {"items": []}
+            drift = mock.Mock(kind="missing_projection")
+            with (
+                mock.patch("kanbanlan.worker.Config.load"),
+                mock.patch("kanbanlan.worker.scoped_runner", return_value=mock.Mock()),
+                mock.patch("kanbanlan.worker.GitHub", return_value=provider),
+                mock.patch("kanbanlan.worker.cache_dir", return_value=Path(directory) / "cache"),
+                mock.patch("kanbanlan.worker.CacheStore", return_value=cache),
+                mock.patch(
+                    "kanbanlan.worker.plan_reconciliation",
+                    side_effect=[[drift], []],
+                ),
+                mock.patch(
+                    "kanbanlan.worker.apply_reconciliation",
+                    return_value=([], []),
+                ) as apply_mock,
+            ):
+                result = Worker(store).run_once()
+
+            self.assertEqual(1, result["succeeded"])
+            apply_mock.assert_called_once()
             self.assertEqual(
                 [mock.call(provider), mock.call(provider)], cache.refresh.call_args_list
             )
+            self.assertEqual(2, provider.list_open_requests.call_count)
 
     def test_recently_serviced_repository_waits_for_its_interval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
