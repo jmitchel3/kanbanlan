@@ -249,13 +249,17 @@ class Worker:
                         "reconciliation left unresolved differences: "
                         + "; ".join(value.kind for value in remaining)
                     )
-            verified = store.refresh(provider)
-            verification_drift = plan_reconciliation(verified, provider.list_open_requests())
-            if verification_drift:
-                raise RuntimeError(
-                    "verification found unresolved differences: "
-                    + "; ".join(value.kind for value in verification_drift)
-                )
+                # Verification re-reads live state only after something was
+                # repaired. A clean cycle already proved itself with the read
+                # above, and the GraphQL point budget it would spend here is
+                # shared by every repository and agent on this account.
+                verified = store.refresh(provider)
+                verification_drift = plan_reconciliation(verified, provider.list_open_requests())
+                if verification_drift:
+                    raise RuntimeError(
+                        "verification found unresolved differences: "
+                        + "; ".join(value.kind for value in verification_drift)
+                    )
             registration.last_success_at = utc_now()
             registration.consecutive_failures = 0
             registration.next_retry_at = None
