@@ -14,6 +14,7 @@ from kanbanlan.config import Config, cache_dir
 from kanbanlan.github import GitHub
 from kanbanlan.locks import file_identity as _file_identity
 from kanbanlan.locks import lock_pid as _lock_pid
+from kanbanlan.locks import owner_predates_lock as _owner_predates_lock
 from kanbanlan.locks import pid_running as _pid_running
 from kanbanlan.locks import release_owner_record, write_owner_record
 from kanbanlan.locks import remove_stale_lock as _remove_stale_lock
@@ -62,7 +63,7 @@ class WorkerLock:
             except FileExistsError:
                 identity = _file_identity(self.path)
                 pid = _lock_pid(self.path)
-                if pid and _pid_running(pid):
+                if pid and _pid_running(pid) and _owner_predates_lock(self.path, pid):
                     raise WorkerAlreadyRunning(f"worker process {pid} already holds {self.path}")
                 try:
                     age = time.time() - self.path.stat().st_mtime
@@ -76,8 +77,12 @@ class WorkerLock:
             try:
                 self.record, self.identity = write_owner_record(descriptor)
             except Exception:
+                # The created file's identity must come from the descriptor:
+                # reading it back from the path would bless whatever file is
+                # there now, possibly a successor's live lock.
+                created = os.fstat(descriptor)
                 os.close(descriptor)
-                _unlink_if_unchanged(self.path, _file_identity(self.path))
+                _unlink_if_unchanged(self.path, (created.st_dev, created.st_ino))
                 raise
             os.close(descriptor)
             break
@@ -256,7 +261,7 @@ def worker_status(registry: RegistryStore | None = None) -> dict[str, Any]:
     lock_path = registry.directory / "worker.lock"
     identity = _file_identity(lock_path)
     pid = _lock_pid(lock_path)
-    running = bool(pid and _pid_running(pid))
+    running = bool(pid and _pid_running(pid) and _owner_predates_lock(lock_path, pid))
     if identity and not running:
         try:
             old_enough_to_be_stale = time.time() - lock_path.stat().st_mtime >= 1

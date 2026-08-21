@@ -138,9 +138,12 @@ class RegistryTests(unittest.TestCase):
             store.lock_path.write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
             old = time.time() - 3600
             os.utime(store.lock_path, (old, old))
-            with mock.patch(
-                "kanbanlan.registry.FileLock",
-                lambda path: FileLock(path, timeout=0.2),
+            with (
+                mock.patch("kanbanlan.locks.process_elapsed_seconds", return_value=7200.0),
+                mock.patch(
+                    "kanbanlan.registry.FileLock",
+                    lambda path: FileLock(path, timeout=0.2),
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     store.register(

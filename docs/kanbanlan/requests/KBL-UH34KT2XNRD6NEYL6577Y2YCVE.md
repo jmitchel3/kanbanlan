@@ -45,6 +45,30 @@ Surfaced by the adversarial review of KBL-2FFYGZHCYNEPXPEU5D6TIHV7GM.
   re-reads the file and requires it to still record the dead PID it observed
   (or still be unreadable) before unlinking, and unreadable content is
   always treated as not-owned.
+- The steal itself is serialized through a sidecar guard file
+  (`<lock>.steal`, `O_CREAT | O_EXCL`). Without it, two waiters behind one
+  crashed holder could interleave: the second completes its own steal and
+  re-acquires between the first waiter's checks and its unlink, and the
+  first then deletes the new live holder's lock. A waiter that finds the
+  guard taken declines and retries; a guard older than 5 seconds can only
+  belong to a stealer that crashed mid-steal and is swept so it cannot
+  wedge everyone.
+- A running PID is not proof of ownership. Lock files survive reboot, and
+  a recycled PID can name an unrelated long-lived process, which would
+  starve every session forever. Before honoring a recorded PID, the
+  process's elapsed time (`ps -o etimes=`, POSIX) is compared with the
+  lock file's age: the owner necessarily started before writing the lock,
+  so a process younger than the lock has a recycled PID and the lock is
+  stale (30 seconds of slack absorbs integer truncation and clock
+  adjustments). When `ps` fails or is unparseable the PID is honored, but
+  only up to 6 hours of lock-file age, restoring the old self-healing
+  valve without ever preempting a verifiably live owner. The waiter loop
+  caches the verdict per (file identity, PID) so it does not spawn `ps`
+  every polling interval.
+- Acquisition-failure cleanup takes the created file's identity from
+  `os.fstat` of the still-open descriptor, not from re-reading the path:
+  the path may already hold a successor's live lock, and the open
+  descriptor also pins the inode against recycling until the check runs.
 - The lock payload is the same JSON owner record the worker already writes.
   `lock_pid` additionally accepts a bare integer so a live legacy holder
   (written by the previous cache lock as a bare PID) is still honored across
@@ -85,5 +109,11 @@ only from a provably dead owner, and every removal (steal or release) checks
 file identity first, so a live, slow refresh can no longer have its lock
 unlinked out from under it and sessions keep queuing instead of refreshing
 concurrently. The logic is shared between the cache, the registry, and the
-worker through `src/kanbanlan/locks.py`; no public CLI behavior changed. No
-follow-up work remains from this card.
+worker through `src/kanbanlan/locks.py`; no public CLI behavior changed.
+
+Known transitional limitation: while mixed versions run against the same
+cache (for example an installed 0.8.0 CLI beside a repo-local copy of this
+branch), the old `FileLock` still steals any lock older than 60 seconds
+regardless of content, so a live new-version refresh running past 60
+seconds can be preempted by old code until the fleet converges on this
+version. No other follow-up work remains from this card.
