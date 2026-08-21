@@ -44,6 +44,31 @@ See docs/improvements/by-fable.md (request 3).
   atomic write is what keeps their lock-free access harmless.
 - The item-level `updatedAt` field was added to `PROJECT_QUERY` so the cache
   can be seeded from a full fetch; snapshot consumers ignore the extra key.
+- The cache stores a SHA-256 fingerprint of the Project `fields` metadata,
+  and a probe whose fresh fields differ invalidates every cached node. Field
+  and option renames (the `ensure_status_options` Todo-to-Inbox setup flow,
+  or a human editing the board) bump no item or content timestamp, yet the
+  old names are denormalized into every cached `fieldValues` node; the
+  fingerprint is the only signal that catches them.
+- The probe additionally reads the bare issue `comments { totalCount }`
+  (valid without pagination args, priced at zero nodes) and reuse requires
+  it to match the cached node, because comment deletions, the claim ledger's
+  failure mode, bump neither `updatedAt`. Comment edits have no cheap probe
+  signal at all, so every cache entry carries a `fetched_at` and expires
+  after `ITEM_CACHE_MAX_AGE_SECONDS` (6 hours); reused entries keep their
+  original `fetched_at` so reuse can never extend the bound.
+- `updatedAt` has one-second resolution, so an entry whose content changed
+  within `ITEM_CACHE_TIMESTAMP_SLACK_SECONDS` (2 seconds) of its own fetch
+  is never reused; without this, a second change landing in the fetch second
+  would compare equal forever.
+- Reuse also requires the probe's `type`, `isArchived`, content `id`, and
+  content `repository` to match the cached node, closing the transfer and
+  archive-flip cases that timestamps do not reliably signal.
+- An item deleted between probe and hydration surfaces as a GraphQL errors
+  array (alongside a null node), which `graphql()` raises as RuntimeError;
+  `_hydrate_items` treats any RuntimeError from a batch as a fallback to the
+  full fetch, while `RateLimitError` propagates so the serve-stale path in
+  `ensure` still works.
 - `KANBANLAN_FULL_REFRESH=1` (also `true`/`yes`/`on`) forces the full fetch
   path, documented in the README rate-limit section.
 - `_fetch_project` now reports the minimum `rateLimit` across probe,
@@ -52,13 +77,18 @@ See docs/improvements/by-fable.md (request 3).
 
 ## Verification
 
-- `uv run pytest -q`: 268 passed (15 new behavior tests in
+- `uv run pytest -q`: 276 passed (23 behavior tests in
   `tests/test_incremental_hydration.py` covering unchanged-board reuse,
-  content-only and item-only timestamp changes, added and removed items,
-  corrupt, version-mismatched, and wrong-project caches, null hydration
-  nodes, draft rehydration, 30-id batching, the forced-full environment
-  variable, unwritable cache paths, and incremental output equality with the
-  full fetch).
+  content-only and item-only timestamp changes, comment deletion via
+  totalCount, Status option renames via the fields fingerprint, cache-entry
+  expiry, the one-second-resolution slack window, preserved `fetched_at` on
+  reuse, added and removed items, corrupt, version-mismatched, and
+  wrong-project caches, hydration of an item deleted between probe and
+  hydration, rate-limit propagation from hydration, multi-page probes, draft
+  rehydration, 30-id batching, the forced-full environment variable,
+  unwritable cache paths, a probe-query shape guard pinning the test mirror
+  to `PROBE_ITEM_FIELDS`, and incremental output equality with the full
+  fetch).
 - `uv run ruff check .` and `uv run ruff format --check .`: clean.
 - `uv build`: wheel and sdist built.
 - Live smoke test against the real Project (31 items): warm unchanged
@@ -66,7 +96,20 @@ See docs/improvements/by-fable.md (request 3).
   versus one full page at cost 4; the incremental result compared equal to a
   forced full fetch of the same board, and two consecutive
   `uv run kanbanlan refresh` runs produced snapshots identical apart from
-  `generated_at` and `rate_limit`.
+  `generated_at` and `rate_limit`. A stale schema-v1 cache correctly fell
+  back to the full fetch and was rewritten as v2.
+- Live verification of the comment timestamp assumptions, on a scratch issue
+  (jmitchel3/kanbanlan#52, plain issue, never added to the Project): adding
+  a comment bumped the issue's `updatedAt`; editing the comment body did not
+  change `updatedAt` at all (confirming that only the cache expiry bounds
+  how long an edited body can be served); deleting the comment did bump
+  `updatedAt` in this observation, but that behavior is undocumented, so the
+  probe's `comments { totalCount }` check remains the guarantee for
+  deletions. The bare `comments { totalCount }` selection is valid GraphQL
+  without pagination arguments at query cost 1. The scratch issue could not
+  be deleted (`gh issue delete` returned "Viewer not authorized to delete"),
+  so it was closed as not planned instead; it carries no labels and no
+  Project item, so the board is untouched.
 
 ## Delivered result
 

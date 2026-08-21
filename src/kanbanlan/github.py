@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -20,7 +21,13 @@ from kanbanlan.runner import (
     is_rate_limit_failure,
 )
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
-from kanbanlan.snapshot import SCOPE_REPOSITORY, build_snapshot
+from kanbanlan.snapshot import (
+    SCOPE_REPOSITORY,
+    build_snapshot,
+    isoformat,
+    parse_time,
+    utc_now,
+)
 
 # The full per-item selection is shared between the paginated Project read and
 # the targeted hydration query so both are guaranteed to produce identical raw
@@ -83,8 +90,11 @@ PROJECT_ITEM_FIELDS = """
 """.strip("\n")
 
 # The probe requests only what a change diff needs. GraphQL prices a query by
-# the node counts it asks for, so leaving out comments, labels, assignees, and
-# field values is what makes probing a stable board nearly free.
+# the node counts it asks for, so leaving out comment bodies, labels,
+# assignees, and field values is what makes probing a stable board nearly
+# free. The bare comment totalCount is the one comment signal that is priced
+# at zero nodes, and it is what catches comment deletions, which bump no
+# updatedAt anywhere.
 PROBE_ITEM_FIELDS = """
           id
           type
@@ -95,6 +105,7 @@ PROBE_ITEM_FIELDS = """
               id
               number
               updatedAt
+              comments { totalCount }
               repository { nameWithOwner }
             }
             ... on PullRequest {
@@ -250,10 +261,19 @@ mutation($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
 # The raw-node cache is purely advisory: it only decides which items are worth
 # re-fetching, never what a snapshot contains, so losing or corrupting it can
 # cost points but can never produce a wrong board.
-ITEM_CACHE_SCHEMA_VERSION = 1
+ITEM_CACHE_SCHEMA_VERSION = 2
 ITEM_CACHE_FILENAME = "project_items.json"
 HYDRATION_BATCH_SIZE = 30
 FULL_REFRESH_ENV = "KANBANLAN_FULL_REFRESH"
+
+# Comment edits bump no timestamp the probe can see, so cached nodes carry a
+# hard expiry that bounds how long an edited comment body can be served.
+ITEM_CACHE_MAX_AGE_SECONDS = 6 * 3600
+
+# updatedAt has one-second resolution, so a change landing in the same second
+# as the hydration that cached it would compare equal forever. An entry whose
+# content changed within this window of its own fetch is never trusted.
+ITEM_CACHE_TIMESTAMP_SLACK_SECONDS = 2.0
 
 REQUIRED_STATUS_OPTIONS = [
     ("Inbox", "GRAY", "Captured but not yet ready"),
@@ -758,13 +778,11 @@ class GitHub:
         """
 
         if not _full_refresh_forced():
-            cached_items = self._load_item_cache()
-            if cached_items is not None:
-                result = self._fetch_project_incremental(cached_items)
+            cache = self._load_item_cache()
+            if cache is not None:
+                result = self._fetch_project_incremental(cache)
                 if result is not None:
-                    project, rate_limit = result
-                    self._store_item_cache(project)
-                    return project, rate_limit
+                    return result
         project, rate_limit = self._fetch_project_full()
         self._store_item_cache(project)
         return project, rate_limit
@@ -776,19 +794,27 @@ class GitHub:
 
     def _fetch_project_incremental(
         self,
-        cached_items: dict[str, Any],
+        cache: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """Probe, diff against the cache, and hydrate only what changed.
 
         Returns None whenever the probe or hydration produces anything
         unexpected, which tells the caller to run the full fetch instead.
-        Provider errors (rate limits, missing project) propagate exactly as
-        they do on the full path.
+        Rate-limit errors propagate exactly as they do on the full path.
         """
 
         metadata, probe_items, rate_limits = self._paginate_project(PROJECT_PROBE_QUERY)
+        if _fields_fingerprint(metadata) != cache.get("fields_fingerprint"):
+            # Field and option renames (Todo becoming Inbox, a recolored
+            # Status) are denormalized into every cached fieldValues node
+            # without bumping any item timestamp, so a changed fields shape
+            # invalidates the whole cache.
+            return None
+        cached_items = cache.get("items", {})
+        now = utc_now()
         order: list[str] = []
         reused: dict[str, Any] = {}
+        preserved_fetched_at: dict[str, str] = {}
         stale: list[str] = []
         for probe_node in probe_items:
             if not isinstance(probe_node, dict) or not probe_node.get("id"):
@@ -796,8 +822,9 @@ class GitHub:
             item_id = probe_node["id"]
             order.append(item_id)
             entry = cached_items.get(item_id)
-            if _cache_entry_reusable(entry, probe_node):
+            if _cache_entry_reusable(entry, probe_node, now):
                 reused[item_id] = entry["node"]
+                preserved_fetched_at[item_id] = entry["fetched_at"]
             else:
                 stale.append(item_id)
         hydrated, hydration_limits = self._hydrate_items(stale)
@@ -811,6 +838,7 @@ class GitHub:
                 return None
             items.append(node)
         metadata["items"] = items
+        self._store_item_cache(metadata, preserved_fetched_at=preserved_fetched_at)
         return metadata, _min_rate_limit(rate_limits)
 
     def _hydrate_items(
@@ -819,16 +847,24 @@ class GitHub:
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         """Fetch full raw nodes for the given project item ids, in batches.
 
-        Returns (None, rate_limits) on any surprise (a null node, an id or
-        type mismatch), so a single odd item costs one full fetch instead of
-        a wrong snapshot.
+        Returns (None, rate_limits) on any surprise, so a single odd item
+        costs one full fetch instead of a wrong snapshot. An item deleted
+        between probe and hydration makes GitHub put an error entry in the
+        response alongside a null node, which ``graphql`` raises as a
+        RuntimeError; that is a fallback too. Only rate-limit errors
+        propagate, so the serve-stale path still sees them.
         """
 
         hydrated: dict[str, Any] = {}
         rate_limits: list[dict[str, Any]] = []
         for start in range(0, len(item_ids), HYDRATION_BATCH_SIZE):
             batch = item_ids[start : start + HYDRATION_BATCH_SIZE]
-            payload = self.graphql(ITEM_HYDRATION_QUERY, {"ids": batch}, retry=True)
+            try:
+                payload = self.graphql(ITEM_HYDRATION_QUERY, {"ids": batch}, retry=True)
+            except RateLimitError:
+                raise
+            except RuntimeError:
+                return None, rate_limits
             rate_limits.append(payload.get("rateLimit", {}))
             nodes = payload.get("nodes")
             if not isinstance(nodes, list) or len(nodes) != len(batch):
@@ -914,35 +950,48 @@ class GitHub:
             return None
         if data.get("project") != self._item_cache_key():
             return None
-        entries = data.get("items")
-        if not isinstance(entries, dict):
+        if not isinstance(data.get("fields_fingerprint"), str):
             return None
-        return entries
+        if not isinstance(data.get("items"), dict):
+            return None
+        return data
 
-    def _store_item_cache(self, project: dict[str, Any]) -> None:
+    def _store_item_cache(
+        self,
+        project: dict[str, Any],
+        *,
+        preserved_fetched_at: dict[str, str] | None = None,
+    ) -> None:
         """Rewrite the advisory cache from a freshly assembled project.
 
         The write is atomic (tempfile plus rename), so a concurrent reader,
         including a lock-free project-scope read, sees either the previous
         complete cache or this one, never a torn file. A failed write is
-        ignored: it only makes the next refresh pay full price.
+        ignored: it only makes the next refresh pay full price. Reused
+        entries keep their original ``fetched_at``, because the cache expiry
+        bounds how long an unverifiable comment edit can be missed, and a
+        reuse verifies nothing about comment bodies.
         """
 
         path = self._item_cache_path()
         if path is None:
             return
+        now_iso = isoformat(utc_now())
         entries: dict[str, Any] = {}
         for node in project.get("items", []):
             if not isinstance(node, dict) or not node.get("id"):
                 continue
-            entries[node["id"]] = {
+            item_id = node["id"]
+            entries[item_id] = {
                 "item_updated_at": node.get("updatedAt"),
                 "content_updated_at": (node.get("content") or {}).get("updatedAt"),
+                "fetched_at": (preserved_fetched_at or {}).get(item_id, now_iso),
                 "node": node,
             }
         payload = {
             "schema_version": ITEM_CACHE_SCHEMA_VERSION,
             "project": self._item_cache_key(),
+            "fields_fingerprint": _fields_fingerprint(project),
             "items": entries,
         }
         try:
@@ -1231,27 +1280,85 @@ def _full_refresh_forced() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _cache_entry_reusable(entry: Any, probe_node: dict[str, Any]) -> bool:
+def _fields_fingerprint(project: dict[str, Any]) -> str:
+    """Return a stable hash of the Project fields metadata.
+
+    Field names, option ids, names, and colors are denormalized into every
+    item's cached fieldValues, so any change to the fields shape must
+    invalidate every cached node even though no item timestamp moves.
+    """
+
+    canonical = json.dumps(
+        project.get("fields", {}),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _cache_entry_reusable(entry: Any, probe_node: dict[str, Any], now: datetime) -> bool:
     """Decide whether one cached raw node can stand in for a live item.
 
     Both timestamps must match because they move independently: a Status
     field edit bumps the item's ``updatedAt`` but not the issue's, while a
     new comment or label bumps the issue's ``updatedAt`` but not necessarily
-    the item's. A probe node without both timestamps (a draft issue, a
-    redacted item, anything unexpected) is never reused, so doubt always
-    means rehydrate.
+    the item's. Comment counts must match because deletions bump neither.
+    Identity (type, archived flag, content id, repository) must match
+    because transfers and archive flips are not reliably visible in the
+    timestamps either. On top of that, an entry is only trusted for
+    ``ITEM_CACHE_MAX_AGE_SECONDS`` (comment edits have no probe signal at
+    all) and never when its content changed within
+    ``ITEM_CACHE_TIMESTAMP_SLACK_SECONDS`` of its own fetch (``updatedAt``
+    has one-second resolution). A probe node missing any of these signals
+    (a draft issue, a redacted item, anything unexpected) is never reused,
+    so doubt always means rehydrate.
     """
 
-    if not isinstance(entry, dict) or not isinstance(entry.get("node"), dict):
+    if not isinstance(entry, dict):
+        return False
+    node = entry.get("node")
+    if not isinstance(node, dict):
         return False
     item_updated = probe_node.get("updatedAt")
-    content_updated = (probe_node.get("content") or {}).get("updatedAt")
+    probe_content = probe_node.get("content") or {}
+    content_updated = probe_content.get("updatedAt")
     if not item_updated or not content_updated:
         return False
-    return (
-        entry.get("item_updated_at") == item_updated
-        and entry.get("content_updated_at") == content_updated
-    )
+    if (
+        entry.get("item_updated_at") != item_updated
+        or entry.get("content_updated_at") != content_updated
+    ):
+        return False
+    cached_content = node.get("content") or {}
+    if (
+        probe_node.get("type") != node.get("type")
+        or probe_node.get("isArchived") != node.get("isArchived")
+        or probe_content.get("id") != cached_content.get("id")
+        or probe_content.get("repository") != cached_content.get("repository")
+    ):
+        return False
+    probe_comments = probe_content.get("comments")
+    cached_comments = cached_content.get("comments")
+    probe_total = probe_comments.get("totalCount") if isinstance(probe_comments, dict) else None
+    cached_total = cached_comments.get("totalCount") if isinstance(cached_comments, dict) else None
+    if probe_total != cached_total:
+        return False
+    fetched_at = entry.get("fetched_at")
+    if not isinstance(fetched_at, str):
+        return False
+    try:
+        fetched = parse_time(fetched_at)
+        changed = parse_time(content_updated)
+        age = (now - fetched).total_seconds()
+        settle = (fetched - changed).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    if age > ITEM_CACHE_MAX_AGE_SECONDS:
+        return False
+    if settle < ITEM_CACHE_TIMESTAMP_SLACK_SECONDS:
+        return False
+    return True
 
 
 def _min_rate_limit(rate_limits: list[dict[str, Any]]) -> dict[str, Any]:
