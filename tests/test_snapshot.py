@@ -6,10 +6,18 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from kanbanlan.config import Config
+from kanbanlan.runner import RateLimitError
 from kanbanlan.sessions import AgentSession, activity_comment
-from kanbanlan.snapshot import CacheStore, active_claim, build_snapshot, isoformat
+from kanbanlan.snapshot import (
+    SCHEMA_VERSION,
+    CacheStore,
+    active_claim,
+    build_snapshot,
+    isoformat,
+)
 
 
 def config() -> Config:
@@ -183,3 +191,169 @@ class CacheTests(unittest.TestCase):
                 },
             )
             self.assertFalse(store.is_fresh())
+
+
+def _stale_snapshot(remaining: int, reset_in_seconds: int) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": isoformat(datetime.now(UTC) - timedelta(seconds=1000)),
+        "rate_limit": {
+            "remaining": remaining,
+            "resetAt": isoformat(datetime.now(UTC) + timedelta(seconds=reset_in_seconds)),
+        },
+    }
+
+
+class _CountingClient:
+    """Fetch-only client, so ``hasattr(client, "snapshot")`` stays False."""
+
+    def __init__(self, rate_limit: dict | None = None, error: Exception | None = None) -> None:
+        self.fetches = 0
+        self.rate_limit = rate_limit or {}
+        self.error = error
+
+    def fetch(self):
+        self.fetches += 1
+        if self.error:
+            raise self.error
+        return (
+            {
+                "id": "project",
+                "number": 2,
+                "title": "Delivery",
+                "url": "url",
+                "fields": {"nodes": []},
+                "items": [],
+            },
+            [],
+            self.rate_limit,
+        )
+
+
+class RateLimitBehaviorTests(unittest.TestCase):
+    def test_ensure_reuses_a_refresh_completed_while_waiting_for_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            store._write_json(store.snapshot_path, _stale_snapshot(4000, 1800))
+            fresh = {
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": isoformat(datetime.now(UTC)),
+                "rate_limit": {},
+            }
+
+            class RefreshedWhileWaiting:
+                def __init__(self, path, timeout: float = 10.0) -> None:
+                    pass
+
+                def __enter__(self):
+                    store._write_json(store.snapshot_path, fresh)
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    pass
+
+            client = _CountingClient()
+            with mock.patch("kanbanlan.snapshot.FileLock", RefreshedWhileWaiting):
+                result = store.ensure(client)
+
+            self.assertEqual(0, client.fetches)
+            self.assertEqual(fresh["generated_at"], result["generated_at"])
+
+    def test_rate_limited_refresh_serves_the_last_good_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            stale = _stale_snapshot(4000, 1800)
+            store._write_json(store.snapshot_path, stale)
+            client = _CountingClient(error=RateLimitError("API rate limit exceeded"))
+
+            result = store.ensure(client)
+
+            self.assertEqual(1, client.fetches)
+            self.assertEqual(stale["generated_at"], result["generated_at"])
+            health = json.loads(store.health_path.read_text(encoding="utf-8"))
+            self.assertEqual("throttled", health["refresh_status"])
+            self.assertEqual("RateLimitError", health["error"]["kind"])
+
+    def test_explicit_refresh_still_fails_when_rate_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            store._write_json(store.snapshot_path, _stale_snapshot(4000, 1800))
+            client = _CountingClient(error=RateLimitError("API rate limit exceeded"))
+
+            with self.assertRaises(RateLimitError):
+                store.refresh(client)
+
+    def test_rate_limited_refresh_without_usable_snapshot_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            client = _CountingClient(error=RateLimitError("API rate limit exceeded"))
+
+            with self.assertRaises(RateLimitError):
+                store.ensure(client)
+
+    def test_low_remaining_defers_refresh_until_the_reset_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            low = _stale_snapshot(10, 1800)
+            store._write_json(store.snapshot_path, low)
+            client = _CountingClient(rate_limit={"remaining": 4999, "resetAt": "soon"})
+
+            deferred = store.ensure(client)
+            self.assertEqual(0, client.fetches)
+            self.assertEqual(low["generated_at"], deferred["generated_at"])
+
+            after_reset = _stale_snapshot(10, -5)
+            store._write_json(store.snapshot_path, after_reset)
+            refreshed = store.ensure(client)
+            self.assertEqual(1, client.fetches)
+            self.assertNotEqual(after_reset["generated_at"], refreshed["generated_at"])
+
+    def test_zero_floor_disables_the_deferral(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            no_floor = Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=2,
+                rate_limit_floor=0,
+            )
+            store = CacheStore(no_floor, Path(directory))
+            store._write_json(store.snapshot_path, _stale_snapshot(10, 1800))
+            client = _CountingClient()
+
+            store.ensure(client)
+
+            self.assertEqual(1, client.fetches)
+
+    def test_malformed_rate_limit_data_never_crashes_and_never_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            malformed: list[dict] = [
+                {"remaining": 10, "resetAt": "2099-08-21T12:00:00"},  # timezone-naive
+                {"remaining": 10, "resetAt": "not-a-time"},
+                {"remaining": 10, "resetAt": None},
+                {"remaining": 10, "resetAt": 12345},
+                {"remaining": True, "resetAt": "2099-08-21T12:00:00Z"},
+                {"remaining": "10", "resetAt": "2099-08-21T12:00:00Z"},
+            ]
+            for rate_limit in malformed:
+                with self.subTest(rate_limit=rate_limit):
+                    low = _stale_snapshot(10, 1800)
+                    low["rate_limit"] = rate_limit
+                    store._write_json(store.snapshot_path, low)
+                    client = _CountingClient()
+
+                    store.ensure(client)
+
+                    self.assertEqual(1, client.fetches)
+
+    def test_old_schema_snapshot_is_never_served_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            outdated = _stale_snapshot(10, 1800)
+            outdated["schema_version"] = SCHEMA_VERSION - 1
+            store._write_json(store.snapshot_path, outdated)
+            client = _CountingClient(error=RateLimitError("API rate limit exceeded"))
+
+            with self.assertRaises(RateLimitError):
+                store.ensure(client)

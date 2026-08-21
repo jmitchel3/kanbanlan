@@ -185,6 +185,16 @@ The cache lives at `<primary-checkout>/.cache/kanbanlan/` with private file
 permissions. A failed refresh preserves the last good snapshot and records the
 error in `health.json`.
 
+Refreshes respect the GitHub GraphQL point budget, which is shared by every
+repository and agent using the same account. Concurrent sessions that queue on
+a refresh reuse the fetch that just completed instead of repeating it. When
+GitHub rate limits a refresh, `ensure` serves the last good snapshot and
+records `refresh_status: "throttled"`; when the snapshot itself reports fewer
+remaining points than `rate_limit_floor` in `.kanbanlan.toml` (default 500,
+0 disables it), `ensure` defers refreshing until the quota resets. `status`
+and `doctor` report the remaining points. An explicit `kanbanlan refresh`
+always attempts the fetch and reports the rate limit plainly if it fails.
+
 ## Shared Projects across repositories
 
 One GitHub Project can serve several repositories. Every command above reads at

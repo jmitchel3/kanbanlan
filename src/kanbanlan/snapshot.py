@@ -12,6 +12,7 @@ from typing import Any
 
 from kanbanlan.config import Config
 from kanbanlan.identity import extract_kanbanlan_id, find_kanbanlan_ids
+from kanbanlan.runner import RateLimitError
 from kanbanlan.sessions import session_history
 
 SCHEMA_VERSION = 3
@@ -522,41 +523,109 @@ class CacheStore:
     def refresh(self, client: Any) -> dict[str, Any]:
         self._prepare_directory()
         with FileLock(self.lock_path):
-            attempted_at = utc_now()
-            try:
-                if hasattr(client, "snapshot"):
-                    snapshot = client.snapshot(generated_at=attempted_at)
-                else:
-                    project, pull_requests, rate_limit = client.fetch()
-                    snapshot = build_snapshot(
-                        self.config,
-                        project,
-                        pull_requests,
-                        rate_limit,
-                        generated_at=attempted_at,
-                    )
-                self._write_json(self.snapshot_path, snapshot)
-                self._write_json(
-                    self.health_path,
-                    {
-                        "schema_version": SCHEMA_VERSION,
-                        "last_attempt_at": isoformat(attempted_at),
-                        "last_success_at": snapshot["generated_at"],
-                        "refresh_status": "ok",
-                        "error": None,
-                    },
+            return self._refresh_locked(client)
+
+    def _refresh_locked(self, client: Any) -> dict[str, Any]:
+        attempted_at = utc_now()
+        try:
+            if hasattr(client, "snapshot"):
+                snapshot = client.snapshot(generated_at=attempted_at)
+            else:
+                project, pull_requests, rate_limit = client.fetch()
+                snapshot = build_snapshot(
+                    self.config,
+                    project,
+                    pull_requests,
+                    rate_limit,
+                    generated_at=attempted_at,
                 )
-                return snapshot
-            except Exception as exc:
-                self._write_failure_health(attempted_at, exc)
-                raise
+            self._write_json(self.snapshot_path, snapshot)
+            self._write_json(
+                self.health_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "last_attempt_at": isoformat(attempted_at),
+                    "last_success_at": snapshot["generated_at"],
+                    "refresh_status": "ok",
+                    "error": None,
+                },
+            )
+            return snapshot
+        except RateLimitError as exc:
+            self._write_failure_health(attempted_at, exc, refresh_status="throttled")
+            raise
+        except Exception as exc:
+            self._write_failure_health(attempted_at, exc)
+            raise
 
     def ensure(self, client: Any) -> dict[str, Any]:
+        """Return a fresh snapshot, or the best usable one under rate pressure.
+
+        Freshness is re-checked after the refresh lock is acquired, because a
+        concurrent session may have completed the very fetch this one queued
+        for; repeating it would spend the same GraphQL points for nothing. A
+        refresh refused for quota reasons falls back to the last good
+        snapshot, so only a missing snapshot makes rate limiting fatal.
+        """
+
         snapshot = self.snapshot()
         if self._snapshot_state(snapshot) == "fresh":
             assert snapshot is not None
             return snapshot
-        return self.refresh(client)
+        if self.rate_limit_deferral(snapshot):
+            assert snapshot is not None
+            return snapshot
+        self._prepare_directory()
+        with FileLock(self.lock_path):
+            snapshot = self.snapshot()
+            if self._snapshot_state(snapshot) == "fresh":
+                assert snapshot is not None
+                return snapshot
+            try:
+                return self._refresh_locked(client)
+            except RateLimitError:
+                if self._usable(snapshot):
+                    assert snapshot is not None
+                    return snapshot
+                raise
+
+    def rate_limit_deferral(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Explain why a refresh should wait, or return None to proceed.
+
+        Spending the last points before the quota resets trades a slightly
+        stale board for every other GitHub call failing outright, so a stale
+        snapshot keeps serving while its recorded ``remaining`` sits below the
+        configured floor and the reset is still ahead.
+        """
+
+        floor = self.config.rate_limit_floor
+        if floor <= 0 or not self._usable(snapshot):
+            return None
+        assert snapshot is not None
+        rate = snapshot.get("rate_limit") or {}
+        remaining = rate.get("remaining")
+        reset_at = rate.get("resetAt")
+        if isinstance(remaining, bool) or not isinstance(remaining, int):
+            return None
+        if remaining >= floor or not isinstance(reset_at, str) or not reset_at:
+            return None
+        try:
+            # TypeError covers a timezone-naive resetAt, which parses but
+            # cannot be compared with an aware "now".
+            if parse_time(reset_at) <= utc_now():
+                return None
+        except (ValueError, TypeError):
+            return None
+        return {"remaining": remaining, "reset_at": reset_at}
+
+    def _usable(self, snapshot: dict[str, Any] | None) -> bool:
+        # Serving stale is only safe when the current code understands the
+        # document; an old-schema snapshot is as unusable as a missing one.
+        return bool(
+            snapshot
+            and snapshot.get("generated_at")
+            and snapshot.get("schema_version") == SCHEMA_VERSION
+        )
 
     def inspect(self) -> dict[str, Any]:
         snapshot = self.snapshot()
@@ -574,6 +643,7 @@ class CacheStore:
             "error": health.get("error") if health else None,
             "next_ready": snapshot.get("next_ready") if snapshot else None,
             "status_counts": snapshot.get("status_counts", {}) if snapshot else {},
+            "rate_limit": snapshot.get("rate_limit") if snapshot else None,
         }
 
     def is_fresh(self) -> bool:
@@ -589,7 +659,13 @@ class CacheStore:
         except OSError:
             pass
 
-    def _write_failure_health(self, attempted_at: datetime, error: Exception) -> None:
+    def _write_failure_health(
+        self,
+        attempted_at: datetime,
+        error: Exception,
+        *,
+        refresh_status: str = "error",
+    ) -> None:
         prior_health = self._read_json(self.health_path)
         prior_snapshot = self.snapshot()
         last_success = (prior_health or {}).get("last_success_at") or (prior_snapshot or {}).get(
@@ -601,7 +677,7 @@ class CacheStore:
                 "schema_version": SCHEMA_VERSION,
                 "last_attempt_at": isoformat(attempted_at),
                 "last_success_at": last_success,
-                "refresh_status": "error",
+                "refresh_status": refresh_status,
                 "error": {
                     "kind": error.__class__.__name__,
                     "message": str(error),
