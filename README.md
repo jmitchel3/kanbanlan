@@ -195,6 +195,13 @@ remaining points than `rate_limit_floor` in `.kanbanlan.toml` (default 500,
 and `doctor` report the remaining points. An explicit `kanbanlan refresh`
 always attempts the fetch and reports the rate limit plainly if it fails.
 
+Refreshes are also incremental: a cheap probe reads only item identity and
+`updatedAt` timestamps, and full item content (comments, labels, assignees) is
+re-fetched only for cards that changed since the last refresh, using an
+advisory raw-node cache in the same cache directory. Any doubt about the cache
+falls back to a full fetch, so the cache can only reduce cost, never change
+the snapshot. Set `KANBANLAN_FULL_REFRESH=1` to force the full fetch.
+
 ## Shared Projects across repositories
 
 One GitHub Project can serve several repositories. Every command above reads at

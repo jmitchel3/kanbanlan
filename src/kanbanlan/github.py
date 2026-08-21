@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from kanbanlan.config import Config
+from kanbanlan.config import Config, cache_dir
 from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
 from kanbanlan.runner import (
@@ -20,45 +22,14 @@ from kanbanlan.runner import (
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
 from kanbanlan.snapshot import SCOPE_REPOSITORY, build_snapshot
 
-PROJECT_QUERY = """
-query($owner: String!, $number: Int!, $after: String) {
-  OWNER(login: $owner) {
-    projectV2(number: $number) {
-      id
-      number
-      title
-      url
-      updatedAt
-      repositories(first: 100) {
-        pageInfo { hasNextPage }
-        nodes { nameWithOwner }
-      }
-      fields(first: 50) {
-        nodes {
-          ... on ProjectV2Field {
-            id
-            name
-            dataType
-          }
-          ... on ProjectV2SingleSelectField {
-            id
-            name
-            dataType
-            options {
-              id
-              name
-              color
-              description
-            }
-          }
-        }
-      }
-      items(first: 100, after: $after) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
+# The full per-item selection is shared between the paginated Project read and
+# the targeted hydration query so both are guaranteed to produce identical raw
+# nodes; the snapshot builder never learns which path fetched an item.
+PROJECT_ITEM_FIELDS = """
           id
           type
           isArchived
+          updatedAt
           fieldValues(first: 30) {
             nodes {
               ... on ProjectV2ItemFieldSingleSelectValue {
@@ -109,6 +80,69 @@ query($owner: String!, $number: Int!, $after: String) {
               updatedAt
             }
           }
+""".strip("\n")
+
+# The probe requests only what a change diff needs. GraphQL prices a query by
+# the node counts it asks for, so leaving out comments, labels, assignees, and
+# field values is what makes probing a stable board nearly free.
+PROBE_ITEM_FIELDS = """
+          id
+          type
+          isArchived
+          updatedAt
+          content {
+            ... on Issue {
+              id
+              number
+              updatedAt
+              repository { nameWithOwner }
+            }
+            ... on PullRequest {
+              id
+              number
+              updatedAt
+              repository { nameWithOwner }
+            }
+          }
+""".strip("\n")
+
+_PROJECT_PAGE_TEMPLATE = """
+query($owner: String!, $number: Int!, $after: String) {
+  OWNER(login: $owner) {
+    projectV2(number: $number) {
+      id
+      number
+      title
+      url
+      updatedAt
+      repositories(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { nameWithOwner }
+      }
+      fields(first: 50) {
+        nodes {
+          ... on ProjectV2Field {
+            id
+            name
+            dataType
+          }
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            dataType
+            options {
+              id
+              name
+              color
+              description
+            }
+          }
+        }
+      }
+      items(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+ITEM_FIELDS
         }
       }
     }
@@ -116,6 +150,21 @@ query($owner: String!, $number: Int!, $after: String) {
   rateLimit { cost remaining resetAt }
 }
 """
+
+PROJECT_QUERY = _PROJECT_PAGE_TEMPLATE.replace("ITEM_FIELDS", PROJECT_ITEM_FIELDS)
+
+PROJECT_PROBE_QUERY = _PROJECT_PAGE_TEMPLATE.replace("ITEM_FIELDS", PROBE_ITEM_FIELDS)
+
+ITEM_HYDRATION_QUERY = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProjectV2Item {
+ITEM_FIELDS
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+""".replace("ITEM_FIELDS", PROJECT_ITEM_FIELDS)
 
 PULL_REQUEST_QUERY = """
 query($owner: String!, $repo: String!, $after: String) {
@@ -197,6 +246,14 @@ mutation($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
   }
 }
 """
+
+# The raw-node cache is purely advisory: it only decides which items are worth
+# re-fetching, never what a snapshot contains, so losing or corrupting it can
+# cost points but can never produce a wrong board.
+ITEM_CACHE_SCHEMA_VERSION = 1
+ITEM_CACHE_FILENAME = "project_items.json"
+HYDRATION_BATCH_SIZE = 30
+FULL_REFRESH_ENV = "KANBANLAN_FULL_REFRESH"
 
 REQUIRED_STATUS_OPTIONS = [
     ("Inbox", "GRAY", "Captured but not yet ready"),
@@ -688,14 +745,112 @@ class GitHub:
         )
 
     def _fetch_project(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Fetch the raw Project, paying only for the items that changed.
+
+        Every full item page is priced by GitHub as if every issue really had
+        100 comments, so a stable board used to pay its worst-case cost on
+        every refresh. Instead, a cheap probe reads only identity and
+        ``updatedAt`` timestamps, unchanged items are reassembled from the
+        advisory raw-node cache, and only new or changed items are hydrated in
+        full. Any doubt about the cache or a hydration result falls back to
+        the full fetch, so this path can only change cost, never the returned
+        project. ``KANBANLAN_FULL_REFRESH=1`` forces the full fetch.
+        """
+
+        if not _full_refresh_forced():
+            cached_items = self._load_item_cache()
+            if cached_items is not None:
+                result = self._fetch_project_incremental(cached_items)
+                if result is not None:
+                    project, rate_limit = result
+                    self._store_item_cache(project)
+                    return project, rate_limit
+        project, rate_limit = self._fetch_project_full()
+        self._store_item_cache(project)
+        return project, rate_limit
+
+    def _fetch_project_full(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        metadata, items, rate_limits = self._paginate_project(PROJECT_QUERY)
+        metadata["items"] = items
+        return metadata, _min_rate_limit(rate_limits)
+
+    def _fetch_project_incremental(
+        self,
+        cached_items: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Probe, diff against the cache, and hydrate only what changed.
+
+        Returns None whenever the probe or hydration produces anything
+        unexpected, which tells the caller to run the full fetch instead.
+        Provider errors (rate limits, missing project) propagate exactly as
+        they do on the full path.
+        """
+
+        metadata, probe_items, rate_limits = self._paginate_project(PROJECT_PROBE_QUERY)
+        order: list[str] = []
+        reused: dict[str, Any] = {}
+        stale: list[str] = []
+        for probe_node in probe_items:
+            if not isinstance(probe_node, dict) or not probe_node.get("id"):
+                return None
+            item_id = probe_node["id"]
+            order.append(item_id)
+            entry = cached_items.get(item_id)
+            if _cache_entry_reusable(entry, probe_node):
+                reused[item_id] = entry["node"]
+            else:
+                stale.append(item_id)
+        hydrated, hydration_limits = self._hydrate_items(stale)
+        rate_limits.extend(hydration_limits)
+        if hydrated is None:
+            return None
+        items: list[dict[str, Any]] = []
+        for item_id in order:
+            node = reused.get(item_id) if item_id in reused else hydrated.get(item_id)
+            if node is None:
+                return None
+            items.append(node)
+        metadata["items"] = items
+        return metadata, _min_rate_limit(rate_limits)
+
+    def _hydrate_items(
+        self,
+        item_ids: list[str],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Fetch full raw nodes for the given project item ids, in batches.
+
+        Returns (None, rate_limits) on any surprise (a null node, an id or
+        type mismatch), so a single odd item costs one full fetch instead of
+        a wrong snapshot.
+        """
+
+        hydrated: dict[str, Any] = {}
+        rate_limits: list[dict[str, Any]] = []
+        for start in range(0, len(item_ids), HYDRATION_BATCH_SIZE):
+            batch = item_ids[start : start + HYDRATION_BATCH_SIZE]
+            payload = self.graphql(ITEM_HYDRATION_QUERY, {"ids": batch}, retry=True)
+            rate_limits.append(payload.get("rateLimit", {}))
+            nodes = payload.get("nodes")
+            if not isinstance(nodes, list) or len(nodes) != len(batch):
+                return None, rate_limits
+            for requested_id, node in zip(batch, nodes):
+                if not isinstance(node, dict) or node.get("id") != requested_id:
+                    return None, rate_limits
+                hydrated[requested_id] = node
+        return hydrated, rate_limits
+
+    def _paginate_project(
+        self,
+        query_template: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         config = self._config()
-        query = PROJECT_QUERY.replace(
+        query = query_template.replace(
             "OWNER", "organization" if config.project_owner_type == "organization" else "user"
         )
         items: list[dict[str, Any]] = []
         cursor: str | None = None
         metadata: dict[str, Any] | None = None
-        rate_limit: dict[str, Any] = {}
+        rate_limits: list[dict[str, Any]] = []
         while True:
             payload = self.graphql(
                 query,
@@ -718,14 +873,82 @@ class GitHub:
                 metadata = {key: value for key, value in project.items() if key != "items"}
             connection = project["items"]
             items.extend(connection.get("nodes", []))
-            rate_limit = payload.get("rateLimit", rate_limit)
+            rate_limit = payload.get("rateLimit")
+            if rate_limit:
+                rate_limits.append(rate_limit)
             page_info = connection["pageInfo"]
             if not page_info["hasNextPage"]:
                 break
             cursor = page_info["endCursor"]
         assert metadata is not None
-        metadata["items"] = items
-        return metadata, rate_limit
+        return metadata, items, rate_limits
+
+    def _item_cache_path(self) -> Path | None:
+        try:
+            return cache_dir(self.root) / ITEM_CACHE_FILENAME
+        except (CommandError, RuntimeError, OSError):
+            return None
+
+    def _item_cache_key(self) -> str:
+        config = self._config()
+        return f"{config.project_owner}/{config.project_number}"
+
+    def _load_item_cache(self) -> dict[str, Any] | None:
+        """Read the advisory raw-node cache, or None when it cannot be trusted.
+
+        Missing, unreadable, corrupt, version-mismatched, or pointed at a
+        different Project all mean the same thing: run the full fetch and
+        rewrite the cache from its result.
+        """
+
+        path = self._item_cache_path()
+        if path is None:
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("schema_version") != ITEM_CACHE_SCHEMA_VERSION:
+            return None
+        if data.get("project") != self._item_cache_key():
+            return None
+        entries = data.get("items")
+        if not isinstance(entries, dict):
+            return None
+        return entries
+
+    def _store_item_cache(self, project: dict[str, Any]) -> None:
+        """Rewrite the advisory cache from a freshly assembled project.
+
+        The write is atomic (tempfile plus rename), so a concurrent reader,
+        including a lock-free project-scope read, sees either the previous
+        complete cache or this one, never a torn file. A failed write is
+        ignored: it only makes the next refresh pay full price.
+        """
+
+        path = self._item_cache_path()
+        if path is None:
+            return
+        entries: dict[str, Any] = {}
+        for node in project.get("items", []):
+            if not isinstance(node, dict) or not node.get("id"):
+                continue
+            entries[node["id"]] = {
+                "item_updated_at": node.get("updatedAt"),
+                "content_updated_at": (node.get("content") or {}).get("updatedAt"),
+                "node": node,
+            }
+        payload = {
+            "schema_version": ITEM_CACHE_SCHEMA_VERSION,
+            "project": self._item_cache_key(),
+            "items": entries,
+        }
+        try:
+            _write_json_atomic(path, payload)
+        except OSError:
+            pass
 
     def _fetch_pull_requests(
         self,
@@ -1001,6 +1224,73 @@ class GitHub:
         if self.config is None:
             raise RuntimeError("this GitHub operation requires repository configuration")
         return self.config
+
+
+def _full_refresh_forced() -> bool:
+    value = os.environ.get(FULL_REFRESH_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _cache_entry_reusable(entry: Any, probe_node: dict[str, Any]) -> bool:
+    """Decide whether one cached raw node can stand in for a live item.
+
+    Both timestamps must match because they move independently: a Status
+    field edit bumps the item's ``updatedAt`` but not the issue's, while a
+    new comment or label bumps the issue's ``updatedAt`` but not necessarily
+    the item's. A probe node without both timestamps (a draft issue, a
+    redacted item, anything unexpected) is never reused, so doubt always
+    means rehydrate.
+    """
+
+    if not isinstance(entry, dict) or not isinstance(entry.get("node"), dict):
+        return False
+    item_updated = probe_node.get("updatedAt")
+    content_updated = (probe_node.get("content") or {}).get("updatedAt")
+    if not item_updated or not content_updated:
+        return False
+    return (
+        entry.get("item_updated_at") == item_updated
+        and entry.get("content_updated_at") == content_updated
+    )
+
+
+def _min_rate_limit(rate_limits: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = [value for value in rate_limits if value]
+    if not candidates:
+        return {}
+    return min(candidates, key=lambda value: value.get("remaining", 10**12))
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    """Write via a tempfile and rename, mirroring the snapshot cache writes.
+
+    Readers of the advisory cache run without the refresh lock, so the rename
+    is what guarantees they only ever see a complete document.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as file:
+            temporary_path = file.name
+            json.dump(value, file, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
