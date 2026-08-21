@@ -32,8 +32,19 @@ Surfaced by the adversarial review of KBL-2FFYGZHCYNEPXPEU5D6TIHV7GM.
   only as a last resort for a lock file with no readable PID, because such a
   file carries no liveness signal at all.
 - Release verifies ownership too: `__exit__` unlinks only when the file on
-  disk is still the exact file this process created. The old lock closed a
+  disk still holds this acquisition's owner record. The old lock closed a
   descriptor and unconditionally unlinked whatever was at the path.
+- Ownership proof is content-based, not inode-based. CI (ext4) showed that
+  unlinking a lock file and immediately creating a replacement can hand the
+  replacement the recycled inode, so a `(st_dev, st_ino)` comparison alone
+  judges the swapped file identical; APFS does not reuse inodes that fast,
+  which is why the hole never reproduced locally. Each acquisition therefore
+  writes a random nonce (`secrets.token_hex`) beside the PID, and release is
+  authorized only by re-reading the file and matching both PID and nonce;
+  the identity check remains as a cheap first pass. Stale-steal likewise
+  re-reads the file and requires it to still record the dead PID it observed
+  (or still be unreadable) before unlinking, and unreadable content is
+  always treated as not-owned.
 - The lock payload is the same JSON owner record the worker already writes.
   `lock_pid` additionally accepts a bare integer so a live legacy holder
   (written by the previous cache lock as a bare PID) is still honored across

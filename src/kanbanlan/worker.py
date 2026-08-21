@@ -15,8 +15,9 @@ from kanbanlan.github import GitHub
 from kanbanlan.locks import file_identity as _file_identity
 from kanbanlan.locks import lock_pid as _lock_pid
 from kanbanlan.locks import pid_running as _pid_running
+from kanbanlan.locks import release_owner_record, write_owner_record
+from kanbanlan.locks import remove_stale_lock as _remove_stale_lock
 from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
-from kanbanlan.locks import write_owner_record
 from kanbanlan.registry import Registration, RegistryStore, utc_now
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
@@ -42,6 +43,7 @@ class WorkerLock:
     def __init__(self, path: Path):
         self.path = path
         self.acquired = False
+        self.record: dict[str, Any] | None = None
         self.identity: tuple[int, int] | None = None
 
     def __enter__(self) -> WorkerLock:
@@ -68,11 +70,11 @@ class WorkerLock:
                     continue
                 if pid is None and age < 1:
                     raise WorkerAlreadyRunning(f"worker lock {self.path} is being initialized")
-                _unlink_if_unchanged(self.path, identity)
+                _remove_stale_lock(self.path, identity, pid)
                 continue
 
             try:
-                self.identity = write_owner_record(descriptor)
+                self.record, self.identity = write_owner_record(descriptor)
             except Exception:
                 os.close(descriptor)
                 _unlink_if_unchanged(self.path, _file_identity(self.path))
@@ -83,8 +85,8 @@ class WorkerLock:
         return self
 
     def __exit__(self, *_args: Any) -> None:
-        if self.acquired:
-            _unlink_if_unchanged(self.path, self.identity)
+        if self.acquired and self.record is not None:
+            release_owner_record(self.path, self.record, self.identity)
 
 
 def token_env_name(hostname: str, login: str) -> str:
@@ -261,7 +263,7 @@ def worker_status(registry: RegistryStore | None = None) -> dict[str, Any]:
         except FileNotFoundError:
             old_enough_to_be_stale = False
         if pid is not None or old_enough_to_be_stale:
-            _unlink_if_unchanged(lock_path, identity)
+            _remove_stale_lock(lock_path, identity, pid)
         pid = None
     return {
         "state_dir": str(registry.directory),

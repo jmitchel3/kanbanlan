@@ -191,6 +191,22 @@ class FileLockTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(424242, json.loads(path.read_text(encoding="utf-8"))["pid"])
 
+    def test_release_requires_the_owner_token_even_when_the_inode_matches(self) -> None:
+        """A replacement can be assigned the recycled inode, so only the nonce proves ownership."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refresh.lock"
+            lock = FileLock(path, timeout=1.0)
+            lock.__enter__()
+            identity = lock.identity
+            path.unlink()
+            impostor = {"pid": os.getpid(), "nonce": "impostor"}
+            path.write_text(json.dumps(impostor) + "\n", encoding="utf-8")
+            with mock.patch("kanbanlan.locks.file_identity", return_value=identity):
+                lock.__exit__(None, None, None)
+            self.assertTrue(path.exists())
+            self.assertEqual("impostor", json.loads(path.read_text(encoding="utf-8"))["nonce"])
+
     def test_unreadable_lock_falls_back_to_mtime_staleness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "refresh.lock"
