@@ -26,6 +26,23 @@ class ConfigTests(unittest.TestCase):
             loaded = Config.load(root)
         self.assertEqual(config, loaded)
 
+    def test_rate_limit_floor_defaults_to_500_and_rejects_negatives(self) -> None:
+        config = Config(
+            repository="acme/widget",
+            project_owner="acme",
+            project_owner_type="organization",
+            project_number=2,
+        )
+        self.assertEqual(500, config.rate_limit_floor)
+        with self.assertRaises(ValueError):
+            Config(
+                repository="acme/widget",
+                project_owner="acme",
+                project_owner_type="organization",
+                project_number=2,
+                rate_limit_floor=-1,
+            )
+
     def test_session_tracking_defaults_off_and_environment_can_override_it(self) -> None:
         config = Config(
             repository="acme/widget",

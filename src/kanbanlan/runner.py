@@ -37,6 +37,37 @@ def is_transient_failure(result: CommandResult) -> bool:
     return any(marker in output for marker in TRANSIENT_MARKERS)
 
 
+# A rate-limited request will keep failing until the quota window resets, so
+# it is never retried; callers throttle or serve cached state instead.
+RATE_LIMIT_MARKERS = (
+    "rate_limited",
+    "api rate limit exceeded",
+    "secondary rate limit",
+    "was submitted too quickly",
+    "(http 429)",
+)
+
+
+class RateLimitError(RuntimeError):
+    """The remote refused a request because the caller is out of quota."""
+
+    def __init__(self, message: str, reset_at: str | None = None):
+        super().__init__(message)
+        self.reset_at = reset_at
+
+
+def is_rate_limit_failure(result: CommandResult) -> bool:
+    """Report whether a failed command was refused for quota reasons.
+
+    Only stderr is consulted: gh writes its own diagnostics there, while
+    stdout can carry a response body whose user content (issue titles,
+    comment text) may mention rate limits without being one.
+    """
+    if result.returncode == 0:
+        return False
+    return any(marker in result.stderr.lower() for marker in RATE_LIMIT_MARKERS)
+
+
 @dataclass(frozen=True)
 class CommandResult:
     args: tuple[str, ...]

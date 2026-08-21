@@ -31,6 +31,7 @@ class Config:
     production_branch: str = ""
     hostname: str = "github.com"
     stale_seconds: int = 180
+    rate_limit_floor: int = 500
     code_host: str = "github"
     canonical_home: str = "github"
     projections: tuple[str, ...] = ("github_projects",)
@@ -45,6 +46,8 @@ class Config:
             raise ValueError("project_number must be positive")
         if self.stale_seconds < 1:
             raise ValueError("stale_seconds must be positive")
+        if self.rate_limit_floor < 0:
+            raise ValueError("rate_limit_floor must be zero or positive")
         if self.code_host != "github":
             raise ValueError(f"unsupported code host: {self.code_host}")
         if self.canonical_home != "github":
@@ -96,6 +99,7 @@ class Config:
                 production_branch=repository.get("production_branch", ""),
                 hostname=repository.get("hostname", "github.com"),
                 stale_seconds=int(local.get("stale_seconds", 180)),
+                rate_limit_floor=int(local.get("rate_limit_floor", 500)),
                 code_host=coordination.get("code_host", "github"),
                 canonical_home=coordination.get("canonical_home", "github"),
                 projections=tuple(projections),
@@ -126,7 +130,8 @@ class Config:
             f'owner_type = "{_escape(self.project_owner_type)}"\n'
             f"number = {self.project_number}\n\n"
             "[local]\n"
-            f"stale_seconds = {self.stale_seconds}\n\n"
+            f"stale_seconds = {self.stale_seconds}\n"
+            f"rate_limit_floor = {self.rate_limit_floor}\n\n"
             "[session_tracking]\n"
             f"enabled = {'true' if self.session_tracking else 'false'}\n"
         )

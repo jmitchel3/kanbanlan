@@ -10,7 +10,13 @@ from typing import Any
 from kanbanlan.config import Config
 from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
-from kanbanlan.runner import CommandError, CommandResult, Runner
+from kanbanlan.runner import (
+    CommandError,
+    CommandResult,
+    RateLimitError,
+    Runner,
+    is_rate_limit_failure,
+)
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
 from kanbanlan.snapshot import SCOPE_REPOSITORY, build_snapshot
 
@@ -346,15 +352,22 @@ class GitHub:
         attempt because a request that reached GitHub may have applied before
         the response was lost.
         """
-        result = self.runner.run(
-            ["gh", "api", "graphql", "--input", "-"],
-            input_text=json.dumps({"query": query, "variables": variables}),
-            retry=retry,
-        )
+        try:
+            result = self.runner.run(
+                ["gh", "api", "graphql", "--input", "-"],
+                input_text=json.dumps({"query": query, "variables": variables}),
+                retry=retry,
+            )
+        except CommandError as exc:
+            if is_rate_limit_failure(exc.result):
+                raise RateLimitError(str(exc)) from exc
+            raise
         payload = json.loads(result.stdout)
         errors = payload.get("errors")
         if errors:
             detail = "; ".join(error.get("message", "GraphQL error") for error in errors)
+            if any(error.get("type") == "RATE_LIMITED" for error in errors):
+                raise RateLimitError(detail)
             raise RuntimeError(detail)
         return payload["data"]
 
@@ -634,6 +647,11 @@ class GitHub:
         for target in targets:
             try:
                 values, rate_limit = self._fetch_pull_requests(target)
+            except RateLimitError:
+                # Out of quota means every remaining target fails too; a
+                # "successful" snapshot missing peer repositories would hide
+                # exactly the cross-repository work overlap checks exist for.
+                raise
             except (CommandError, RuntimeError) as exc:
                 if target == config.repository:
                     raise

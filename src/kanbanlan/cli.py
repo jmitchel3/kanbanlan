@@ -33,7 +33,7 @@ from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
 from kanbanlan.rehome import format_plan, plan_rehome, rehome_result
-from kanbanlan.runner import CommandError, Runner, is_transient_failure
+from kanbanlan.runner import CommandError, RateLimitError, Runner, is_transient_failure
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.sessions import (
     AgentSession,
@@ -503,6 +503,13 @@ def _missing_command_hint(command: str) -> str:
 
 
 def _friendly_error(exc: Exception) -> tuple[str, str | None]:
+    if isinstance(exc, RateLimitError):
+        detail = f" (resets {exc.reset_at})" if exc.reset_at else ""
+        return str(exc), (
+            "GitHub is rate limiting this account"
+            + detail
+            + ". Cached snapshots keep serving; wait for the quota to reset before refreshing."
+        )
     if not isinstance(exc, CommandError):
         message = str(exc)
         hint = None
@@ -1193,8 +1200,17 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 success("Repository workflow labels")
         except (CommandError, RuntimeError) as exc:
             failures.append(str(exc))
-    cache_state = store.inspect()["snapshot_state"]
-    field("Cache", f"{status_value(cache_state)} ({store.snapshot_path})")
+    inspection = store.inspect()
+    field("Cache", f"{status_value(inspection['snapshot_state'])} ({store.snapshot_path})")
+    rate = inspection.get("rate_limit") or {}
+    if rate.get("remaining") is not None:
+        reset = f", resets {rate['resetAt']}" if rate.get("resetAt") else ""
+        field("Rate limit", f"{rate['remaining']} GraphQL points remaining{reset}")
+        if rate["remaining"] < config.rate_limit_floor:
+            warning(
+                f"GraphQL points are below the configured floor of {config.rate_limit_floor}; "
+                "snapshot refreshes are deferred until the quota resets"
+            )
     if failures:
         for failure in failures:
             warning(failure)
@@ -1208,13 +1224,44 @@ def _cmd_ensure(args: argparse.Namespace) -> int:
     _, _, provider, store = _context(args)
     with status("Ensuring the shared board snapshot is fresh"):
         snapshot = store.ensure(provider)
+    inspection = store.inspect()
     if _emit_result(
         args,
-        {"snapshot_path": str(store.snapshot_path), "generated_at": snapshot["generated_at"]},
+        {
+            "snapshot_path": str(store.snapshot_path),
+            "generated_at": snapshot["generated_at"],
+            "snapshot_state": inspection["snapshot_state"],
+            "refresh_status": inspection["refresh_status"],
+            "rate_limit": snapshot.get("rate_limit"),
+        },
     ):
         return 0
+    _warn_stale_service(store, snapshot, inspection)
     print(store.snapshot_path)
     return 0
+
+
+def _warn_stale_service(
+    store: CacheStore,
+    snapshot: dict[str, Any],
+    inspection: dict[str, Any],
+) -> None:
+    """Say why ensure kept a stale snapshot instead of refreshing it."""
+
+    if inspection["snapshot_state"] == "fresh":
+        return
+    deferral = store.rate_limit_deferral(snapshot)
+    if deferral:
+        warning(
+            f"refresh deferred: {deferral['remaining']} GraphQL points remaining is below "
+            f"the floor of {store.config.rate_limit_floor}; serving the cached snapshot "
+            f"until the quota resets at {deferral['reset_at']}"
+        )
+    elif inspection.get("refresh_status") == "throttled":
+        warning(
+            "GitHub rate limited the refresh; serving the last good snapshot from "
+            f"{inspection.get('last_success_at') or snapshot.get('generated_at')}"
+        )
 
 
 def _cmd_refresh(args: argparse.Namespace) -> int:
@@ -1304,6 +1351,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     next_ready = inspection["next_ready"]
     if next_ready:
         field("Next", f"{request_label(next_ready)} {next_ready['title']}")
+    rate = inspection.get("rate_limit") or {}
+    if rate.get("remaining") is not None:
+        reset = f", resets {rate['resetAt']}" if rate.get("resetAt") else ""
+        field("Rate limit", f"{rate['remaining']} GraphQL points remaining{reset}")
+    if inspection.get("refresh_status") == "throttled":
+        warning("the last refresh was rate limited; the snapshot may lag the live board")
     if inspection["error"]:
         warning(f"Last refresh: {inspection['error']['kind']}: {inspection['error']['message']}")
     return 0

@@ -10,6 +10,7 @@ from kanbanlan.runner import (
     CommandError,
     CommandResult,
     Runner,
+    is_rate_limit_failure,
     is_transient_failure,
 )
 
@@ -109,6 +110,22 @@ class RunnerRetryTests(unittest.TestCase):
         self.assertFalse(is_transient_failure(CommandResult(("gh",), 0, OUTAGE, "")))
         self.assertFalse(
             is_transient_failure(CommandResult(("gh",), 1, "", "could not resolve to a Repository"))
+        )
+
+    def test_rate_limit_failures_are_recognized_from_stderr_only(self) -> None:
+        for stderr in (
+            "gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+            "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+            "gh: Something went wrong (HTTP 429)",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertTrue(is_rate_limit_failure(CommandResult(("gh",), 1, "", stderr)))
+        # A response body on stdout can quote user content that merely talks
+        # about rate limits; that must never classify the failure.
+        body = '{"data": {"issue": {"title": "API rate limit exceeded in RATE_LIMITED"}}}'
+        self.assertFalse(is_rate_limit_failure(CommandResult(("gh",), 1, body, "other error")))
+        self.assertFalse(
+            is_rate_limit_failure(CommandResult(("gh",), 0, "", "api rate limit exceeded"))
         )
 
     def test_transient_failure_is_retried_until_it_succeeds(self) -> None:

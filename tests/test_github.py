@@ -6,7 +6,7 @@ from unittest import mock
 
 from kanbanlan.config import Config
 from kanbanlan.github import OWNER_QUERY, UPDATE_STATUS_FIELD, GitHub
-from kanbanlan.runner import CommandError, CommandResult
+from kanbanlan.runner import CommandError, CommandResult, RateLimitError
 
 
 def config() -> Config:
@@ -174,6 +174,84 @@ class GitHubTests(unittest.TestCase):
         # default must stay single-attempt.
         github.graphql(UPDATE_STATUS_FIELD, {"field": "abc", "options": []})
         self.assertFalse(runner.run.call_args.kwargs["retry"])
+
+    def test_graphql_rate_limited_error_type_raises_rate_limit_error(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(
+            ("gh", "api", "graphql"),
+            0,
+            '{"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}',
+            "",
+        )
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        with self.assertRaises(RateLimitError):
+            github.graphql(OWNER_QUERY, {"login": "acme"})
+
+    def test_graphql_rate_limited_command_failure_raises_rate_limit_error(self) -> None:
+        runner = mock.Mock()
+        runner.run.side_effect = CommandError(
+            CommandResult(
+                ("gh", "api", "graphql"),
+                1,
+                "",
+                "gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+            )
+        )
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        with self.assertRaises(RateLimitError):
+            github.graphql(OWNER_QUERY, {"login": "acme"})
+
+    def test_collect_tolerates_an_unreadable_peer_but_propagates_rate_limits(self) -> None:
+        class PeerFetchGitHub(GitHub):
+            def __init__(self, peer_error: Exception) -> None:
+                super().__init__(Path("/tmp"), config())
+                self.peer_error = peer_error
+
+            def _fetch_project(self):
+                project = {
+                    "id": "p",
+                    "number": 2,
+                    "title": "Delivery",
+                    "url": "url",
+                    "repositories": {"nodes": [{"nameWithOwner": "acme/peer"}]},
+                    "fields": {"nodes": []},
+                    "items": [],
+                }
+                return project, {"remaining": 4000, "resetAt": "2026-01-01T00:00:00Z"}
+
+            def _fetch_pull_requests(self, repository=None):
+                if repository == "acme/peer":
+                    raise self.peer_error
+                return [], {"remaining": 4000, "resetAt": "2026-01-01T00:00:00Z"}
+
+        tolerant = PeerFetchGitHub(RuntimeError("no access"))
+        read = tolerant.collect()
+        self.assertEqual(
+            ["acme/peer"],
+            [value["repository"] for value in read.unavailable_repositories],
+        )
+
+        # Out of quota fails the whole read; a snapshot silently missing a
+        # peer repository would defeat cross-repository overlap checks.
+        limited = PeerFetchGitHub(RateLimitError("API rate limit exceeded"))
+        with self.assertRaises(RateLimitError):
+            limited.collect()
+
+    def test_graphql_other_errors_stay_plain_runtime_errors(self) -> None:
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(
+            ("gh", "api", "graphql"),
+            0,
+            '{"errors": [{"type": "NOT_FOUND", "message": "no such project"}]}',
+            "",
+        )
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        with self.assertRaises(RuntimeError) as caught:
+            github.graphql(OWNER_QUERY, {"login": "acme"})
+        self.assertNotIsInstance(caught.exception, RateLimitError)
 
     def test_project_creation_is_not_retried(self) -> None:
         runner = mock.Mock()
