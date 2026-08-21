@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import signal
 import subprocess
@@ -13,6 +12,13 @@ from typing import Any
 
 from kanbanlan.config import Config, cache_dir
 from kanbanlan.github import GitHub
+from kanbanlan.locks import file_identity as _file_identity
+from kanbanlan.locks import lock_pid as _lock_pid
+from kanbanlan.locks import owner_predates_lock as _owner_predates_lock
+from kanbanlan.locks import pid_running as _pid_running
+from kanbanlan.locks import release_owner_record, write_owner_record
+from kanbanlan.locks import remove_stale_lock as _remove_stale_lock
+from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
 from kanbanlan.registry import Registration, RegistryStore, utc_now
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
@@ -38,6 +44,7 @@ class WorkerLock:
     def __init__(self, path: Path):
         self.path = path
         self.acquired = False
+        self.record: dict[str, Any] | None = None
         self.identity: tuple[int, int] | None = None
 
     def __enter__(self) -> WorkerLock:
@@ -56,7 +63,7 @@ class WorkerLock:
             except FileExistsError:
                 identity = _file_identity(self.path)
                 pid = _lock_pid(self.path)
-                if pid and _pid_running(pid):
+                if pid and _pid_running(pid) and _owner_predates_lock(self.path, pid):
                     raise WorkerAlreadyRunning(f"worker process {pid} already holds {self.path}")
                 try:
                     age = time.time() - self.path.stat().st_mtime
@@ -64,21 +71,18 @@ class WorkerLock:
                     continue
                 if pid is None and age < 1:
                     raise WorkerAlreadyRunning(f"worker lock {self.path} is being initialized")
-                _unlink_if_unchanged(self.path, identity)
+                _remove_stale_lock(self.path, identity, pid)
                 continue
 
             try:
-                payload = (
-                    json.dumps({"pid": os.getpid(), "started_at": utc_now()}) + "\n"
-                ).encode()
-                if os.write(descriptor, payload) != len(payload):
-                    raise OSError("could not write the complete worker lock")
-                os.fsync(descriptor)
-                stat = os.fstat(descriptor)
-                self.identity = (stat.st_dev, stat.st_ino)
+                self.record, self.identity = write_owner_record(descriptor)
             except Exception:
+                # The created file's identity must come from the descriptor:
+                # reading it back from the path would bless whatever file is
+                # there now, possibly a successor's live lock.
+                created = os.fstat(descriptor)
                 os.close(descriptor)
-                _unlink_if_unchanged(self.path, _file_identity(self.path))
+                _unlink_if_unchanged(self.path, (created.st_dev, created.st_ino))
                 raise
             os.close(descriptor)
             break
@@ -86,48 +90,8 @@ class WorkerLock:
         return self
 
     def __exit__(self, *_args: Any) -> None:
-        if self.acquired:
-            _unlink_if_unchanged(self.path, self.identity)
-
-
-def _file_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return None
-    return stat.st_dev, stat.st_ino
-
-
-def _unlink_if_unchanged(path: Path, identity: tuple[int, int] | None) -> None:
-    if identity is None or _file_identity(path) != identity:
-        return
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _lock_pid(path: Path) -> int | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        pid = int(value.get("pid", 0))
-    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-        return None
-    return pid if pid > 0 else None
-
-
-def _pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        if self.acquired and self.record is not None:
+            release_owner_record(self.path, self.record, self.identity)
 
 
 def token_env_name(hostname: str, login: str) -> str:
@@ -297,14 +261,14 @@ def worker_status(registry: RegistryStore | None = None) -> dict[str, Any]:
     lock_path = registry.directory / "worker.lock"
     identity = _file_identity(lock_path)
     pid = _lock_pid(lock_path)
-    running = bool(pid and _pid_running(pid))
+    running = bool(pid and _pid_running(pid) and _owner_predates_lock(lock_path, pid))
     if identity and not running:
         try:
             old_enough_to_be_stale = time.time() - lock_path.stat().st_mtime >= 1
         except FileNotFoundError:
             old_enough_to_be_stale = False
         if pid is not None or old_enough_to_be_stale:
-            _unlink_if_unchanged(lock_path, identity)
+            _remove_stale_lock(lock_path, identity, pid)
         pid = None
     return {
         "state_dir": str(registry.directory),

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kanbanlan.snapshot import FileLock
+from kanbanlan.locks import FileLock
 
 REGISTRY_SCHEMA_VERSION = 1
 
