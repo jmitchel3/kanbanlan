@@ -69,6 +69,15 @@ from kanbanlan.workflow import (
     format_drift,
     plan_reconciliation,
 )
+from kanbanlan.worktrees import (
+    PRUNE,
+    REMOVE,
+    CleanupAction,
+    format_action,
+    inspect_worktree,
+    list_worktrees,
+    plan_cleanup,
+)
 
 PROJECT_URL_RE = re.compile(r"github\.com/(?:orgs|users)/(?P<owner>[^/]+)/projects/(?P<number>\d+)")
 DEFAULT_TEMPLATE_OWNER = "jmitchel3"
@@ -87,6 +96,7 @@ COMMAND_NAMES = (
     "next",
     "overlap",
     "reconcile",
+    "cleanup",
     "capture",
     "triage",
     "claim",
@@ -300,6 +310,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser("reconcile", help="report label/claim/PR/Project drift")
     reconcile.add_argument("--apply", action="store_true", help="apply the displayed repairs")
+
+    cleanup = commands.add_parser(
+        "cleanup",
+        help="remove worktrees left behind by requests that are no longer claimed",
+    )
+    cleanup.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the displayed removals instead of only planning them",
+    )
+    cleanup.add_argument(
+        "--force",
+        action="store_true",
+        help="also remove a worktree with uncommitted changes or unmerged commits",
+    )
 
     capture = commands.add_parser("capture", help="create an Inbox request card")
     capture.add_argument("title", help="issue title")
@@ -1588,6 +1613,79 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
     _activate_worker(_root(args), Config.load(_root(args)))
     success("Reconciliation applied and verified.")
     return 0
+
+
+def _cmd_cleanup(args: argparse.Namespace) -> int:
+    root, config, provider, store = _context(args)
+    runner = Runner(root)
+    with status("Loading worktrees and current claim state"):
+        snapshot = store.refresh(provider)
+        entries = list_worktrees(runner)
+        main_path = str(primary_worktree(root))
+        current_path = runner.run(
+            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"]
+        ).stdout.strip()
+        # Merge state is only meaningful against a current default branch.
+        runner.run(["git", "fetch", "origin", config.default_branch])
+        statuses = {
+            entry.path: inspect_worktree(runner, entry, default_branch=config.default_branch)
+            for entry in entries
+            if entry.path not in {main_path, current_path} and not entry.prunable
+        }
+    plan = plan_cleanup(
+        entries,
+        snapshot,
+        statuses,
+        main_path=main_path,
+        current_path=current_path,
+        default_branch=config.default_branch,
+        force=args.force,
+    )
+    removals = [value for value in plan if value.action in {REMOVE, PRUNE}]
+    payload = [value.to_dict() for value in plan]
+    if not removals:
+        if _emit_result(args, {"applied": False, "plan": payload, "removed": []}):
+            return 0
+        for value in plan:
+            print(format_action(value))
+        success("No worktree needs cleanup.")
+        return 0
+    if args.json_output and not args.apply:
+        _emit_result(args, {"applied": False, "plan": payload, "removed": []})
+        return 2
+    if not args.json_output:
+        for value in plan:
+            print(format_action(value))
+    if not args.apply:
+        warning(f"{len(removals)} worktree(s) to clean up; rerun with --apply to remove them.")
+        return 2
+    removed = _apply_cleanup(runner, removals)
+    if _emit_result(args, {"applied": True, "plan": payload, "removed": removed}):
+        return 0
+    success(f"Cleaned up {len(removed)} worktree(s).")
+    return 0
+
+
+def _apply_cleanup(runner: Runner, removals: list[CleanupAction]) -> list[dict[str, Any]]:
+    removed: list[dict[str, Any]] = []
+    pruned = False
+    for value in removals:
+        if value.action == PRUNE:
+            if not pruned:
+                with status("Pruning worktree entries whose directory is gone"):
+                    runner.run(["git", "worktree", "prune"])
+                pruned = True
+            removed.append(value.to_dict())
+            continue
+        with status(f"Removing worktree {value.path}"):
+            command = ["git", "worktree", "remove", value.path]
+            if value.forced:
+                command.insert(3, "--force")
+            runner.run(command)
+            if value.delete_branch and value.branch:
+                runner.run(["git", "branch", "-d", value.branch])
+        removed.append(value.to_dict())
+    return removed
 
 
 def _discover_github_login(root: Path, hostname: str) -> str:

@@ -38,7 +38,8 @@ scopes, and the difference is visible in stable JSON as `source.scope`.
 | Project | `project` | Every repository the Project already references. |
 
 Repository scope is the default and the only scope lifecycle commands use.
-`next`, `capture`, `claim`, `release`, `review`, `close`, `handoff`, and ordinary
+`next`, `capture`, `claim`, `release`, `review`, `close`, `handoff`, `cleanup`,
+and ordinary
 `reconcile` stay repository-local, so a shared Project never hands this
 repository another repository's work. Queue selection (`ready_cards` and
 `next_ready`) stays repository-local even in project scope.
@@ -177,6 +178,22 @@ kanbanlan review KBL-...
 The earliest unreleased CLAIM comment owns the card. Claims do not expire
 automatically. Check the canonical request, branch, worktree, and PR before
 asking to take over stale work.
+
+`claim` creates a worktree per request; `cleanup` is what removes them again:
+
+```sh
+kanbanlan cleanup                 # report what is safe to remove
+kanbanlan cleanup --apply
+```
+
+It removes a worktree only when its request has no active claim, and it links a
+worktree to its request through the Kanbanlan ID in the branch or directory name
+that `claim` writes. It never touches the primary worktree, the worktree the
+command runs in, a locked worktree, or one it cannot link to a request. A tree
+with uncommitted changes or with commits the default branch does not have is
+reported and kept; `--force` removes it anyway, and an unmerged branch always
+outlives its worktree so the commits stay recoverable. The local branch is
+deleted only when it is fully merged.
 
 ## Optional agent session tracking
 
