@@ -189,11 +189,18 @@ kanbanlan cleanup --apply
 It removes a worktree only when its request has no active claim, and it links a
 worktree to its request through the Kanbanlan ID in the branch or directory name
 that `claim` writes. It never touches the primary worktree, the worktree the
-command runs in, a locked worktree, or one it cannot link to a request. A tree
-with uncommitted changes or with commits the default branch does not have is
-reported and kept; `--force` removes it anyway, and an unmerged branch always
-outlives its worktree so the commits stay recoverable. The local branch is
-deleted only when it is fully merged.
+command runs in, a locked worktree, or one it cannot link to a request.
+
+What keeps a worktree is a commit that exists nowhere else. A branch with an
+upstream is settled once everything is pushed, which is what a squash merge
+leaves behind: the commit on `main` is a new one, so the branch
+still reports commits the default branch does not contain, yet nothing is at
+risk. A branch that was never pushed is its own only copy, so there merge state
+decides. Uncommitted changes always keep a worktree.
+
+`--force` removes a worktree despite either. It still never deletes a branch
+holding unpushed commits, so only uncommitted changes are ever discarded. The
+local branch is deleted when it is merged or fully pushed.
 
 ## Optional agent session tracking
 

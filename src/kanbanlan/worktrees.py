@@ -36,6 +36,22 @@ class WorktreeStatus:
 
     dirty: bool = False
     unmerged: int = 0
+    unpushed: int = 0
+    upstream: str | None = None
+
+    @property
+    def recoverable(self) -> bool:
+        """Report whether every commit survives this worktree's removal.
+
+        A pushed commit outlives its branch: it stays on the remote, and on the
+        pull request that carried it even after a squash merge deletes the
+        branch. Merge state is therefore only the fallback measure, for a branch
+        that was never pushed and is its own only copy.
+        """
+
+        if self.upstream:
+            return self.unpushed == 0
+        return self.unmerged == 0
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,9 @@ class CleanupAction:
     kanbanlan_id: str | None = None
     provider_ref: str | None = None
     delete_branch: bool = False
+    # A branch the default branch does not contain needs `git branch -D`, which
+    # is only ever planned for a branch whose commits are all on the remote.
+    force_delete_branch: bool = False
     forced: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +77,7 @@ class CleanupAction:
             "kanbanlan_id": self.kanbanlan_id,
             "provider_ref": self.provider_ref,
             "delete_branch": self.delete_branch,
+            "force_delete_branch": self.force_delete_branch,
             "forced": self.forced,
         }
 
@@ -114,30 +134,50 @@ def list_worktrees(runner: Runner) -> list[WorktreeEntry]:
     return parse_worktree_list(runner.run(["git", "worktree", "list", "--porcelain"]).stdout)
 
 
+def _count_commits(runner: Runner, range_expression: str) -> int:
+    """Count commits in a range, treating an unanswerable range as one commit."""
+
+    result = runner.run(["git", "rev-list", "--count", range_expression], check=False)
+    # Doubt must never delete work, so a range git cannot resolve counts as
+    # outstanding rather than as nothing.
+    return int(result.stdout.strip() or 0) if result.returncode == 0 else 1
+
+
+def _upstream(runner: Runner, branch: str) -> str | None:
+    # `for-each-ref` reads the configured upstream straight off the ref, which
+    # `rev-parse <branch>@{upstream}` cannot do for a fully qualified ref name.
+    result = runner.run(
+        [
+            "git",
+            "for-each-ref",
+            "--format=%(upstream:short)",
+            f"refs/heads/{branch}",
+        ],
+        check=False,
+    )
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
 def inspect_worktree(
     runner: Runner,
     entry: WorktreeEntry,
     *,
     default_branch: str,
 ) -> WorktreeStatus:
-    """Report uncommitted work and commits the default branch does not have."""
+    """Report uncommitted work, unpushed commits, and merge state."""
 
     dirty = bool(runner.run(["git", "-C", entry.path, "status", "--porcelain"]).stdout.strip())
-    unmerged = 0
-    if entry.branch:
-        result = runner.run(
-            [
-                "git",
-                "rev-list",
-                "--count",
-                f"origin/{default_branch}..refs/heads/{entry.branch}",
-            ],
-            check=False,
-        )
-        # A branch with no upstream comparison available is treated as
-        # unmerged, because doubt must never delete work.
-        unmerged = int(result.stdout.strip() or 0) if result.returncode == 0 else 1
-    return WorktreeStatus(dirty=dirty, unmerged=unmerged)
+    if not entry.branch:
+        return WorktreeStatus(dirty=dirty)
+    unmerged = _count_commits(runner, f"origin/{default_branch}..refs/heads/{entry.branch}")
+    upstream = _upstream(runner, entry.branch)
+    unpushed = _count_commits(runner, f"{upstream}..refs/heads/{entry.branch}") if upstream else 0
+    return WorktreeStatus(
+        dirty=dirty,
+        unmerged=unmerged,
+        unpushed=unpushed,
+        upstream=upstream,
+    )
 
 
 def plan_cleanup(
@@ -170,6 +210,7 @@ def plan_cleanup(
             reason: str,
             *,
             delete_branch: bool = False,
+            force_delete_branch: bool = False,
             forced: bool = False,
         ) -> CleanupAction:
             return CleanupAction(
@@ -180,6 +221,7 @@ def plan_cleanup(
                 kanbanlan_id=identity,
                 provider_ref=provider_ref,
                 delete_branch=delete_branch,
+                force_delete_branch=force_delete_branch,
                 forced=forced,
             )
 
@@ -207,23 +249,29 @@ def plan_cleanup(
         if status.dirty and not force:
             actions.append(action(KEEP, "uncommitted changes; rerun with --force to discard"))
             continue
-        if status.unmerged and not force:
+        if not status.recoverable and not force:
+            outstanding = (
+                f"{status.unpushed} commit(s) not pushed to {status.upstream}"
+                if status.upstream
+                else f"{status.unmerged} commit(s) not merged into {default_branch} "
+                "and no upstream branch"
+            )
             actions.append(
                 action(
                     KEEP,
-                    f"{status.unmerged} commit(s) not merged into {default_branch}; "
-                    "rerun with --force to remove the worktree anyway",
+                    f"{outstanding}; rerun with --force to remove the worktree anyway",
                 )
             )
             continue
-        forced = bool(status.dirty or status.unmerged)
+        forced = bool(status.dirty or not status.recoverable)
         actions.append(
             action(
                 REMOVE,
                 settled,
-                # An unmerged branch is the only copy of its commits, so the
-                # branch outlives the worktree even under --force.
-                delete_branch=not status.unmerged,
+                # A branch holding commits that exist nowhere else outlives its
+                # worktree even under --force.
+                delete_branch=status.recoverable,
+                force_delete_branch=status.recoverable and bool(status.unmerged),
                 forced=forced,
             )
         )
