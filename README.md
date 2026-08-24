@@ -19,7 +19,7 @@ It provides:
 - dry-run-first reconciliation between issue labels, Project Status, active
   claims, and linked pull requests; and
 - immutable, provider-independent Kanbanlan IDs;
-- safe capture, claim, release, handoff, review, and close commands; and
+- safe capture, claim, release, handoff, review, close, and cleanup commands; and
 - durable per-request records stored in the repository.
 
 GitHub Issues remain canonical in the current provider. Kanbanlan does not
@@ -285,6 +285,7 @@ kanbanlan release KBL-... --reason "Waiting for product decision" --blocked
 kanbanlan handoff KBL-... --session codex-next --branch work/kbl-audit \\
   --worktree /path/to/worktree --reason "Shift change"
 kanbanlan close KBL-... --reason "Duplicate of KBL-..." --not-planned
+kanbanlan cleanup --apply
 ```
 
 `capture` assigns a globally unique `KBL-...` Kanbanlan ID. Lifecycle commands
@@ -304,6 +305,14 @@ duplicate, or a request that will not be built. It releases any active claim,
 closes the canonical request as completed or, with `--not-planned`, as dropped,
 and settles the projection at Done. It refuses while a linked pull request is
 still open unless `--force` is given.
+
+`cleanup` removes the worktrees `claim` created for requests that no longer
+have an active claim, and the branches that are fully merged. It plans first and
+mutates only under `--apply`. A worktree is linked to its request through the
+Kanbanlan ID in the branch or directory name, so the primary worktree, the
+current worktree, a locked one, and anything it cannot link are never touched. A
+tree with uncommitted changes or unmerged commits is reported and kept unless
+`--force` is given, and an unmerged branch always outlives its worktree.
 
 `record` creates `docs/kanbanlan/requests/<Kanbanlan ID>.md` once. Complete its
 decisions, verification, and delivered-result sections in the implementation
