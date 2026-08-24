@@ -283,6 +283,13 @@ REQUIRED_STATUS_OPTIONS = [
     ("In review", "BLUE", "Pull request is open"),
     ("Done", "PURPLE", "Delivered to the configured staging branch"),
 ]
+# GitHub records why an issue ended, which keeps a delivered outcome distinct
+# from one that was dropped.
+CLOSE_REASONS = {
+    "completed": "completed",
+    "not_planned": "not planned",
+}
+
 STATUS_ALIASES = {
     "Inbox": {"Todo", "To do", "Backlog"},
     "In progress": {"In Progress", "Doing"},
@@ -1174,6 +1181,45 @@ class GitHub:
         repository: str | None = None,
     ) -> None:
         self.comment_issue(_issue_number(reference), body, repository=repository)
+
+    def close_issue(
+        self,
+        number: int,
+        *,
+        reason: str,
+        comment: str | None = None,
+        repository: str | None = None,
+    ) -> None:
+        if reason not in CLOSE_REASONS:
+            raise RuntimeError(f"unsupported close reason {reason!r}")
+        args = [
+            "gh",
+            "issue",
+            "close",
+            str(number),
+            "--repo",
+            self._repository(repository),
+            "--reason",
+            CLOSE_REASONS[reason],
+        ]
+        if comment:
+            args.extend(["--comment", comment])
+        self.runner.run(args)
+
+    def close_request(
+        self,
+        reference: int | str,
+        *,
+        reason: str,
+        comment: str | None = None,
+        repository: str | None = None,
+    ) -> None:
+        self.close_issue(
+            _issue_number(reference),
+            reason=reason,
+            comment=comment,
+            repository=repository,
+        )
 
     def create_issue(
         self,

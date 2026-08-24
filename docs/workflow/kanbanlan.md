@@ -38,7 +38,7 @@ scopes, and the difference is visible in stable JSON as `source.scope`.
 | Project | `project` | Every repository the Project already references. |
 
 Repository scope is the default and the only scope lifecycle commands use.
-`next`, `capture`, `claim`, `release`, `review`, `handoff`, and ordinary
+`next`, `capture`, `claim`, `release`, `review`, `close`, `handoff`, and ordinary
 `reconcile` stay repository-local, so a shared Project never hands this
 repository another repository's work. Queue selection (`ready_cards` and
 `next_ready`) stays repository-local even in project scope.
@@ -162,7 +162,7 @@ the move; it never creates a replacement request.
 | `status:in-progress` | In progress | Claimed by one session. |
 | `status:blocked` | Blocked | Waiting on a dependency or decision. |
 | `status:review` | In review | A linked pull request is open. |
-| closed issue | Done | Delivered to the staging branch. |
+| closed issue | Done | Delivered to the staging branch, or closed as not planned. |
 
 Priority labels are `priority:p0` through `priority:p3`.
 
@@ -236,6 +236,18 @@ and use `Closes #<issue>` while GitHub is canonical. Merging moves the card to
 Done. Done means delivered to
 `main`, not production-ready. Production promotion remains a
 separate review after staging verification.
+
+A request that ends without a merge is closed directly:
+
+```sh
+kanbanlan close KBL-... --reason "Delivered by <what shipped it>"
+kanbanlan close KBL-... --reason "Duplicate of KBL-..." --not-planned
+```
+
+`close` releases any active claim, closes the canonical request as completed or
+not planned, and settles the projection at Done. It refuses while a linked pull
+request is still open, because merging that pull request is the closing path;
+`--force` overrides the refusal when the pull request will never merge.
 
 Successful live setup can register the repository with the optional user-scoped
 worker. Manage it with `kanbanlan worker status`, `enable`, `disable`, `start`,

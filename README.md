@@ -19,7 +19,7 @@ It provides:
 - dry-run-first reconciliation between issue labels, Project Status, active
   claims, and linked pull requests; and
 - immutable, provider-independent Kanbanlan IDs;
-- safe capture, claim, release, handoff, and review commands; and
+- safe capture, claim, release, handoff, review, and close commands; and
 - durable per-request records stored in the repository.
 
 GitHub Issues remain canonical in the current provider. Kanbanlan does not
@@ -284,6 +284,7 @@ kanbanlan review KBL-...
 kanbanlan release KBL-... --reason "Waiting for product decision" --blocked
 kanbanlan handoff KBL-... --session codex-next --branch work/kbl-audit \\
   --worktree /path/to/worktree --reason "Shift change"
+kanbanlan close KBL-... --reason "Duplicate of KBL-..." --not-planned
 ```
 
 `capture` assigns a globally unique `KBL-...` Kanbanlan ID. Lifecycle commands
@@ -296,6 +297,13 @@ active claim, and only then creates a dedicated worktree from the configured
 default branch. If checkout creation fails, it releases the claim and returns
 the card to Ready. Use `--no-worktree` only from an existing non-default
 branch/worktree.
+
+A merged pull request closes its request and moves the card to Done. `close`
+covers every other terminal outcome: work delivered without a pull request, a
+duplicate, or a request that will not be built. It releases any active claim,
+closes the canonical request as completed or, with `--not-planned`, as dropped,
+and settles the projection at Done. It refuses while a linked pull request is
+still open unless `--force` is given.
 
 `record` creates `docs/kanbanlan/requests/<Kanbanlan ID>.md` once. Complete its
 decisions, verification, and delivered-result sections in the implementation
@@ -397,7 +405,7 @@ updated only between `kanbanlan:start` and `kanbanlan:end` markers.
 
 Priorities are `priority:p0` through `priority:p3`. An active CLAIM forces In
 progress; an open pull request that closes the issue forces In review; a closed
-issue forces Done. Issue labels are the fallback status record when the
+issue forces Done, whether a merge or `kanbanlan close` closed it. Issue labels are the fallback status record when the
 Project is temporarily unavailable.
 
 ## Diagnostics

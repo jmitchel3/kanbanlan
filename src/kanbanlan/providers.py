@@ -19,6 +19,7 @@ class ProviderCapabilities:
     project_scope: bool = True
     repository_routing: bool = True
     request_rehoming: bool = True
+    request_closing: bool = True
 
 
 class CoordinationProvider(Protocol):
@@ -51,6 +52,15 @@ class CoordinationProvider(Protocol):
         reference: int | str,
         body: str,
         *,
+        repository: str | None = None,
+    ) -> None: ...
+
+    def close_request(
+        self,
+        reference: int | str,
+        *,
+        reason: str,
+        comment: str | None = None,
         repository: str | None = None,
     ) -> None: ...
 

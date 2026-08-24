@@ -93,6 +93,7 @@ COMMAND_NAMES = (
     "release",
     "rehome",
     "review",
+    "close",
     "handoff",
     "sessions",
     "resume",
@@ -361,6 +362,21 @@ def build_parser() -> argparse.ArgumentParser:
     review = commands.add_parser("review", help="move an issue with an open PR to review")
     review.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     _add_actor_session_argument(review)
+
+    close = commands.add_parser("close", help="close a request and move it to Done")
+    close.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
+    close.add_argument("--reason", required=True, help="why the request is closing")
+    close.add_argument(
+        "--not-planned",
+        action="store_true",
+        help="record the request as dropped rather than delivered",
+    )
+    close.add_argument(
+        "--force",
+        action="store_true",
+        help="close the request even while a linked pull request is still open",
+    )
+    _add_actor_session_argument(close)
 
     handoff = commands.add_parser("handoff", help="transfer an active claim")
     handoff.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
@@ -2155,6 +2171,80 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_close(args: argparse.Namespace) -> int:
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
+    if not provider.capabilities.request_closing:
+        raise RuntimeError(
+            f"canonical home {provider.provider_name!r} does not support closing a request"
+        )
+    with status(f"Checking request {args.issue}"):
+        snapshot = store.refresh(provider)
+    item = _issue(snapshot, args.issue)
+    number = item["number"]
+    label = request_label(item)
+    if item.get("state") == "CLOSED":
+        raise RuntimeError(
+            f"request {label} is already closed; "
+            "run 'kanbanlan reconcile --apply' to settle its projection"
+        )
+    linked = item.get("linked_open_pull_requests") or []
+    if linked and not args.force:
+        references = ", ".join(pull_request["provider_ref"] for pull_request in linked)
+        raise RuntimeError(
+            f"request {label} still has an open pull request ({references}); "
+            "merge or close it first, or pass --force to close the request anyway"
+        )
+    reason = "not_planned" if args.not_planned else "completed"
+    claim = item.get("active_claim") or {}
+    session = claim.get("session") or claim.get("author")
+    timestamp = _utc_timestamp()
+    with status(f"Closing request {label}"):
+        if claim:
+            # A closed request keeps no owner, so the claim ends before the
+            # request does.
+            provider.comment_request(
+                number,
+                (
+                    f"RELEASED: {timestamp} — request closed: {args.reason}\n"
+                    f"Session: {session or 'unknown'}"
+                ),
+            )
+        provider.close_request(
+            number,
+            reason=reason,
+            comment=f"CLOSED: {timestamp} — {args.reason}",
+        )
+        latest = store.refresh(provider)
+        _set_state(provider, latest, number, None, "Done")
+        _record_session_activity(
+            config=config,
+            provider=provider,
+            reference=number,
+            action="close",
+            from_status=item.get("status"),
+            to_status="Done",
+            actor=actor,
+            owner_session=session,
+        )
+        store.refresh(provider)
+    if _emit_result(
+        args,
+        {
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "status": "Done",
+            "close_reason": reason,
+            "released_session": session,
+            "actor_session": actor.to_dict() if actor else None,
+        },
+    ):
+        return 0
+    success(f"Closed {label} as {reason.replace('_', ' ')}")
+    if session:
+        field("released", session)
+    return 0
+
+
 def _cmd_handoff(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
@@ -2326,7 +2416,7 @@ def _set_state(
     provider: CoordinationProvider,
     snapshot: dict[str, Any],
     reference: int | str,
-    label: str,
+    label: str | None,
     status: str,
 ) -> None:
     item = _issue(snapshot, reference)

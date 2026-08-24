@@ -30,6 +30,9 @@ and durable delivery records remain versioned here. Follow
 - Run `kanbanlan record <kanbanlan-id-or-provider-ref>` in the implementation
   worktree and complete its durable decisions, verification, and delivered result.
 - A pull request closes its issue and moves it to In review. Ownership lasts
-  until merge, explicit release, or handoff. Project Done means delivered to
+  until merge, explicit release, close, or handoff. A request that ends without
+  a merge is closed with
+  `kanbanlan close <kanbanlan-id-or-provider-ref> --reason ...`, adding
+  `--not-planned` when it will not be built. Project Done means delivered to
   `main`; production readiness still requires staging review.
 <!-- kanbanlan:end -->
