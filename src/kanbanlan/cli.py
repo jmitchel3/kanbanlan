@@ -1683,7 +1683,8 @@ def _apply_cleanup(runner: Runner, removals: list[CleanupAction]) -> list[dict[s
                 command.insert(3, "--force")
             runner.run(command)
             if value.delete_branch and value.branch:
-                runner.run(["git", "branch", "-d", value.branch])
+                flag = "-D" if value.force_delete_branch else "-d"
+                runner.run(["git", "branch", flag, value.branch])
         removed.append(value.to_dict())
     return removed
 

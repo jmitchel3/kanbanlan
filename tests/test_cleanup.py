@@ -31,6 +31,7 @@ MAIN = "/repo"
 SLUG = "kbl-aaaaaaaaaaaaaaaaaaaaaaaaaa-add-a-thing"
 WORKTREE = f"/repo/.worktrees/{SLUG}"
 BRANCH = f"work/{SLUG}"
+UPSTREAM = f"origin/{BRANCH}"
 
 
 def config() -> Config:
@@ -72,6 +73,12 @@ def entry(
     **kwargs: Any,
 ) -> WorktreeEntry:
     return WorktreeEntry(path=path, branch=branch, **kwargs)
+
+
+def pushed(**kwargs: Any) -> WorktreeStatus:
+    """A branch whose commits are all on the remote, as `claim` leaves it."""
+
+    return WorktreeStatus(upstream=UPSTREAM, **kwargs)
 
 
 def plan(
@@ -195,26 +202,59 @@ class PlanTests(unittest.TestCase):
         self.assertEqual([PRUNE], [value.action for value in actions])
 
     def test_uncommitted_changes_keep_the_worktree(self) -> None:
-        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(dirty=True)})
+        actions = plan([entry()], statuses={WORKTREE: pushed(dirty=True)})
 
         self.assertEqual([KEEP], [value.action for value in actions])
         self.assertIn("--force", actions[0].reason)
 
     def test_force_discards_uncommitted_changes(self) -> None:
-        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(dirty=True)}, force=True)
+        actions = plan([entry()], statuses={WORKTREE: pushed(dirty=True)}, force=True)
 
         self.assertEqual([REMOVE], [value.action for value in actions])
         self.assertTrue(actions[0].forced)
         self.assertTrue(actions[0].delete_branch)
 
-    def test_unmerged_commits_keep_the_worktree(self) -> None:
-        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(unmerged=3)})
+    def test_a_squash_merged_branch_is_delivered_once_it_is_pushed(self) -> None:
+        # A squash rewrites the commit, so a delivered branch always reports
+        # commits the default branch does not contain.
+        actions = plan([entry()], statuses={WORKTREE: pushed(unmerged=1)})
+
+        self.assertEqual([REMOVE], [value.action for value in actions])
+        self.assertFalse(actions[0].forced)
+        self.assertTrue(actions[0].delete_branch)
+        self.assertTrue(actions[0].force_delete_branch)
+
+    def test_a_branch_merged_by_fast_forward_deletes_without_force(self) -> None:
+        actions = plan([entry()], statuses={WORKTREE: pushed(unmerged=0)})
+
+        self.assertEqual([REMOVE], [value.action for value in actions])
+        self.assertTrue(actions[0].delete_branch)
+        self.assertFalse(actions[0].force_delete_branch)
+
+    def test_unpushed_commits_keep_the_worktree(self) -> None:
+        actions = plan([entry()], statuses={WORKTREE: pushed(unmerged=3, unpushed=3)})
 
         self.assertEqual([KEEP], [value.action for value in actions])
-        self.assertIn("3 commit(s) not merged into main", actions[0].reason)
+        self.assertIn(f"3 commit(s) not pushed to {UPSTREAM}", actions[0].reason)
 
-    def test_force_removes_an_unmerged_worktree_but_keeps_its_branch(self) -> None:
-        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(unmerged=2)}, force=True)
+    def test_a_branch_with_no_upstream_falls_back_to_merge_state(self) -> None:
+        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(unmerged=2)})
+
+        self.assertEqual([KEEP], [value.action for value in actions])
+        self.assertIn("2 commit(s) not merged into main and no upstream branch", actions[0].reason)
+
+    def test_a_pushed_branch_with_no_upstream_ref_is_still_removable_when_merged(self) -> None:
+        actions = plan([entry()], statuses={WORKTREE: WorktreeStatus(unmerged=0)})
+
+        self.assertEqual([REMOVE], [value.action for value in actions])
+        self.assertTrue(actions[0].delete_branch)
+
+    def test_force_removes_an_unpushed_worktree_but_keeps_its_branch(self) -> None:
+        actions = plan(
+            [entry()],
+            statuses={WORKTREE: pushed(unmerged=2, unpushed=2)},
+            force=True,
+        )
 
         self.assertEqual([REMOVE], [value.action for value in actions])
         self.assertTrue(actions[0].forced)
@@ -231,26 +271,87 @@ class InspectTests(unittest.TestCase):
     def result(self, stdout: str = "", returncode: int = 0) -> CommandResult:
         return CommandResult(args=["git"], returncode=returncode, stdout=stdout, stderr="")
 
-    def test_reports_a_dirty_tree_and_unmerged_count(self) -> None:
-        runner = self.runner(self.result(" M src/kanbanlan/cli.py\n"), self.result("2\n"))
+    def test_reports_dirty_state_merge_state_and_push_state(self) -> None:
+        runner = self.runner(
+            self.result(" M src/kanbanlan/cli.py\n"),
+            self.result("2\n"),
+            self.result(f"{UPSTREAM}\n"),
+            self.result("1\n"),
+        )
 
         value = inspect_worktree(runner, entry(), default_branch="main")
 
-        self.assertEqual(WorktreeStatus(dirty=True, unmerged=2), value)
+        self.assertEqual(
+            WorktreeStatus(dirty=True, unmerged=2, unpushed=1, upstream=UPSTREAM),
+            value,
+        )
 
-    def test_a_clean_merged_worktree_reports_nothing_outstanding(self) -> None:
-        runner = self.runner(self.result(""), self.result("0\n"))
+    def test_a_squash_merged_branch_reports_unmerged_but_fully_pushed(self) -> None:
+        runner = self.runner(
+            self.result(""),
+            self.result("1\n"),
+            self.result(f"{UPSTREAM}\n"),
+            self.result("0\n"),
+        )
 
         value = inspect_worktree(runner, entry(), default_branch="main")
 
-        self.assertEqual(WorktreeStatus(dirty=False, unmerged=0), value)
+        self.assertTrue(value.recoverable)
+        self.assertEqual(1, value.unmerged)
 
-    def test_an_uncomparable_branch_counts_as_unmerged(self) -> None:
-        runner = self.runner(self.result(""), self.result("", returncode=128))
+    def test_the_upstream_is_read_off_the_ref(self) -> None:
+        # `rev-parse refs/heads/<branch>@{upstream}` fails on a fully qualified
+        # ref name, which silently reported every branch as never pushed.
+        runner = self.runner(
+            self.result(""),
+            self.result("1\n"),
+            self.result(f"{UPSTREAM}\n"),
+            self.result("0\n"),
+        )
+
+        inspect_worktree(runner, entry(), default_branch="main")
+
+        self.assertIn(
+            [
+                "git",
+                "for-each-ref",
+                "--format=%(upstream:short)",
+                f"refs/heads/{BRANCH}",
+            ],
+            [call.args[0] for call in runner.run.call_args_list],
+        )
+
+    def test_a_branch_with_no_upstream_reports_none(self) -> None:
+        runner = self.runner(
+            self.result(""),
+            self.result("0\n"),
+            self.result(""),
+        )
+
+        value = inspect_worktree(runner, entry(), default_branch="main")
+
+        self.assertIsNone(value.upstream)
+        self.assertEqual(0, value.unpushed)
+        self.assertTrue(value.recoverable)
+
+    def test_an_uncomparable_range_counts_as_outstanding(self) -> None:
+        runner = self.runner(
+            self.result(""),
+            self.result("", returncode=128),
+            self.result("", returncode=128),
+        )
 
         value = inspect_worktree(runner, entry(), default_branch="main")
 
         self.assertEqual(1, value.unmerged)
+        self.assertFalse(value.recoverable)
+
+    def test_a_detached_worktree_is_only_checked_for_dirt(self) -> None:
+        runner = self.runner(self.result(" M file\n"))
+
+        value = inspect_worktree(runner, entry(branch=None), default_branch="main")
+
+        self.assertEqual(WorktreeStatus(dirty=True), value)
 
 
 class CleanupCommandTests(unittest.TestCase):
@@ -313,18 +414,31 @@ class CleanupCommandTests(unittest.TestCase):
         self.assertIn(["git", "worktree", "remove", WORKTREE], calls)
         self.assertIn(["git", "branch", "-d", BRANCH], calls)
 
-    def test_apply_forces_a_dirty_worktree_and_keeps_no_branch_when_unmerged(self) -> None:
+    def test_apply_forces_a_dirty_worktree_and_keeps_an_unpushed_branch(self) -> None:
         code, _, runner = self.run_cleanup(
             [entry()],
             apply=True,
             force=True,
-            statuses={WORKTREE: WorktreeStatus(dirty=True, unmerged=1)},
+            statuses={WORKTREE: pushed(dirty=True, unmerged=1, unpushed=1)},
         )
 
         self.assertEqual(0, code)
         calls = self.git_calls(runner)
         self.assertIn(["git", "worktree", "remove", "--force", WORKTREE], calls)
         self.assertNotIn(["git", "branch", "-d", BRANCH], calls)
+        self.assertNotIn(["git", "branch", "-D", BRANCH], calls)
+
+    def test_apply_force_deletes_a_squash_merged_branch(self) -> None:
+        code, _, runner = self.run_cleanup(
+            [entry()],
+            apply=True,
+            statuses={WORKTREE: pushed(unmerged=1)},
+        )
+
+        self.assertEqual(0, code)
+        calls = self.git_calls(runner)
+        self.assertIn(["git", "worktree", "remove", WORKTREE], calls)
+        self.assertIn(["git", "branch", "-D", BRANCH], calls)
 
     def test_apply_prunes_a_missing_directory_once(self) -> None:
         code, _, runner = self.run_cleanup(

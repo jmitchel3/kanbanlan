@@ -307,12 +307,18 @@ and settles the projection at Done. It refuses while a linked pull request is
 still open unless `--force` is given.
 
 `cleanup` removes the worktrees `claim` created for requests that no longer
-have an active claim, and the branches that are fully merged. It plans first and
-mutates only under `--apply`. A worktree is linked to its request through the
-Kanbanlan ID in the branch or directory name, so the primary worktree, the
-current worktree, a locked one, and anything it cannot link are never touched. A
-tree with uncommitted changes or unmerged commits is reported and kept unless
-`--force` is given, and an unmerged branch always outlives its worktree.
+have an active claim. It plans first and mutates only under `--apply`. A
+worktree is linked to its request through the Kanbanlan ID in the branch or
+directory name, so the primary worktree, the current worktree, a locked one, and
+anything it cannot link are never touched.
+
+A worktree is kept when it holds a commit that exists nowhere else: uncommitted
+changes, or unpushed commits on a branch with an upstream, or unmerged commits
+on a branch that was never pushed. A squash-merged branch is therefore settled
+even though the default branch does not contain its commit, because the commit
+is still on the remote and on the pull request that carried it. `--force`
+removes a worktree despite any of that, and still never deletes a branch with
+unpushed commits.
 
 `record` creates `docs/kanbanlan/requests/<Kanbanlan ID>.md` once. Complete its
 decisions, verification, and delivered-result sections in the implementation
