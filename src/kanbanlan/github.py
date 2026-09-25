@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from kanbanlan.accounts import AccountRunner
 from kanbanlan.config import Config, cache_dir
 from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
@@ -341,7 +342,9 @@ class GitHub:
     def __init__(self, root: Path, config: Config | None = None, runner: Runner | None = None):
         self.root = root
         self.config = config
-        self.runner = runner or Runner(root)
+        # With a configuration there is a repository to bind an account to;
+        # without one (init, auth) gh's own active account is all there is.
+        self.runner = runner or (AccountRunner(root, config) if config else Runner(root))
 
     @staticmethod
     def require_cli() -> None:

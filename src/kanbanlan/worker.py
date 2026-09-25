@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from kanbanlan.accounts import AccountStore, account_env, account_token
 from kanbanlan.config import Config, cache_dir
 from kanbanlan.github import GitHub
 from kanbanlan.locks import file_identity as _file_identity
@@ -100,39 +101,22 @@ def token_env_name(hostname: str, login: str) -> str:
 
 
 def scoped_runner(registration: Registration) -> Runner:
-    if not registration.github_login:
+    """Return a runner acting as the account this repository is bound to.
+
+    A user-level binding (``kanbanlan account use``) wins over the login
+    recorded at registration, so rebinding takes effect on the next cycle
+    without re-registering.
+    """
+
+    bound = AccountStore().lookup(registration.hostname, registration.repository)
+    login = bound.login if bound else registration.github_login
+    if not login:
         raise RuntimeError(
-            "repository has no recorded GitHub account; run worker enable --github-login"
+            "repository has no bound GitHub account; run 'kanbanlan account use LOGIN'"
         )
-    token_name = token_env_name(registration.hostname, registration.github_login)
-    token = os.environ.get(token_name)
-    if token is None:
-        token_result = Runner(
-            Path(registration.root),
-            env={
-                "GH_HOST": registration.hostname,
-                "GH_TOKEN": None,
-                "GITHUB_TOKEN": None,
-                "GH_ENTERPRISE_TOKEN": None,
-            },
-        ).run(
-            [
-                "gh",
-                "auth",
-                "token",
-                "--hostname",
-                registration.hostname,
-                "--user",
-                registration.github_login,
-            ]
-        )
-        token = token_result.stdout.strip()
-    if not token:
-        raise RuntimeError(f"GitHub account {registration.github_login!r} has no usable token")
-    return Runner(
-        Path(registration.root),
-        env={"GH_HOST": registration.hostname, "GH_TOKEN": token},
-    )
+    token_name = token_env_name(registration.hostname, login)
+    token = os.environ.get(token_name) or account_token(registration.hostname, login)
+    return Runner(Path(registration.root), env=account_env(registration.hostname, token))
 
 
 class Worker:
