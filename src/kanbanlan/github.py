@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -264,6 +265,10 @@ mutation($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
 ITEM_CACHE_SCHEMA_VERSION = 2
 ITEM_CACHE_FILENAME = "project_items.json"
 HYDRATION_BATCH_SIZE = 30
+
+# Independent reads run side by side. Each is one gh process, so this bounds
+# concurrent processes and connections rather than GraphQL point cost.
+READ_CONCURRENCY = 6
 FULL_REFRESH_ENV = "KANBANLAN_FULL_REFRESH"
 
 # Comment edits bump no timestamp the probe can see, so cached nodes carry a
@@ -720,35 +725,63 @@ class GitHub:
         read by already being on the board. A peer repository that cannot be
         read is reported instead of failing the whole read, because the
         configured repository still has usable state.
+
+        Every read is independent, so the pull request reads run concurrently
+        with the Project read instead of after it. The repositories to read
+        are only known once the Project arrives, so the ones the previous read
+        found are started speculatively; a repository the Project no longer
+        references is discarded, and a newly referenced one is read after.
+        The concurrency changes wall-clock time only, never the result.
         """
 
         config = self._config()
-        project, project_rate_limit = self._fetch_project()
-        targets = sorted({config.repository, *project_repositories(project)})
-        pull_requests: list[dict[str, Any]] = []
-        unavailable: list[dict[str, Any]] = []
-        rate_limits = [project_rate_limit]
-        for target in targets:
-            try:
-                values, rate_limit = self._fetch_pull_requests(target)
-            except RateLimitError:
-                # Out of quota means every remaining target fails too; a
-                # "successful" snapshot missing peer repositories would hide
-                # exactly the cross-repository work overlap checks exist for.
-                raise
-            except (CommandError, RuntimeError) as exc:
-                if target == config.repository:
+        predicted = sorted({config.repository, *self._cached_repositories()})
+        executor = ThreadPoolExecutor(max_workers=READ_CONCURRENCY)
+        try:
+            project_future = executor.submit(self._fetch_project)
+            pull_futures = {
+                target: executor.submit(self._fetch_pull_requests, target) for target in predicted
+            }
+            project, project_rate_limit = project_future.result()
+            targets = sorted({config.repository, *project_repositories(project)})
+            for target in targets:
+                if target not in pull_futures:
+                    pull_futures[target] = executor.submit(self._fetch_pull_requests, target)
+            pull_requests: list[dict[str, Any]] = []
+            unavailable: list[dict[str, Any]] = []
+            rate_limits = [project_rate_limit]
+            for target in targets:
+                try:
+                    values, rate_limit = pull_futures[target].result()
+                except RateLimitError:
+                    # Out of quota means every remaining target fails too; a
+                    # "successful" snapshot missing peer repositories would hide
+                    # exactly the cross-repository work overlap checks exist for.
                     raise
-                unavailable.append({"repository": target, "error": str(exc)})
-                continue
-            pull_requests.extend(values)
-            rate_limits.append(rate_limit)
+                except (CommandError, RuntimeError) as exc:
+                    if target == config.repository:
+                        raise
+                    unavailable.append({"repository": target, "error": str(exc)})
+                    continue
+                pull_requests.extend(values)
+                rate_limits.append(rate_limit)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
         return ProjectRead(
             project=project,
             pull_requests=pull_requests,
             rate_limit=min(rate_limits, key=lambda value: value.get("remaining", 10**12)),
             unavailable_repositories=unavailable,
         )
+
+    def _cached_repositories(self) -> list[str]:
+        """Return the repositories the previous Project read referenced."""
+
+        cache = self._load_item_cache()
+        repositories = cache.get("repositories") if cache else None
+        if not isinstance(repositories, list):
+            return []
+        return [value for value in repositories if isinstance(value, str) and "/" in value]
 
     def fetch(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         read = self.collect()
@@ -999,6 +1032,7 @@ class GitHub:
             "schema_version": ITEM_CACHE_SCHEMA_VERSION,
             "project": self._item_cache_key(),
             "fields_fingerprint": _fields_fingerprint(project),
+            "repositories": sorted(project_repositories(project)),
             "items": entries,
         }
         try:

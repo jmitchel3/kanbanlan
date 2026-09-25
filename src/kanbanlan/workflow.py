@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,22 @@ LABEL_TO_STATUS = {
     "status:review": "In review",
 }
 STATUS_TO_LABEL = {value: key for key, value in LABEL_TO_STATUS.items()}
+
+
+def read_board(
+    store: CacheStore,
+    provider: CoordinationProvider,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Refresh the snapshot and list open requests at the same time.
+
+    Reconciliation compares the two, and neither read depends on the other,
+    so waiting for one before starting the other only adds latency.
+    """
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        open_requests = executor.submit(provider.list_open_requests)
+        snapshot = store.refresh(provider)
+        return snapshot, open_requests.result()
 
 
 @dataclass(frozen=True)
@@ -192,8 +209,8 @@ def apply_reconciliation(
                 snapshot["project"],
                 action.expected,
             )
-    refreshed = store.refresh(provider)
-    remaining = plan_reconciliation(refreshed, provider.list_open_requests())
+    refreshed, open_requests = read_board(store, provider)
+    remaining = plan_reconciliation(refreshed, open_requests)
     return remaining, refreshed
 
 
