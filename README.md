@@ -166,18 +166,20 @@ kanbanlan worker disable
 
 The worker resolves the selected account's credential at runtime with
 `gh auth token --user`; it never runs `gh auth switch` and never writes a token
-to the registry. See [`docs/workflow/worker.md`](docs/workflow/worker.md) for
+to the registry. It also drains any lifecycle changes a session queued but did
+not finish syncing (see "Instant commands" below). See [`docs/workflow/worker.md`](docs/workflow/worker.md) for
 macOS LaunchAgent and Linux systemd user-service examples. The worker is
 opt-in, has no Docker requirement, and explicit disablement persists.
 
 ## Daily use
 
 ```sh
-kanbanlan ensure             # refresh only when the worktree-shared cache is stale
+kanbanlan ensure             # serve the worktree-shared cache, refreshing it when stale
 kanbanlan next               # report the first unblocked Ready issue
 kanbanlan status             # summarize the local cache
 kanbanlan reconcile          # report drift, without mutations
 kanbanlan reconcile --apply  # apply and verify the displayed repairs
+kanbanlan sync               # show lifecycle changes still syncing to GitHub
 kanbanlan --json next        # stable output for agents and automation
 ```
 
@@ -201,6 +203,53 @@ re-fetched only for cards that changed since the last refresh, using an
 advisory raw-node cache in the same cache directory. Any doubt about the cache
 falls back to a full fetch, so the cache can only reduce cost, never change
 the snapshot. Set `KANBANLAN_FULL_REFRESH=1` to force the full fetch.
+
+### GitHub account
+
+Every GitHub call acts as one deterministic `gh` account for the repository,
+never whichever account `gh` last made active:
+
+```sh
+kanbanlan account                # show the account and why it was chosen
+kanbanlan account use LOGIN      # bind this repository
+kanbanlan account use LOGIN --owner  # bind every repository of this owner
+kanbanlan account clear
+```
+
+Resolution order: `KANBANLAN_GITHUB_ACCOUNT`, a repository binding, an owner
+binding, then an automatic choice only when it is unambiguous (the repository
+or Project owner is a logged-in account, or exactly one account is logged in),
+which is saved as a repository binding. Otherwise the command fails and names
+the logged-in accounts. An explicit `GH_TOKEN` or `GITHUB_TOKEN` is used as is
+when nothing is bound. Bindings live in the user state directory, never in the
+repository.
+
+### Instant commands
+
+Lifecycle commands (`capture`, `triage`, `claim`, `release`, `review`,
+`close`, `handoff`) and reads (`ensure`, `next`, `overlap`, `status`,
+`reconcile`, `sessions`, `resume`, `record`) answer from local state in a
+fraction of a second:
+
+- A lifecycle command validates against the local snapshot with every pending
+  change laid over it, records its change in the cache directory's outbox, and
+  returns. A detached `kanbanlan sync --drain` then replays each change, in
+  order, as the ordinary live command, which re-validates against GitHub. A
+  queued `capture` returns its Kanbanlan ID at once; the issue number follows.
+- Sessions on the same machine arbitrate claims instantly under a local lock.
+  The replayed claim still posts to GitHub and verifies it afterwards, so a
+  claim lost to another machine is reported on the next command.
+- Reads serve the local snapshot and refresh it in the background when it is
+  stale. A snapshot older than ten staleness windows, a request the snapshot
+  does not know, or a check it cannot decide (a `review` whose pull request is
+  newer than the snapshot, a reconcile that finds drift) runs live instead,
+  after the queue drains.
+- A change that fails to sync is never retried on its own. It is reported on
+  later commands, blocks further changes to the same request, and is managed
+  with `kanbanlan sync`, `kanbanlan sync --retry ID`, and
+  `kanbanlan sync --dismiss ID|all`.
+
+Set `KANBANLAN_WRITE_BEHIND=0` to run every command live.
 
 ## Shared Projects across repositories
 
