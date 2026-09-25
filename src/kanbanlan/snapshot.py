@@ -478,11 +478,58 @@ class CacheStore:
         self.snapshot_path = directory / "snapshot.json"
         self.health_path = directory / "health.json"
         self.lock_path = directory / "refresh.lock"
+        self.invalidated_path = directory / "invalidated.json"
 
     def refresh(self, client: Any) -> dict[str, Any]:
+        """Return a snapshot read after this call began.
+
+        Sessions that queue on the lock behind another refresh reuse its
+        result when that fetch started after they asked: it already reflects
+        every write they made before calling, exactly as their own fetch
+        would, so repeating it would only double the wait and the points.
+        """
+
+        requested_at = utc_now()
         self._prepare_directory()
         with FileLock(self.lock_path):
+            snapshot = self.snapshot()
+            if self._read_after(snapshot, requested_at):
+                assert snapshot is not None
+                return snapshot
             return self._refresh_locked(client)
+
+    def invalidate(self) -> None:
+        """Mark the current snapshot stale without paying for a refresh.
+
+        A mutation that changed the board records when it happened, so any
+        snapshot generated before it stops counting as fresh; the next
+        ``ensure`` then reads the board again instead of serving the
+        pre-mutation state for the rest of the staleness window.
+        """
+
+        self._prepare_directory()
+        self._write_json(
+            self.invalidated_path,
+            {"schema_version": SCHEMA_VERSION, "invalidated_at": isoformat(utc_now())},
+        )
+
+    def _read_after(self, snapshot: dict[str, Any] | None, moment: datetime) -> bool:
+        if not self._usable(snapshot) or self._invalidated(snapshot):
+            return False
+        assert snapshot is not None
+        try:
+            return parse_time(snapshot["generated_at"]) >= moment
+        except (ValueError, TypeError):
+            return False
+
+    def _invalidated(self, snapshot: dict[str, Any] | None) -> bool:
+        marker = self._read_json(self.invalidated_path)
+        if not marker or not snapshot or not snapshot.get("generated_at"):
+            return False
+        try:
+            return parse_time(marker["invalidated_at"]) > parse_time(snapshot["generated_at"])
+        except (KeyError, ValueError, TypeError):
+            return False
 
     def _refresh_locked(self, client: Any) -> dict[str, Any]:
         attempted_at = utc_now()
@@ -648,6 +695,8 @@ class CacheStore:
         if not snapshot or not snapshot.get("generated_at"):
             return "missing"
         if snapshot.get("schema_version") != SCHEMA_VERSION:
+            return "stale"
+        if self._invalidated(snapshot):
             return "stale"
         age = self._snapshot_age(snapshot)
         return "fresh" if age is not None and age <= self.config.stale_seconds else "stale"

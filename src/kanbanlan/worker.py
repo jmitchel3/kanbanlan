@@ -22,7 +22,7 @@ from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
 from kanbanlan.registry import Registration, RegistryStore, utc_now
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
-from kanbanlan.workflow import apply_reconciliation, plan_reconciliation
+from kanbanlan.workflow import apply_reconciliation, plan_reconciliation, read_board
 
 MAX_BACKOFF_SECONDS = 3600
 DEFAULT_INTERVAL_SECONDS = 300
@@ -200,8 +200,7 @@ class Worker:
             runner = scoped_runner(registration)
             provider = GitHub(root, config, runner=runner)
             store = CacheStore(config, cache_dir(root))
-            snapshot = store.refresh(provider)
-            open_issues = provider.list_open_requests()
+            snapshot, open_issues = read_board(store, provider)
             drift = plan_reconciliation(snapshot, open_issues)
             unsafe = [value for value in drift if value.kind == "duplicate_kanbanlan_id"]
             if unsafe:
@@ -217,8 +216,8 @@ class Worker:
                 # repaired. A clean cycle already proved itself with the read
                 # above, and the GraphQL point budget it would spend here is
                 # shared by every repository and agent on this account.
-                verified = store.refresh(provider)
-                verification_drift = plan_reconciliation(verified, provider.list_open_requests())
+                verified, verified_issues = read_board(store, provider)
+                verification_drift = plan_reconciliation(verified, verified_issues)
                 if verification_drift:
                     raise RuntimeError(
                         "verification found unresolved differences: "

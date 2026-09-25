@@ -7,8 +7,10 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +70,7 @@ from kanbanlan.workflow import (
     apply_reconciliation,
     format_drift,
     plan_reconciliation,
+    read_board,
 )
 from kanbanlan.worktrees import (
     PRUNE,
@@ -1557,8 +1560,7 @@ def _cmd_next(args: argparse.Namespace) -> int:
 def _cmd_reconcile(args: argparse.Namespace) -> int:
     _, _, provider, store = _context(args)
     with status("Loading current Project and issue state"):
-        snapshot = store.refresh(provider)
-        open_issues = provider.list_open_requests()
+        snapshot, open_issues = read_board(store, provider)
     drift = plan_reconciliation(snapshot, open_issues)
     if not args.json_output:
         _warn_linkage_problems(snapshot)
@@ -1806,13 +1808,8 @@ def _reconcile_captured_request(
     """Bring one freshly created request to Inbox in the repository that owns it."""
 
     if target == config.repository:
-        snapshot = store.refresh(provider)
-        remaining, refreshed = apply_reconciliation(
-            provider,
-            store,
-            snapshot,
-            provider.list_open_requests(),
-        )
+        snapshot, open_issues = read_board(store, provider)
+        remaining, refreshed = apply_reconciliation(provider, store, snapshot, open_issues)
         if remaining:
             raise RuntimeError("its Project state did not reconcile")
         return _issue(refreshed, kanbanlan_id)
@@ -1861,7 +1858,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         repository=target,
     )
     if config.session_tracking_enabled() and target == config.repository:
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     result = {
         "kanbanlan_id": kanbanlan_id,
         "repository": target,
@@ -1904,7 +1901,7 @@ def _cmd_triage(args: argparse.Namespace) -> int:
             to_status="Ready",
             actor=actor,
         )
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     result = {
         "kanbanlan_id": item.get("kanbanlan_id"),
         "status": "Ready",
@@ -1981,7 +1978,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         actor=actor,
         owner_session=session,
     )
-    store.refresh(provider)
+    _refresh_after_mutation(root, store, provider)
     result = {
         "kanbanlan_id": item.get("kanbanlan_id"),
         "provider_ref": item.get("provider_ref"),
@@ -2084,7 +2081,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=session,
         )
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     if _emit_result(
         args,
         {
@@ -2162,7 +2159,7 @@ def _cmd_rehome(args: argparse.Namespace) -> int:
         repository=target,
     )
     if plan.source_repository == config.repository or target == config.repository:
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     result = rehome_result(plan, moved)
     result["actor_session"] = actor.to_dict() if actor else None
     if _emit_result(args, result):
@@ -2243,7 +2240,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=(item.get("active_claim") or {}).get("session"),
         )
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     if _emit_result(
         args,
         {
@@ -2326,7 +2323,7 @@ def _cmd_close(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=session,
         )
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     if _emit_result(
         args,
         {
@@ -2377,7 +2374,7 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=args.session,
         )
-        store.refresh(provider)
+        _refresh_after_mutation(root, store, provider)
     if _emit_result(
         args,
         {
@@ -2511,6 +2508,39 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_after_mutation(
+    root: Path,
+    store: CacheStore,
+    provider: CoordinationProvider,
+) -> None:
+    """Bring the shared snapshot up to date after a command changed the board.
+
+    Nothing in the command reads this snapshot any more, so it is refreshed by
+    a detached process instead of making the caller wait for a full board
+    read. The snapshot is invalidated first, so until that refresh lands
+    every ``ensure`` reads the board itself rather than serving the
+    pre-mutation state, and a failed background refresh costs one foreground
+    read later, never a wrong answer. ``KANBANLAN_BACKGROUND_REFRESH=0``
+    keeps the refresh in the foreground.
+    """
+
+    if os.environ.get("KANBANLAN_BACKGROUND_REFRESH", "1") == "0":
+        store.refresh(provider)
+        return
+    store.invalidate()
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "kanbanlan", "-C", str(root), "--json", "refresh"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
 def _set_state(
     provider: CoordinationProvider,
     snapshot: dict[str, Any],
@@ -2519,12 +2549,18 @@ def _set_state(
     status: str,
 ) -> None:
     item = _issue(snapshot, reference)
-    provider.set_request_status(item["number"], label)
-    provider.set_projection_status(
-        item["project_item_id"],
-        snapshot["project"],
-        status,
-    )
+    # The label and the Project Status are separate records, so both writes
+    # run at once; each still raises exactly as it would alone.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        label_write = executor.submit(provider.set_request_status, item["number"], label)
+        status_write = executor.submit(
+            provider.set_projection_status,
+            item["project_item_id"],
+            snapshot["project"],
+            status,
+        )
+        label_write.result()
+        status_write.result()
 
 
 def _issue(snapshot: dict[str, Any], reference: int | str) -> dict[str, Any]:
