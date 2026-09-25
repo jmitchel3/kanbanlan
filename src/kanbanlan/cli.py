@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from kanbanlan import __version__
+from kanbanlan.accounts import (
+    AccountStore,
+    logged_in_accounts,
+    owner_key,
+    repository_key,
+    resolve_account,
+)
 from kanbanlan.config import (
     CONFIG_FILENAME,
     Config,
@@ -113,6 +120,7 @@ COMMAND_NAMES = (
     "session-hook",
     "record",
     "worker",
+    "account",
 )
 
 
@@ -466,6 +474,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="worker polling interval in seconds (default: 300)",
     )
     worker.add_argument("--once", action="store_true", help="run one worker iteration and exit")
+
+    account = commands.add_parser(
+        "account",
+        help="show or bind the gh account Kanbanlan acts as for this repository",
+    )
+    account.add_argument(
+        "action",
+        nargs="?",
+        choices=("show", "use", "clear"),
+        default="show",
+        help="show the resolved account (default), bind one, or remove a binding",
+    )
+    account.add_argument("login", nargs="?", help="gh account login for 'use'")
+    account.add_argument(
+        "--owner",
+        action="store_true",
+        help="bind every repository of this repository's owner, not just this one",
+    )
 
     return parser
 
@@ -1691,8 +1717,16 @@ def _apply_cleanup(runner: Runner, removals: list[CleanupAction]) -> list[dict[s
     return removed
 
 
-def _discover_github_login(root: Path, hostname: str) -> str:
-    result = Runner(root, env={"GH_HOST": hostname}).run(["gh", "api", "user", "--jq", ".login"])
+def _discover_github_login(root: Path, config: Config) -> str:
+    """Return the bound account, choosing one only when the choice is unambiguous."""
+
+    account = resolve_account(config)
+    if account is not None:
+        return account.login
+    # An explicit environment token names its own identity.
+    result = Runner(root, env={"GH_HOST": config.hostname}).run(
+        ["gh", "api", "user", "--jq", ".login"]
+    )
     login = result.stdout.strip()
     if not login:
         raise RuntimeError("GitHub did not return an account login; pass --github-login explicitly")
@@ -1706,9 +1740,7 @@ def _activate_worker(root: Path, config: Config, *, github_login: str | None = N
     if existing and existing.disabled:
         return
     stable_root = primary_worktree(root)
-    login = github_login or (existing.github_login if existing else None)
-    if login is None:
-        login = _discover_github_login(root, config.hostname)
+    login = github_login or _discover_github_login(root, config)
     registration = registry.register(
         common_dir=key,
         root=stable_root,
@@ -1733,7 +1765,11 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         key = common_dir(root)
         stable_root = primary_worktree(root)
         if args.action == "enable":
-            login = args.github_login or _discover_github_login(root, config.hostname)
+            if args.github_login:
+                AccountStore().bind(
+                    config.hostname, repository_key(config.repository), args.github_login
+                )
+            login = args.github_login or _discover_github_login(root, config)
             registry.register(
                 common_dir=key,
                 root=stable_root,
@@ -1769,6 +1805,52 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     if _emit_result(args, payload or {}):
         return 0
     print(json.dumps(payload or {}, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_account(args: argparse.Namespace) -> int:
+    root = _root(args)
+    config = Config.load(root)
+    store = AccountStore()
+    owner = config.repository.split("/", 1)[0]
+    key = owner_key(owner) if args.owner else repository_key(config.repository)
+    if args.action == "use":
+        if not args.login:
+            raise RuntimeError("account use requires a LOGIN")
+        known = logged_in_accounts(config.hostname)
+        if args.login.lower() not in {value.lower() for value in known}:
+            raise RuntimeError(
+                f"{args.login} is not logged in to {config.hostname} in gh "
+                f"(logged in: {', '.join(sorted(known)) or 'none'}); "
+                f"run 'gh auth login --hostname {config.hostname}' first"
+            )
+        store.bind(config.hostname, key, args.login)
+        # The worker reads bindings each cycle; its registration mirrors them
+        # so 'worker status' shows the account it will use.
+        existing = RegistryStore().get(str(common_dir(root)))
+        if existing and not args.owner:
+            existing.github_login = args.login
+            RegistryStore().update(existing)
+    elif args.action == "clear":
+        if args.login:
+            raise RuntimeError("account clear takes no LOGIN")
+        store.unbind(config.hostname, key)
+    elif args.login:
+        raise RuntimeError("account show takes no LOGIN")
+    account = resolve_account(config, store=store, persist=False) if args.action != "use" else None
+    if args.action == "use":
+        account = store.lookup(config.hostname, config.repository)
+    result = {
+        "repository": config.repository,
+        "hostname": config.hostname,
+        "login": account.login if account else None,
+        "source": account.source if account else "environment token",
+    }
+    if _emit_result(args, result):
+        return 0
+    field("Repository", config.repository)
+    field("Account", result["login"] or "(GH_TOKEN from the environment)")
+    field("Source", result["source"])
     return 0
 
 

@@ -102,15 +102,17 @@ class WorkerTests(unittest.TestCase):
         scoped = mock.Mock()
         with (
             mock.patch.dict(os.environ, {"GH_TOKEN": "ambient"}, clear=False),
-            mock.patch("kanbanlan.worker.Runner", side_effect=[token_runner, scoped]) as runner,
+            mock.patch("kanbanlan.accounts.Runner", return_value=token_runner) as lookup,
+            mock.patch("kanbanlan.worker.Runner", return_value=scoped) as runner,
         ):
             result = scoped_runner(registration)
 
         self.assertIs(scoped, result)
-        token_lookup_env = runner.call_args_list[0].kwargs["env"]
+        token_lookup_env = lookup.call_args.kwargs["env"]
         self.assertIsNone(token_lookup_env["GH_TOKEN"])
         self.assertIsNone(token_lookup_env["GITHUB_TOKEN"])
-        self.assertEqual("selected", runner.call_args_list[1].kwargs["env"]["GH_TOKEN"])
+        self.assertIn("alice", token_runner.run.call_args.args[0])
+        self.assertEqual("selected", runner.call_args.kwargs["env"]["GH_TOKEN"])
 
     def test_successful_iteration_refreshes_plans_and_resets_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
