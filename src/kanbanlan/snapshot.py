@@ -262,6 +262,35 @@ def _link_pull_requests(
     return linked, sorted(problems, key=lambda value: value["pull_request"])
 
 
+def select_ready(items: list[dict[str, Any]], repository: str) -> list[dict[str, Any]]:
+    """Return this repository's unclaimed Ready requests in queue order."""
+
+    ready = [
+        item
+        for item in items
+        if item.get("type") == "ISSUE"
+        and item.get("repository") in (repository, None)
+        and item.get("state") == "OPEN"
+        and item.get("status") == "Ready"
+        and not item.get("active_claim")
+    ]
+    ready.sort(
+        key=lambda item: (
+            PRIORITY_ORDER.get(item.get("priority"), len(PRIORITY_ORDER)),
+            item.get("number") if item.get("number") is not None else sys.maxsize,
+        )
+    )
+    return ready
+
+
+def count_statuses(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        status = item.get("status") or "Unspecified"
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def build_snapshot(
     config: Config,
     project: dict[str, Any],
@@ -408,21 +437,7 @@ def build_snapshot(
 
     # Queue selection stays repository-local even under project scope so a
     # shared Project never hands one repository another repository's work.
-    ready = [
-        item
-        for item in items
-        if item["type"] == "ISSUE"
-        and item.get("repository") in (config.repository, None)
-        and item.get("state") == "OPEN"
-        and item.get("status") == "Ready"
-        and not item.get("active_claim")
-    ]
-    ready.sort(
-        key=lambda item: (
-            PRIORITY_ORDER.get(item.get("priority"), len(PRIORITY_ORDER)),
-            item.get("number", sys.maxsize),
-        )
-    )
+    ready = select_ready(items, config.repository)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -471,6 +486,11 @@ def build_snapshot(
     }
 
 
+# How many staleness windows a snapshot may serve local reads for while a
+# background refresh replaces it.
+SERVE_STALE_FACTOR = 10
+
+
 class CacheStore:
     def __init__(self, config: Config, directory: Path):
         self.config = config
@@ -479,6 +499,10 @@ class CacheStore:
         self.health_path = directory / "health.json"
         self.lock_path = directory / "refresh.lock"
         self.invalidated_path = directory / "invalidated.json"
+        self.open_requests_path = directory / "open_requests.json"
+        # Project scope stays out of snapshot.json, whose contract is
+        # repository scope; this copy only answers project-scope reads.
+        self.project_snapshot_path = directory / "project_snapshot.json"
 
     def refresh(self, client: Any) -> dict[str, Any]:
         """Return a snapshot read after this call began.
@@ -497,6 +521,43 @@ class CacheStore:
                 assert snapshot is not None
                 return snapshot
             return self._refresh_locked(client)
+
+    def serveable(self, snapshot: dict[str, Any] | None) -> bool:
+        """Report whether a snapshot may answer a local read without GitHub.
+
+        A stale snapshot still serves while a background refresh replaces
+        it, but only within ``SERVE_STALE_FACTOR`` staleness windows: past
+        that it is too old to decide anything, and the caller waits.
+        """
+
+        if not self._usable(snapshot):
+            return False
+        age = self._snapshot_age(snapshot)
+        return age is not None and age <= self.config.stale_seconds * SERVE_STALE_FACTOR
+
+    def needs_revalidation(self, snapshot: dict[str, Any] | None) -> bool:
+        return self._snapshot_state(snapshot) != "fresh" and not self.rate_limit_deferral(snapshot)
+
+    def write_open_requests(self, open_requests: list[dict[str, Any]]) -> None:
+        self._prepare_directory()
+        self._write_json(
+            self.open_requests_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": isoformat(utc_now()),
+                "requests": open_requests,
+            },
+        )
+
+    def open_requests(self) -> dict[str, Any] | None:
+        return self._read_json(self.open_requests_path)
+
+    def write_project_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._prepare_directory()
+        self._write_json(self.project_snapshot_path, snapshot)
+
+    def project_snapshot(self) -> dict[str, Any] | None:
+        return self._read_json(self.project_snapshot_path)
 
     def invalidate(self) -> None:
         """Mark the current snapshot stale without paying for a refresh.

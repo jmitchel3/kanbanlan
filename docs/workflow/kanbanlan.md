@@ -21,7 +21,11 @@ kanbanlan reconcile
 kanbanlan --json next
 ```
 
-`ensure` refreshes a private local cache shared by Git worktrees.
+`ensure` serves a private local cache shared by Git worktrees and refreshes it
+in the background when stale. Lifecycle commands record their change locally
+and return; `kanbanlan sync` shows changes still being applied to GitHub and
+any that failed, which block further changes to that request until retried or
+dismissed.
 `reconcile` reports drift between request status, identity, active claims, pull
 requests, and projections. It also reports requests that need a Kanbanlan ID.
 Use `kanbanlan reconcile --apply` only after reviewing the plan. `--json`

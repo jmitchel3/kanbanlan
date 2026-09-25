@@ -32,7 +32,13 @@ def read_board(
     with ThreadPoolExecutor(max_workers=1) as executor:
         open_requests = executor.submit(provider.list_open_requests)
         snapshot = store.refresh(provider)
-        return snapshot, open_requests.result()
+        requests = open_requests.result()
+    # Kept beside the snapshot so a clean reconcile check can answer locally.
+    try:
+        store.write_open_requests(requests)
+    except (AttributeError, OSError):
+        pass
+    return snapshot, requests
 
 
 @dataclass(frozen=True)

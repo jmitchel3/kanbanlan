@@ -13,6 +13,10 @@ def _foreground_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     """
 
     monkeypatch.setenv("KANBANLAN_BACKGROUND_REFRESH", "0")
+    # Likewise, lifecycle commands run live unless a test opts into the
+    # local-first path.
+    monkeypatch.setenv("KANBANLAN_WRITE_BEHIND", "0")
+    monkeypatch.delenv("KANBANLAN_SYNC_EXECUTOR", raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
@@ -37,7 +38,19 @@ from kanbanlan.config import (
 )
 from kanbanlan.domain import request_label, resolve_request_item
 from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
-from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id
+from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id, normalize_kanbanlan_id
+from kanbanlan.outbox import (
+    FAILED,
+    PENDING_STATES,
+    QUEUED,
+    RUNNING,
+    Intent,
+    Outbox,
+    drain_outbox,
+    overlay,
+    pending_item,
+    write_behind_enabled,
+)
 from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
@@ -52,7 +65,7 @@ from kanbanlan.sessions import (
     hook_workspaces,
     session_from_hook_payload,
 )
-from kanbanlan.snapshot import SCOPE_PROJECT, CacheStore, utc_now
+from kanbanlan.snapshot import SCHEMA_VERSION, SCOPE_PROJECT, CacheStore, utc_now
 from kanbanlan.ui import (
     BOLD,
     CYAN,
@@ -120,6 +133,7 @@ COMMAND_NAMES = (
     "session-hook",
     "record",
     "worker",
+    "sync",
     "account",
 )
 
@@ -307,7 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("upgrade", help="upgrade Kanbanlan to the latest release")
     commands.add_parser("doctor", help="check local config, auth, fields, and labels")
     commands.add_parser("ensure", help="ensure the shared snapshot is fresh")
-    commands.add_parser("refresh", help="refresh the shared snapshot now")
+    refresh_command = commands.add_parser("refresh", help="refresh the shared snapshot now")
+    _add_project_scope_argument(refresh_command)
     status_command = commands.add_parser("status", help="show local cache and board summary")
     _add_project_scope_argument(status_command)
     snapshot_command = commands.add_parser("snapshot", help="print the current snapshot JSON")
@@ -340,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture = commands.add_parser("capture", help="create an Inbox request card")
     capture.add_argument("title", help="issue title")
     capture.add_argument("--body", default="", help="issue body; defaults to an outcome template")
+    # Set by the sync drainer so a queued capture keeps the ID it was given.
+    capture.add_argument("--kanbanlan-id", help=argparse.SUPPRESS)
     capture.add_argument(
         "--priority",
         choices=tuple(PRIORITY_LABELS),
@@ -474,6 +491,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="worker polling interval in seconds (default: 300)",
     )
     worker.add_argument("--once", action="store_true", help="run one worker iteration and exit")
+
+    sync = commands.add_parser(
+        "sync",
+        help="show, apply, retry, or dismiss lifecycle changes queued for GitHub",
+    )
+    sync_action = sync.add_mutually_exclusive_group()
+    sync_action.add_argument(
+        "--drain", action="store_true", help="apply every queued change now and wait"
+    )
+    sync_action.add_argument("--retry", metavar="ID", help="queue one failed change again")
+    sync_action.add_argument(
+        "--dismiss", metavar="ID", help="drop one failed change, or 'all' failed changes"
+    )
 
     account = commands.add_parser(
         "account",
@@ -1291,10 +1321,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_ensure(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
-    with status("Ensuring the shared board snapshot is fresh"):
-        snapshot = store.ensure(provider)
+    root, _, provider, store = _context(args)
+    snapshot = store.snapshot()
+    if write_behind_enabled() and store.serveable(snapshot):
+        # Serve locally now; a detached refresh replaces a stale snapshot.
+        assert snapshot is not None
+        if store.needs_revalidation(snapshot):
+            _spawn_refresh(root)
+    else:
+        with status("Ensuring the shared board snapshot is fresh"):
+            snapshot = store.ensure(provider)
     inspection = store.inspect()
+    outbox = Outbox(store.directory)
     if _emit_result(
         args,
         {
@@ -1303,10 +1341,12 @@ def _cmd_ensure(args: argparse.Namespace) -> int:
             "snapshot_state": inspection["snapshot_state"],
             "refresh_status": inspection["refresh_status"],
             "rate_limit": snapshot.get("rate_limit"),
+            "sync": _sync_summary(outbox),
         },
     ):
         return 0
     _warn_stale_service(store, snapshot, inspection)
+    _warn_sync_failures(outbox)
     print(store.snapshot_path)
     return 0
 
@@ -1319,6 +1359,9 @@ def _warn_stale_service(
     """Say why ensure kept a stale snapshot instead of refreshing it."""
 
     if inspection["snapshot_state"] == "fresh":
+        return
+    if write_behind_enabled() and store.serveable(snapshot):
+        # Served locally while a background refresh replaces it; not a fault.
         return
     deferral = store.rate_limit_deferral(snapshot)
     if deferral:
@@ -1336,8 +1379,14 @@ def _warn_stale_service(
 
 def _cmd_refresh(args: argparse.Namespace) -> int:
     _, _, provider, store = _context(args)
+    if getattr(args, "project_scope", False):
+        snapshot = _project_snapshot(provider, "Refreshing the project-scope snapshot", store)
+        if _emit_result(args, {"generated_at": snapshot["generated_at"], "scope": "project"}):
+            return 0
+        print(f"refreshed {store.project_snapshot_path} at {snapshot['generated_at']}")
+        return 0
     with status("Refreshing the shared board snapshot"):
-        snapshot = store.refresh(provider)
+        snapshot, _ = read_board(store, provider)
     if _emit_result(
         args,
         {"snapshot_path": str(store.snapshot_path), "generated_at": snapshot["generated_at"]},
@@ -1347,11 +1396,17 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
-def _project_snapshot(provider: CoordinationProvider, label: str) -> dict[str, Any]:
+def _project_snapshot(
+    provider: CoordinationProvider,
+    label: str,
+    store: CacheStore | None = None,
+) -> dict[str, Any]:
     """Read the whole Project live without disturbing the repository cache.
 
     The shared cache is repository-scoped by contract, so a project-scoped read
-    stays in memory. Every project scope command is read-only.
+    never touches it; given a store, the read is kept in its separate
+    project-scope copy for later local reads. Every project scope command is
+    read-only.
     """
 
     if not provider.capabilities.project_scope:
@@ -1359,7 +1414,34 @@ def _project_snapshot(provider: CoordinationProvider, label: str) -> dict[str, A
             f"canonical home {provider.provider_name!r} does not support project scope"
         )
     with status(label):
-        return provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+        snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+    if store is not None:
+        try:
+            store.write_project_snapshot(snapshot)
+        except OSError:
+            pass
+    return snapshot
+
+
+def _project_view(
+    root: Path,
+    provider: CoordinationProvider,
+    store: CacheStore,
+    label: str,
+) -> dict[str, Any]:
+    """Return the project-scope view, locally when a recent copy exists."""
+
+    if not write_behind_enabled():
+        return _project_snapshot(provider, label, store)
+    if not provider.capabilities.project_scope:
+        return _project_snapshot(provider, label)
+    snapshot = store.project_snapshot()
+    if not store.serveable(snapshot):
+        return _project_snapshot(provider, label, store)
+    assert snapshot is not None
+    if store.needs_revalidation(snapshot):
+        _spawn_refresh(root, project=True)
+    return overlay(snapshot, Outbox(store.directory).pending())
 
 
 def _project_source(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1406,6 +1488,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return _cmd_status_project(args)
     _, _, _, store = _context(args)
     inspection = store.inspect()
+    outbox = Outbox(store.directory)
+    sync = _sync_summary(outbox)
+    snapshot = store.snapshot()
+    if snapshot is not None and sync["pending"]:
+        view = overlay(snapshot, outbox.pending())
+        inspection["status_counts"] = view["status_counts"]
+        inspection["next_ready"] = view.get("next_ready")
+    inspection["sync"] = sync
     if _emit_result(args, inspection):
         return 0
     heading("Kanbanlan status")
@@ -1427,8 +1517,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
         field("Rate limit", f"{rate['remaining']} GraphQL points remaining{reset}")
     if inspection.get("refresh_status") == "throttled":
         warning("the last refresh was rate limited; the snapshot may lag the live board")
+    if sync["pending"]:
+        field("Sync", f"{sync['pending']} change(s) queued for GitHub")
     if inspection["error"]:
         warning(f"Last refresh: {inspection['error']['kind']}: {inspection['error']['message']}")
+    _warn_sync_failures(outbox)
     return 0
 
 
@@ -1481,8 +1574,8 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
 
 
 def _cmd_overlap(args: argparse.Namespace) -> int:
-    _, config, provider, _ = _context(args)
-    snapshot = _project_snapshot(provider, "Checking every open card and pull request")
+    root, config, provider, store = _context(args)
+    snapshot = _project_view(root, provider, store, "Checking every open card and pull request")
     source = _project_source(snapshot)
     requests = [
         {
@@ -1566,9 +1659,8 @@ def _cmd_path(args: argparse.Namespace) -> int:
 
 
 def _cmd_next(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
-    with status("Finding the next unblocked Ready card"):
-        snapshot = store.ensure(provider)
+    root, _, provider, store = _context(args)
+    snapshot = _local_view(root, store, provider, label="Finding the next unblocked Ready card")
     item = snapshot.get("next_ready")
     if not item:
         if _emit_result(args, {"request": None}):
@@ -1584,10 +1676,31 @@ def _cmd_next(args: argparse.Namespace) -> int:
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
-    with status("Loading current Project and issue state"):
-        snapshot, open_issues = read_board(store, provider)
-    drift = plan_reconciliation(snapshot, open_issues)
+    root, _, provider, store = _context(args)
+    drift = None
+    if write_behind_enabled() and not args.apply:
+        # A clean check answers from the local copies; any drift is
+        # re-confirmed live, so a repair is never proposed from stale state.
+        snapshot = store.snapshot()
+        cached = store.open_requests()
+        if (
+            store.serveable(snapshot)
+            and cached
+            and cached.get("schema_version") == SCHEMA_VERSION
+            and isinstance(cached.get("requests"), list)
+            and store.serveable(cached)
+        ):
+            assert snapshot is not None
+            open_issues = cached["requests"]
+            drift = plan_reconciliation(snapshot, open_issues)
+            if drift:
+                drift = None
+            elif store.needs_revalidation(snapshot):
+                _spawn_refresh(root)
+    if drift is None:
+        with status("Loading current Project and issue state"):
+            snapshot, open_issues = read_board(store, provider)
+        drift = plan_reconciliation(snapshot, open_issues)
     if not args.json_output:
         _warn_linkage_problems(snapshot)
     if not drift:
@@ -1905,11 +2018,20 @@ def _reconcile_captured_request(
     return item
 
 
-def _cmd_capture(args: argparse.Namespace) -> int:
+def _capture_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     target, preparation = _capture_target(args, config, provider)
     kanbanlan_id = new_kanbanlan_id()
+    if getattr(args, "kanbanlan_id", None):
+        kanbanlan_id = normalize_kanbanlan_id(args.kanbanlan_id)
+        if not kanbanlan_id:
+            raise RuntimeError(f"invalid Kanbanlan ID {args.kanbanlan_id!r}")
+        # A queued capture replayed after an unknown outcome must not open
+        # a second issue for the same request.
+        existing = _existing_request(provider, store, kanbanlan_id, target, config)
+        if existing is not None:
+            return _emit_capture(args, existing, kanbanlan_id, target, config, None, actor)
     body = args.body or (
         "## Outcome\n\n"
         "<!-- Describe the independently reviewable result. -->\n\n"
@@ -1941,26 +2063,60 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     )
     if config.session_tracking_enabled() and target == config.repository:
         _refresh_after_mutation(root, store, provider)
+    item = {**item, "url": item.get("url") or url}
+    return _emit_capture(args, item, kanbanlan_id, target, config, preparation, actor)
+
+
+def _existing_request(
+    provider: CoordinationProvider,
+    store: CacheStore,
+    kanbanlan_id: str,
+    target: str,
+    config: Config,
+) -> dict[str, Any] | None:
+    if target == config.repository:
+        snapshot = store.refresh(provider)
+    else:
+        snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+    try:
+        return _issue(snapshot, kanbanlan_id)
+    except RuntimeError:
+        return None
+
+
+def _emit_capture(
+    args: argparse.Namespace,
+    item: dict[str, Any],
+    kanbanlan_id: str,
+    target: str,
+    config: Config,
+    preparation: dict[str, Any] | None,
+    actor: AgentSession | None,
+    sync: dict[str, Any] | None = None,
+) -> int:
+    url = item.get("url")
     result = {
         "kanbanlan_id": kanbanlan_id,
         "repository": target,
-        "provider_ref": item.get("provider_ref"),
+        "provider_ref": item.get("provider_ref") if item.get("number") is not None else None,
         "canonical_url": item.get("canonical_url") or url,
         "url": url,
         "routed": target != config.repository,
         "project_link": preparation,
         "actor_session": actor.to_dict() if actor else None,
     }
+    if sync is not None:
+        result["sync"] = sync
     if _emit_result(args, result):
         return 0
     print(f"Kanbanlan: {kanbanlan_id}")
     if target != config.repository:
         print(f"repository: {target}")
-    print(url)
+    print(url or "issue: queued for GitHub (kanbanlan sync shows progress)")
     return 0
 
 
-def _cmd_triage(args: argparse.Namespace) -> int:
+def _triage_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking request {args.issue}"):
@@ -1995,7 +2151,7 @@ def _cmd_triage(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_claim(args: argparse.Namespace) -> int:
+def _claim_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking request {args.issue}"):
@@ -2105,9 +2261,17 @@ def _claim_checkout(
     return branch, str(worktree)
 
 
-def _create_worktree(root: Path, config: Config, branch: str, worktree: Path) -> None:
+def _create_worktree(
+    root: Path,
+    config: Config,
+    branch: str,
+    worktree: Path,
+    *,
+    fetch: bool = True,
+) -> None:
     runner = Runner(root)
-    runner.run(["git", "fetch", "origin", config.default_branch])
+    if fetch:
+        runner.run(["git", "fetch", "origin", config.default_branch])
     branch_exists = (
         runner.run(
             ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
@@ -2130,7 +2294,7 @@ def _create_worktree(root: Path, config: Config, branch: str, worktree: Path) ->
     runner.run(args)
 
 
-def _cmd_release(args: argparse.Namespace) -> int:
+def _release_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
@@ -2289,7 +2453,7 @@ def _reconcile_rehomed_request(
     return item
 
 
-def _cmd_review(args: argparse.Namespace) -> int:
+def _review_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking pull requests for request {args.issue}"):
@@ -2349,7 +2513,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_close(args: argparse.Namespace) -> int:
+def _close_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     if not provider.capabilities.request_closing:
@@ -2423,7 +2587,7 @@ def _cmd_close(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_handoff(args: argparse.Namespace) -> int:
+def _handoff_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
@@ -2471,9 +2635,10 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
 
 
 def _cmd_sessions(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
-    with status(f"Loading session activity for request {args.request}"):
-        snapshot = store.ensure(provider)
+    root, _, provider, store = _context(args)
+    snapshot = _local_view(
+        root, store, provider, label=f"Loading session activity for request {args.request}"
+    )
     item = _issue(snapshot, args.request)
     history = _session_activity(item, action=args.action)
     result = {
@@ -2504,9 +2669,10 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    _, _, provider, store = _context(args)
-    with status(f"Loading resumable sessions for request {args.request}"):
-        snapshot = store.ensure(provider)
+    root, _, provider, store = _context(args)
+    snapshot = _local_view(
+        root, store, provider, label=f"Loading resumable sessions for request {args.request}"
+    )
     item = _issue(snapshot, args.request)
     history = _session_activity(item, action=args.action)
     resumable: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -2574,10 +2740,14 @@ def _session_activity(
 
 
 def _cmd_record(args: argparse.Namespace) -> int:
-    root, _, provider, store = _context(args)
-    with status(f"Loading request {args.request}"):
-        snapshot = store.ensure(provider)
+    root, config, provider, store = _context(args)
+    snapshot = _local_view(root, store, provider, label=f"Loading request {args.request}")
     item = _issue(snapshot, args.request)
+    if item.get("number") is None:
+        # A record names the canonical issue, which a queued capture lacks.
+        _drain_inline(root, config, store, provider)
+        with status(f"Loading request {args.request}"):
+            item = _issue(store.ensure(provider), args.request)
     result = create_record(root, item)
     payload = {
         "action": result.action,
@@ -2587,6 +2757,547 @@ def _cmd_record(args: argparse.Namespace) -> int:
     if _emit_result(args, payload):
         return 0
     print(f"{result.action}: {result.path.relative_to(root)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Local-first lifecycle commands
+#
+# Each lifecycle command below checks the local view (the shared snapshot
+# with pending changes laid over it) under the outbox lock, records its
+# change, starts the drainer, and returns. The drainer replays the change as
+# the ``_*_live`` command, which re-validates against GitHub. Anything the
+# local view cannot decide safely falls back to the live command, after
+# draining the queue first so the live command never overtakes a change
+# queued before it.
+# ---------------------------------------------------------------------------
+
+
+class _Fallback(Exception):
+    """The local view cannot decide this command; run it live."""
+
+
+@dataclass
+class _Plan:
+    kind: str
+    item: dict[str, Any] | None
+    argv: list[str]
+    effect: dict[str, Any]
+    result: dict[str, Any]
+    message: str
+    details: list[tuple[str, str]]
+    note: str | None = None
+    kanbanlan_id: str | None = None
+
+
+def _instant(args: argparse.Namespace, kind: str, planner: Any, live: Any) -> int:
+    if not write_behind_enabled():
+        return live(args)
+    root, config, provider, store = _context(args)
+    outbox = Outbox(store.directory)
+    try:
+        actor = _actor_session(args, root, config)
+        with outbox.arbitration():
+            snapshot = store.snapshot()
+            if not store.serveable(snapshot):
+                raise _Fallback()
+            assert snapshot is not None
+            view = overlay(snapshot, outbox.pending())
+            plan = planner(args, root, config, view, actor)
+            kanbanlan_id = plan.kanbanlan_id or (plan.item or {}).get("kanbanlan_id")
+            blocker = outbox.blocking_failure(kanbanlan_id)
+            if blocker is not None:
+                raise RuntimeError(
+                    f"an earlier {blocker.kind} of {blocker.label} failed to sync "
+                    f"({blocker.error}); resolve it with 'kanbanlan sync' first"
+                )
+            if actor is not None and "--actor-session" not in plan.argv:
+                plan.argv.extend(["--actor-session", actor.reference])
+            reference = kanbanlan_id or (plan.item or {}).get("provider_ref") or ""
+            intent = Intent.create(
+                kind=kind,
+                reference=reference,
+                label=request_label(plan.item) if plan.item else reference,
+                argv=plan.argv,
+                effect=plan.effect,
+                kanbanlan_id=kanbanlan_id,
+                note=plan.note,
+            )
+            outbox.write(intent)
+    except _Fallback:
+        _drain_inline(root, config, store, provider)
+        return live(args)
+    _start_sync(root)
+    sync = {"mode": "write-behind", "change": intent.id, "state": QUEUED}
+    if kind == "capture":
+        return _emit_capture(
+            args,
+            plan.item or {},
+            kanbanlan_id or "",
+            config.repository,
+            config,
+            None,
+            actor,
+            sync,
+        )
+    if _emit_result(args, {**plan.result, "sync": sync}):
+        return 0
+    success(plan.message)
+    for name, value in plan.details:
+        print(f"{name}: {value}")
+    _warn_sync_failures(outbox)
+    return 0
+
+
+def _local_item(view: dict[str, Any], reference: str) -> dict[str, Any]:
+    try:
+        return _issue(view, reference)
+    except RuntimeError:
+        # Not in the local view: it may be newer than the snapshot, so only
+        # GitHub can say.
+        raise _Fallback() from None
+
+
+def _plan_capture(args, root, config, view, actor) -> _Plan:
+    if getattr(args, "repository", None) or getattr(args, "kanbanlan_id", None):
+        raise _Fallback()
+    kanbanlan_id = new_kanbanlan_id()
+    body = args.body or (
+        "## Outcome\n\n"
+        "<!-- Describe the independently reviewable result. -->\n\n"
+        "## Acceptance criteria\n\n- [ ] "
+    )
+    item = pending_item(
+        kanbanlan_id=kanbanlan_id,
+        title=args.title,
+        body=attach_kanbanlan_id(body, kanbanlan_id),
+        priority=args.priority,
+        repository=config.repository,
+    )
+    argv = ["capture", args.title, "--priority", args.priority, "--kanbanlan-id", kanbanlan_id]
+    if args.body:
+        argv.extend(["--body", args.body])
+    return _Plan(
+        kind="capture",
+        item=item,
+        argv=argv,
+        effect={"create": item},
+        result={},
+        message="",
+        details=[],
+        kanbanlan_id=kanbanlan_id,
+    )
+
+
+def _plan_triage(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    label = request_label(item)
+    if item.get("state") != "OPEN":
+        raise RuntimeError(f"request {label} is not open")
+    if item.get("status") != "Inbox":
+        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Inbox")
+    return _Plan(
+        kind="triage",
+        item=item,
+        argv=["triage", _sync_reference(item)],
+        effect={"status": "Ready"},
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "status": "Ready",
+            "actor_session": actor.to_dict() if actor else None,
+        },
+        message=f"Moved {label} to Ready",
+        details=[],
+    )
+
+
+def _plan_claim(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    label = request_label(item)
+    if item.get("state") != "OPEN":
+        raise RuntimeError(f"request {label} is not open")
+    if item.get("status") != "Ready":
+        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Ready")
+    if item.get("active_claim"):
+        raise RuntimeError(f"request {label} already has an active claim")
+    session = args.session or (actor.reference if actor else None)
+    session = session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
+    title_item = item if item.get("number") is not None else {**item, "number": 0}
+    branch, worktree = _claim_checkout(args, root, config, title_item)
+    note = None
+    if not args.no_worktree:
+        with status(f"Creating worktree {worktree}"):
+            _create_worktree(root, config, branch, Path(worktree), fetch=_fetch_is_stale(root))
+        note = f"worktree {worktree} was created locally for this claim"
+    claim = {
+        "claimed_at": _utc_timestamp(),
+        "session": session,
+        "branch": branch,
+        "worktree": worktree,
+        "touchpoints": args.touchpoints,
+        "author": None,
+        "pending": True,
+    }
+    argv = [
+        "claim",
+        _sync_reference(item),
+        "--touchpoints",
+        args.touchpoints,
+        "--session",
+        session,
+        "--branch",
+        branch,
+        "--worktree",
+        worktree,
+        "--no-worktree",
+    ]
+    return _Plan(
+        kind="claim",
+        item=item,
+        argv=argv,
+        effect={"status": "In progress", "claim": claim},
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "provider_ref": item.get("provider_ref") if item.get("number") is not None else None,
+            "session": session,
+            "actor_session": actor.to_dict() if actor else None,
+            "branch": branch,
+            "worktree": worktree,
+        },
+        message=f"Claimed {label} as {session}",
+        details=[("branch", branch), ("worktree", worktree)],
+        note=note,
+    )
+
+
+def _plan_release(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    label = request_label(item)
+    claim = item.get("active_claim")
+    if not claim:
+        raise RuntimeError(f"request {label} has no active claim")
+    session = claim.get("session") or "unknown"
+    destination = "Blocked" if args.blocked else "Ready"
+    argv = ["release", _sync_reference(item), "--reason", args.reason]
+    if args.blocked:
+        argv.append("--blocked")
+    return _Plan(
+        kind="release",
+        item=item,
+        argv=argv,
+        effect={"status": destination, "claim": None},
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "session": session,
+            "status": destination,
+            "actor_session": actor.to_dict() if actor else None,
+        },
+        message=f"Released {label} from {session}",
+        details=[],
+    )
+
+
+def _plan_review(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    linked = item.get("linked_open_pull_requests") or []
+    if not linked:
+        # A pull request opened moments ago is not in the snapshot yet.
+        raise _Fallback()
+    label = request_label(item)
+    return _Plan(
+        kind="review",
+        item=item,
+        argv=["review", _sync_reference(item)],
+        effect={"status": "In review"},
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "status": "In review",
+            "actor_session": actor.to_dict() if actor else None,
+            "linked_open_pull_requests": [
+                {
+                    "provider_ref": pull_request["provider_ref"],
+                    "repository": pull_request["repository"],
+                    "url": pull_request["url"],
+                    "is_draft": pull_request.get("is_draft", False),
+                    "linked_by": pull_request.get("linked_by", []),
+                }
+                for pull_request in linked
+            ],
+        },
+        message=f"Moved {label} to In review",
+        details=[
+            (
+                pull_request["provider_ref"],
+                f"{pull_request['url']} ({', '.join(pull_request.get('linked_by', [])) or 'link'})",
+            )
+            for pull_request in linked
+        ],
+    )
+
+
+def _plan_close(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    label = request_label(item)
+    if item.get("state") == "CLOSED":
+        raise RuntimeError(
+            f"request {label} is already closed; "
+            "run 'kanbanlan reconcile --apply' to settle its projection"
+        )
+    linked = item.get("linked_open_pull_requests") or []
+    if linked and not args.force:
+        references = ", ".join(pull_request["provider_ref"] for pull_request in linked)
+        raise RuntimeError(
+            f"request {label} still has an open pull request ({references}); "
+            "merge or close it first, or pass --force to close the request anyway"
+        )
+    reason = "not_planned" if args.not_planned else "completed"
+    claim = item.get("active_claim") or {}
+    session = claim.get("session") or claim.get("author")
+    argv = ["close", _sync_reference(item), "--reason", args.reason]
+    if args.not_planned:
+        argv.append("--not-planned")
+    if args.force:
+        argv.append("--force")
+    return _Plan(
+        kind="close",
+        item=item,
+        argv=argv,
+        effect={"status": "Done", "state": "CLOSED", "claim": None},
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "status": "Done",
+            "close_reason": reason,
+            "released_session": session,
+            "actor_session": actor.to_dict() if actor else None,
+        },
+        message=f"Closed {label} as {reason.replace('_', ' ')}",
+        details=[("released", session)] if session else [],
+    )
+
+
+def _plan_handoff(args, root, config, view, actor) -> _Plan:
+    item = _local_item(view, args.issue)
+    label = request_label(item)
+    claim = item.get("active_claim")
+    if not claim:
+        raise RuntimeError(f"request {label} has no active claim")
+    worktree = str(Path(args.worktree).resolve())
+    return _Plan(
+        kind="handoff",
+        item=item,
+        argv=[
+            "handoff",
+            _sync_reference(item),
+            "--session",
+            args.session,
+            "--branch",
+            args.branch,
+            "--worktree",
+            worktree,
+            "--reason",
+            args.reason,
+        ],
+        effect={
+            "status": "In progress",
+            "claim": {
+                **claim,
+                "session": args.session,
+                "branch": args.branch,
+                "worktree": worktree,
+            },
+        },
+        result={
+            "kanbanlan_id": item.get("kanbanlan_id"),
+            "session": args.session,
+            "actor_session": actor.to_dict() if actor else None,
+        },
+        message=f"Handed off {label} to {args.session}",
+        details=[],
+    )
+
+
+def _sync_reference(item: dict[str, Any]) -> str:
+    return item.get("kanbanlan_id") or item["provider_ref"]
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    return _instant(args, "capture", _plan_capture, _capture_live)
+
+
+def _cmd_triage(args: argparse.Namespace) -> int:
+    return _instant(args, "triage", _plan_triage, _triage_live)
+
+
+def _cmd_claim(args: argparse.Namespace) -> int:
+    if args.no_worktree:
+        return _claim_live(args)
+    return _instant(args, "claim", _plan_claim, _claim_live)
+
+
+def _cmd_release(args: argparse.Namespace) -> int:
+    return _instant(args, "release", _plan_release, _release_live)
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    return _instant(args, "review", _plan_review, _review_live)
+
+
+def _cmd_close(args: argparse.Namespace) -> int:
+    return _instant(args, "close", _plan_close, _close_live)
+
+
+def _cmd_handoff(args: argparse.Namespace) -> int:
+    return _instant(args, "handoff", _plan_handoff, _handoff_live)
+
+
+def _fetch_is_stale(root: Path, max_age_seconds: float = 300.0) -> bool:
+    """Report whether the default branch needs fetching before branching from it.
+
+    A claim branches from ``origin/<default>``; a fetch within the last few
+    minutes is current enough, and skipping it keeps the claim local.
+    """
+
+    try:
+        fetched = (common_dir(root) / "FETCH_HEAD").stat().st_mtime
+    except (OSError, CommandError, RuntimeError):
+        return True
+    return time.time() - fetched > max_age_seconds
+
+
+def _start_sync(root: Path) -> None:
+    """Start a detached drainer; it exits at once if another is running."""
+
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "kanbanlan", "-C", str(root), "--json", "sync", "--drain"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _spawn_refresh(root: Path, *, project: bool = False) -> None:
+    command = [sys.executable, "-m", "kanbanlan", "-C", str(root), "--json", "refresh"]
+    if project:
+        command.append("--project")
+    try:
+        subprocess.Popen(
+            command,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _drain_inline(
+    root: Path,
+    config: Config,
+    store: CacheStore,
+    provider: CoordinationProvider,
+) -> None:
+    """Apply every queued change before a live command, waiting for any drainer."""
+
+    outbox = Outbox(store.directory)
+    if not any(value.state in (QUEUED, RUNNING) for value in outbox.intents()):
+        return
+    with status("Applying queued changes to GitHub first"):
+        drain_outbox(root, store, provider, wait=900.0)
+
+
+def _warn_sync_failures(outbox: Outbox) -> None:
+    for intent in outbox.failed():
+        note = f"; {intent.note}" if intent.note else ""
+        warning(
+            f"{intent.kind} of {intent.label} did not sync ({intent.error}{note}); "
+            f"run 'kanbanlan sync' to retry or dismiss change {intent.id}"
+        )
+
+
+def _sync_summary(outbox: Outbox) -> dict[str, Any]:
+    intents = outbox.intents()
+    return {
+        "pending": sum(1 for value in intents if value.state in PENDING_STATES),
+        "failed": [
+            {"id": value.id, "kind": value.kind, "request": value.label, "error": value.error}
+            for value in intents
+            if value.state == FAILED
+        ],
+    }
+
+
+def _local_view(
+    root: Path,
+    store: CacheStore,
+    provider: CoordinationProvider,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Return the snapshot plus pending changes, revalidating in the background.
+
+    Only a missing or unreadable snapshot makes the caller wait for GitHub.
+    """
+
+    if not write_behind_enabled():
+        with status(label):
+            return store.ensure(provider)
+    snapshot = store.snapshot()
+    if not store.serveable(snapshot):
+        with status(label):
+            snapshot = store.ensure(provider)
+    elif store.needs_revalidation(snapshot):
+        _spawn_refresh(root)
+    assert snapshot is not None
+    return overlay(snapshot, Outbox(store.directory).pending())
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    root, _, provider, store = _context(args)
+    outbox = Outbox(store.directory)
+    if args.drain:
+        if args.json_output:
+            drain_outbox(root, store, provider)
+        else:
+            with status("Applying queued changes to GitHub"):
+                drain_outbox(root, store, provider, wait=900.0)
+    elif args.retry:
+        with outbox.arbitration():
+            intent = outbox.find(args.retry)
+            if intent.state != FAILED:
+                raise RuntimeError(f"change {intent.id} is {intent.state}, not failed")
+            intent.state = QUEUED
+            intent.error = None
+            intent.finished_at = None
+            outbox.write(intent)
+        _start_sync(root)
+    elif args.dismiss:
+        with outbox.arbitration():
+            targets = outbox.failed() if args.dismiss == "all" else [outbox.find(args.dismiss)]
+            for intent in targets:
+                if intent.state != FAILED:
+                    raise RuntimeError(f"change {intent.id} is {intent.state}, not failed")
+                outbox.remove(intent)
+    intents = outbox.intents()
+    payload = {"changes": [value.to_dict() for value in intents]}
+    if _emit_result(args, payload):
+        return 0
+    if not intents:
+        print("No lifecycle changes are waiting to sync.")
+        return 0
+    for intent in intents:
+        section(f"{intent.id} {intent.kind} {intent.label} [{intent.state}]")
+        field("Queued", intent.created_at)
+        if intent.error:
+            field("Error", intent.error)
+        if intent.note and intent.state == FAILED:
+            field("Note", intent.note)
     return 0
 
 
@@ -2606,8 +3317,13 @@ def _refresh_after_mutation(
     keeps the refresh in the foreground.
     """
 
-    if os.environ.get("KANBANLAN_BACKGROUND_REFRESH", "1") == "0":
+    mode = os.environ.get("KANBANLAN_BACKGROUND_REFRESH", "1")
+    if mode == "0":
         store.refresh(provider)
+        return
+    if mode == "skip":
+        # The sync drainer refreshes once after the whole batch it applied.
+        store.invalidate()
         return
     store.invalidate()
     try:

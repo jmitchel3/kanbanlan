@@ -20,6 +20,7 @@ from kanbanlan.locks import pid_running as _pid_running
 from kanbanlan.locks import release_owner_record, write_owner_record
 from kanbanlan.locks import remove_stale_lock as _remove_stale_lock
 from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
+from kanbanlan.outbox import drain_outbox
 from kanbanlan.registry import Registration, RegistryStore, utc_now
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
@@ -184,6 +185,10 @@ class Worker:
             runner = scoped_runner(registration)
             provider = GitHub(root, config, runner=runner)
             store = CacheStore(config, cache_dir(root))
+            # Changes a session queued are normally drained at once by a
+            # process that session started; this catches any that process
+            # never finished. Another drainer already running wins.
+            drain_outbox(root, store, provider)
             snapshot, open_issues = read_board(store, provider)
             drift = plan_reconciliation(snapshot, open_issues)
             unsafe = [value for value in drift if value.kind == "duplicate_kanbanlan_id"]

@@ -137,6 +137,7 @@ class WorkerTests(unittest.TestCase):
                 mock.patch("kanbanlan.worker.GitHub", return_value=provider),
                 mock.patch("kanbanlan.worker.cache_dir", return_value=Path(directory) / "cache"),
                 mock.patch("kanbanlan.worker.CacheStore", return_value=cache),
+                mock.patch("kanbanlan.worker.drain_outbox"),
                 mock.patch("kanbanlan.worker.plan_reconciliation", return_value=[]),
             ):
                 result = Worker(store).run_once()
@@ -171,6 +172,7 @@ class WorkerTests(unittest.TestCase):
                 mock.patch("kanbanlan.worker.GitHub", return_value=provider),
                 mock.patch("kanbanlan.worker.cache_dir", return_value=Path(directory) / "cache"),
                 mock.patch("kanbanlan.worker.CacheStore", return_value=cache),
+                mock.patch("kanbanlan.worker.drain_outbox"),
                 mock.patch(
                     "kanbanlan.worker.plan_reconciliation",
                     side_effect=[[drift], []],
