@@ -394,17 +394,29 @@ def execute_intent(root: Path) -> Callable[[Intent], Execution]:
 
 
 def _executor_error(stderr: str, stdout: str) -> str:
+    """Return the failed child command's own error message.
+
+    ``--json`` errors are one indented JSON document, possibly after other
+    output, so the parse starts at every line that opens an object rather
+    than trusting any single line.
+    """
+
+    decoder = json.JSONDecoder()
     for stream in (stderr, stdout):
-        for line in reversed(stream.strip().splitlines()):
+        text = stream.strip()
+        starts = [index for index, char in enumerate(text) if char == "{"]
+        for start in reversed(starts):
+            if start and text[start - 1] != "\n":
+                continue
             try:
-                payload = json.loads(line)
+                payload, _ = decoder.raw_decode(text, start)
             except json.JSONDecodeError:
                 continue
-            message = (
-                (payload.get("error") or {}).get("message") if isinstance(payload, dict) else None
-            )
+            error = payload.get("error") if isinstance(payload, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
             if message:
-                return message
+                hint = error.get("hint")
+                return f"{message} ({hint})" if hint else message
     detail = (stderr.strip() or stdout.strip()).splitlines()
     return detail[-1] if detail else "failed without output"
 

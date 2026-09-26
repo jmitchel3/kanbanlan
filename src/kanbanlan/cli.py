@@ -2003,7 +2003,9 @@ def _reconcile_captured_request(
     """Bring one freshly created request to Inbox in the repository that owns it."""
 
     if target == config.repository:
-        snapshot, open_issues = read_board(store, provider)
+        snapshot, open_issues = _await_request(
+            lambda: read_board(store, provider), lambda read: read[0], kanbanlan_id
+        )
         remaining, refreshed = apply_reconciliation(provider, store, snapshot, open_issues)
         if remaining:
             raise RuntimeError("its Project state did not reconcile")
@@ -2011,11 +2013,36 @@ def _reconcile_captured_request(
     # A peer repository owns this request, so repository-scoped reconciliation
     # cannot see it. Set exactly this request's initial state instead of
     # reconciling a repository this session does not own.
-    snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
+    snapshot = _await_request(
+        lambda: provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT),
+        lambda read: read,
+        kanbanlan_id,
+    )
     item = _issue(snapshot, kanbanlan_id)
     provider.set_request_status(item["number"], "status:intake", repository=target)
     provider.set_projection_status(item["project_item_id"], snapshot["project"], "Inbox")
     return item
+
+
+# GitHub can list a just-added Project item a few seconds late. A capture
+# that gave up at once would leave a created issue behind a failed command,
+# so the read after creation is retried for about ten seconds first.
+CAPTURE_VISIBILITY_DELAYS = (1.0, 2.0, 3.0, 4.0)
+
+
+def _await_request(read: Any, snapshot_of: Any, kanbanlan_id: str) -> Any:
+    """Repeat ``read`` until its snapshot lists ``kanbanlan_id``, or give up."""
+
+    for delay in (*CAPTURE_VISIBILITY_DELAYS, None):
+        value = read()
+        try:
+            _issue(snapshot_of(value), kanbanlan_id)
+            return value
+        except RuntimeError:
+            if delay is None:
+                return value
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _capture_live(args: argparse.Namespace) -> int:
