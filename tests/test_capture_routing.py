@@ -220,6 +220,11 @@ class CaptureRoutingTests(unittest.TestCase):
         if projection_error is not None:
             provider.add_to_projection.side_effect = projection_error
         store = mock.Mock()
+        # The repository path reads the board until the new request is listed.
+        store.refresh.return_value = project_snapshot(
+            "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA", repository=LOCAL
+        )
+        provider.list_open_requests.return_value = []
 
         captured: dict[str, Any] = {}
 

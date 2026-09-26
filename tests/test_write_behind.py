@@ -505,3 +505,43 @@ class ExecutorTests(unittest.TestCase):
 
         provider.create_request.assert_not_called()
         self.assertEqual(ALPHA, json.loads(stdout.getvalue())["result"]["kanbanlan_id"])
+
+
+class FailureDetailTests(unittest.TestCase):
+    def test_an_indented_json_error_after_other_output_keeps_its_message(self) -> None:
+        from kanbanlan.outbox import _executor_error
+
+        error = {"ok": False, "error": {"kind": "RuntimeError", "message": "boom", "hint": "retry"}}
+        stderr = "→ Creating issue\n" + json.dumps(error, indent=2, sort_keys=True) + "\n"
+
+        self.assertEqual("boom (retry)", _executor_error(stderr, ""))
+
+    def test_a_message_containing_braces_is_not_split(self) -> None:
+        from kanbanlan.outbox import _executor_error
+
+        stderr = json.dumps({"error": {"message": "bad {value}\n}"}}, indent=2)
+
+        self.assertEqual("bad {value}\n}", _executor_error(stderr, ""))
+
+
+class CaptureVisibilityTests(unittest.TestCase):
+    def test_capture_waits_for_github_to_list_the_new_request(self) -> None:
+        reads = iter([snapshot([]), snapshot([]), snapshot([item(74, ALPHA, "Inbox")])])
+        with mock.patch.object(cli.time, "sleep") as sleep:
+            value = cli._await_request(lambda: next(reads), lambda read: read, ALPHA)
+
+        self.assertEqual(74, cli._issue(value, ALPHA)["number"])
+        self.assertEqual([mock.call(1.0), mock.call(2.0)], sleep.call_args_list)
+
+    def test_capture_stops_waiting_after_a_bounded_time(self) -> None:
+        reads: list[int] = []
+
+        def read() -> dict[str, Any]:
+            reads.append(1)
+            return snapshot([])
+
+        with mock.patch.object(cli.time, "sleep") as sleep:
+            cli._await_request(read, lambda value: value, ALPHA)
+
+        self.assertEqual(len(cli.CAPTURE_VISIBILITY_DELAYS) + 1, len(reads))
+        self.assertEqual(10.0, sum(call.args[0] for call in sleep.call_args_list))
