@@ -42,6 +42,7 @@ def is_transient_failure(result: CommandResult) -> bool:
 RATE_LIMIT_MARKERS = (
     "rate_limited",
     "api rate limit exceeded",
+    "api rate limit already exceeded",
     "secondary rate limit",
     "was submitted too quickly",
     "(http 429)",

@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -382,6 +383,67 @@ class _CountingClient:
 
 
 class RateLimitBehaviorTests(unittest.TestCase):
+    def test_live_refresh_defers_without_fetching_and_recovers_after_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            low = _stale_snapshot(10, 1800)
+            store._write_json(store.snapshot_path, low)
+            client = _CountingClient()
+
+            with self.assertRaises(RateLimitError) as raised:
+                store.refresh(client)
+
+            reset_at = low["rate_limit"]["resetAt"]
+            self.assertEqual(reset_at, raised.exception.reset_at)
+            self.assertEqual(0, client.fetches)
+            self.assertEqual(low, store.snapshot())
+            self.assertEqual("throttled", store.inspect()["refresh_status"])
+
+            with mock.patch(
+                "kanbanlan.snapshot.utc_now",
+                return_value=datetime.now(UTC) + timedelta(seconds=1801),
+            ):
+                store.refresh(client)
+            self.assertEqual(1, client.fetches)
+            self.assertEqual("ok", store.inspect()["refresh_status"])
+
+    def test_upstream_refusal_persists_cooldown_across_store_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            stale = _stale_snapshot(4000, 1800)
+            store._write_json(store.snapshot_path, stale)
+            client = _CountingClient(error=RateLimitError("API rate limit already exceeded"))
+
+            store.ensure(client)
+            another = CacheStore(config(), Path(directory))
+            self.assertEqual(stale, another.ensure(client))
+            with self.assertRaises(RateLimitError) as raised:
+                another.refresh(client)
+
+            self.assertEqual(stale["rate_limit"]["resetAt"], raised.exception.reset_at)
+            self.assertEqual(1, client.fetches)
+
+    def test_refusal_without_snapshot_uses_bounded_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            client = _CountingClient(error=RateLimitError("secondary rate limit"))
+            now = datetime.now(UTC)
+            with mock.patch("kanbanlan.snapshot.utc_now", return_value=now):
+                for _ in range(2):
+                    with self.assertRaises(RateLimitError) as raised:
+                        store.refresh(client)
+            self.assertEqual(1, client.fetches)
+            self.assertEqual(isoformat(now + timedelta(seconds=60)), raised.exception.reset_at)
+
+    def test_live_refresh_with_zero_floor_still_fetches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(config(), rate_limit_floor=0)
+            store = CacheStore(settings, Path(directory))
+            store._write_json(store.snapshot_path, _stale_snapshot(10, 1800))
+            client = _CountingClient()
+            store.refresh(client)
+            self.assertEqual(1, client.fetches)
+
     def test_ensure_reuses_a_refresh_completed_while_waiting_for_the_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CacheStore(config(), Path(directory))

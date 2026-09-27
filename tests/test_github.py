@@ -195,7 +195,7 @@ class GitHubTests(unittest.TestCase):
                 ("gh", "api", "graphql"),
                 1,
                 "",
-                "gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+                "gh: API rate limit already exceeded for user ID 259989802.",
             )
         )
         github = GitHub(Path("/tmp"), config(), runner=runner)

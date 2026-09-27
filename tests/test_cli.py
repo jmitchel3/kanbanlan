@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -35,10 +37,43 @@ from kanbanlan.config import Config
 from kanbanlan.registry import RegistryStore
 from kanbanlan.runner import CommandError, CommandResult
 from kanbanlan.sessions import AgentSession
+from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
 from kanbanlan.workflow import Drift
 
 
 class CliTests(unittest.TestCase):
+    def test_live_reconcile_reports_cooldown_without_reads_or_repairs(self) -> None:
+        for options in ([], ["--apply"]):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = Config("acme/widget", "acme", "organization", 2)
+                store = CacheStore(config, root / "cache")
+                reset = isoformat(datetime.now(UTC) + timedelta(minutes=20))
+                store._write_json(
+                    store.snapshot_path,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "generated_at": isoformat(datetime.now(UTC)),
+                        "rate_limit": {"remaining": 10, "resetAt": reset},
+                    },
+                )
+                provider = mock.Mock()
+                stderr = StringIO()
+                with (
+                    mock.patch(
+                        "kanbanlan.cli._context", return_value=(root, config, provider, store)
+                    ),
+                    mock.patch("kanbanlan.cli._activate_worker") as activate,
+                    redirect_stderr(stderr),
+                ):
+                    result = main(["--json", "reconcile", *options])
+                self.assertEqual(1, result)
+                payload = json.loads(stderr.getvalue())
+                self.assertFalse(payload["ok"])
+                self.assertIn(reset, payload["error"]["message"])
+                self.assertEqual([], provider.mock_calls)
+                activate.assert_not_called()
+
     def test_session_tracking_cli_options_are_explicit(self) -> None:
         init = build_parser().parse_args(["init", "--session-tracking"])
         disabled = build_parser().parse_args(["init", "--no-session-tracking"])

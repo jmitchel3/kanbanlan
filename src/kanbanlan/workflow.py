@@ -7,6 +7,7 @@ from typing import Any
 from kanbanlan.domain import KanbanlanRequest
 from kanbanlan.identity import new_kanbanlan_id
 from kanbanlan.providers import CoordinationProvider
+from kanbanlan.runner import CommandError, RateLimitError, is_rate_limit_failure
 from kanbanlan.snapshot import CacheStore
 
 LABEL_TO_STATUS = {
@@ -29,10 +30,23 @@ def read_board(
     so waiting for one before starting the other only adds latency.
     """
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        open_requests = executor.submit(provider.list_open_requests)
-        snapshot = store.refresh(provider)
-        requests = open_requests.result()
+    # Check before submitting either read, including the issue-list request.
+    # refresh checks again under its lock in case a concurrent read used quota.
+    store.check_refresh_allowed()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            open_requests = executor.submit(provider.list_open_requests)
+            snapshot = store.refresh(provider)
+            requests = open_requests.result()
+    except (CommandError, RateLimitError) as exc:
+        if isinstance(exc, CommandError):
+            if not is_rate_limit_failure(exc.result):
+                raise
+            limited = RateLimitError(str(exc))
+            store.record_rate_limit(limited)
+            raise limited from exc
+        store.record_rate_limit(exc)
+        raise
     # Kept beside the snapshot so a clean reconcile check can answer locally.
     try:
         store.write_open_requests(requests)
