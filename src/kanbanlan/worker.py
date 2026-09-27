@@ -22,7 +22,7 @@ from kanbanlan.locks import remove_stale_lock as _remove_stale_lock
 from kanbanlan.locks import unlink_if_unchanged as _unlink_if_unchanged
 from kanbanlan.outbox import drain_outbox
 from kanbanlan.registry import Registration, RegistryStore, utc_now
-from kanbanlan.runner import Runner
+from kanbanlan.runner import RateLimitError, Runner
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.workflow import apply_reconciliation, plan_reconciliation, read_board
 
@@ -101,6 +101,12 @@ def token_env_name(hostname: str, login: str) -> str:
     return f"KANBANLAN_GH_TOKEN_{digest}"
 
 
+def registration_account(registration: Registration) -> str:
+    bound = AccountStore().lookup(registration.hostname, registration.repository)
+    login = bound.login if bound else registration.github_login
+    return f"{registration.hostname}:{login}".lower() if login else ""
+
+
 def scoped_runner(registration: Registration) -> Runner:
     """Return a runner acting as the account this repository is bound to.
 
@@ -143,7 +149,18 @@ class Worker:
     def _run_all(self) -> dict[str, Any]:
         summary = {"attempted": 0, "succeeded": 0, "failed": 0, "skipped": 0, "repositories": []}
         now = datetime.now(UTC)
-        for registration in self.registry.registrations():
+        registrations = self.registry.registrations()
+        # Persisted failure metadata carries the account that actually failed,
+        # so rebinding a repository never transfers its cooldown to a new login.
+        cooldowns: dict[str, datetime] = {}
+        for registration in registrations:
+            failure = registration.last_error or {}
+            account = failure.get("rate_limit_account")
+            retry_at = _parse_time(registration.next_retry_at)
+            if account and failure.get("kind") == "RateLimitError" and retry_at and retry_at > now:
+                cooldowns[account] = max(cooldowns.get(account, now), retry_at)
+
+        for registration in registrations:
             if not registration.enabled or registration.disabled:
                 summary["skipped"] += 1
                 continue
@@ -156,9 +173,19 @@ class Worker:
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
+            account = ""
             try:
+                account = registration_account(registration)
+                if cooldowns.get(account, now) > now:
+                    summary["attempted"] -= 1
+                    summary["skipped"] += 1
+                    continue
                 self._run_registration(registration)
             except Exception as exc:  # worker must continue servicing other repositories
+                if isinstance(exc, RateLimitError) and account:
+                    retry_at = _parse_time(registration.next_retry_at)
+                    if retry_at:
+                        cooldowns[account] = retry_at
                 summary["failed"] += 1
                 summary["repositories"].append(
                     {
@@ -185,6 +212,7 @@ class Worker:
             runner = scoped_runner(registration)
             provider = GitHub(root, config, runner=runner)
             store = CacheStore(config, cache_dir(root))
+            store.check_refresh_allowed()
             # Changes a session queued are normally drained at once by a
             # process that session started; this catches any that process
             # never finished. Another drainer already running wins.
@@ -222,10 +250,27 @@ class Worker:
                 MAX_BACKOFF_SECONDS,
                 30 * (2 ** max(0, registration.consecutive_failures - 1)),
             )
-            registration.next_retry_at = (
-                (datetime.now(UTC) + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
-            )
+            retry_at = datetime.now(UTC) + timedelta(seconds=delay)
             registration.last_error = {"kind": exc.__class__.__name__, "message": str(exc)}
+            if isinstance(exc, RateLimitError):
+                # A quota reset supersedes ordinary per-repository backoff.
+                # Without one, wait at least a normal polling interval.
+                try:
+                    reset_at = _parse_time(exc.reset_at)
+                    if reset_at and reset_at > datetime.now(UTC):
+                        retry_at = reset_at
+                    else:
+                        retry_at = max(
+                            retry_at,
+                            datetime.now(UTC) + timedelta(seconds=registration.interval_seconds),
+                        )
+                except (ValueError, TypeError):
+                    retry_at = max(
+                        retry_at,
+                        datetime.now(UTC) + timedelta(seconds=registration.interval_seconds),
+                    )
+                registration.last_error["rate_limit_account"] = registration_account(registration)
+            registration.next_retry_at = retry_at.isoformat().replace("+00:00", "Z")
             self.registry.update(registration)
             raise
         self.registry.update(registration)

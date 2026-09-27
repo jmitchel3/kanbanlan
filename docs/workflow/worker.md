@@ -25,6 +25,21 @@ retry timestamps, and health metadata, but no token. Each run obtains the
 selected account's token from the GitHub CLI and passes it only to subprocesses
 through `GH_HOST` and `GH_TOKEN`.
 
+Live reconciliation checks the cached GraphQL quota before starting either the
+Project read or the open-issue read. Below `[local].rate_limit_floor` (500 by
+default), it defers until GitHub's recorded reset time. It preserves the last
+good snapshot for status reads and reports a throttled error; it never treats
+an old snapshot as a successful live reconciliation.
+
+When a worker job is throttled, other jobs using the same GitHub host and
+account wait too, including after the worker restarts. Other accounts continue
+normally. The worker honors current account bindings. A GitHub rate-limit
+failure also records a cooldown in the repository cache, preventing repeated
+`reconcile` and `refresh` commands from immediately retrying. If no valid reset
+time is known, the cache uses a one-minute cooldown. Setting
+`rate_limit_floor = 0` disables the proactive reserve; it does not bypass a
+cooldown from GitHub refusing requests.
+
 ## macOS LaunchAgent
 
 Create `/Users/YOU/Library/LaunchAgents/com.kanbanlan.worker.plist`, replacing

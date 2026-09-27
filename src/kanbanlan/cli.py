@@ -1365,9 +1365,14 @@ def _warn_stale_service(
         return
     deferral = store.rate_limit_deferral(snapshot)
     if deferral:
+        reason = (
+            "GitHub rate-limit cooldown"
+            if deferral.get("reason") == "cooldown"
+            else f"{deferral['remaining']} GraphQL points remaining is below "
+            f"the floor of {store.config.rate_limit_floor}"
+        )
         warning(
-            f"refresh deferred: {deferral['remaining']} GraphQL points remaining is below "
-            f"the floor of {store.config.rate_limit_floor}; serving the cached snapshot "
+            f"refresh deferred: {reason}; serving the cached snapshot "
             f"until the quota resets at {deferral['reset_at']}"
         )
     elif inspection.get("refresh_status") == "throttled":

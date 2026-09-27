@@ -5,11 +5,15 @@ import os
 import signal
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+from kanbanlan.accounts import AccountStore, repository_key
+from kanbanlan.config import Config
 from kanbanlan.registry import Registration, RegistryStore, utc_now
-from kanbanlan.runner import CommandResult
+from kanbanlan.runner import CommandResult, RateLimitError
+from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
 from kanbanlan.worker import (
     Worker,
     WorkerAlreadyRunning,
@@ -23,6 +27,118 @@ from kanbanlan.worker import (
 
 
 class WorkerTests(unittest.TestCase):
+    def test_quota_cooldown_is_shared_persisted_and_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = RegistryStore(root / "state")
+            config = Config("acme/one", "acme", "organization", 2)
+            now = datetime.now(UTC)
+            reset = now + timedelta(minutes=20)
+            for name, login, hostname in (
+                ("a", "alice", "github.com"),
+                ("b", "alice", "github.com"),
+                ("c", "bob", "github.com"),
+                ("d", "alice", "git.example.com"),
+            ):
+                registry.register(
+                    common_dir=root / name / ".git",
+                    root=root / name,
+                    repository=f"acme/{name}",
+                    hostname=hostname,
+                    github_login=login,
+                )
+                cache = CacheStore(config, root / name / "cache")
+                cache._write_json(
+                    cache.snapshot_path,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "generated_at": isoformat(now),
+                        "rate_limit": {
+                            "remaining": 10 if name == "a" else 4000,
+                            "resetAt": isoformat(reset),
+                        },
+                    },
+                )
+            with (
+                mock.patch("kanbanlan.worker.Config.load", return_value=config),
+                mock.patch("kanbanlan.worker.scoped_runner"),
+                mock.patch("kanbanlan.worker.GitHub"),
+                mock.patch("kanbanlan.worker.cache_dir", side_effect=lambda p: p / "cache"),
+                mock.patch("kanbanlan.worker.drain_outbox") as drain,
+                mock.patch("kanbanlan.worker.read_board", return_value=({"items": []}, [])) as read,
+            ):
+                first = Worker(registry).run_once()
+                self.assertEqual(1, first["failed"])
+                self.assertEqual(1, first["skipped"])
+                self.assertEqual(2, first["succeeded"])
+                limited = registry.get(str(root / "a" / ".git"))
+                self.assertEqual(isoformat(reset), limited.next_retry_at)
+                self.assertEqual("github.com:alice", limited.last_error["rate_limit_account"])
+                self.assertEqual(2, read.call_count)
+                self.assertEqual(2, drain.call_count)
+
+                # A new Worker sees the persisted account cooldown before it
+                # considers b, which has never itself made a failed request.
+                second = Worker(registry).run_once()
+                self.assertEqual(0, second["attempted"])
+                self.assertEqual(4, second["skipped"])
+
+                after_reset = reset + timedelta(seconds=1)
+                with (
+                    mock.patch("kanbanlan.worker.datetime", wraps=datetime) as clock,
+                    mock.patch("kanbanlan.snapshot.utc_now", return_value=after_reset),
+                ):
+                    clock.now.return_value = after_reset
+                    third = Worker(registry).run_once()
+                self.assertEqual(4, third["succeeded"])
+                self.assertIsNone(registry.get(str(root / "a" / ".git")).last_error)
+
+    def test_account_binding_controls_shared_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = RegistryStore(root)
+            first = registry.register(
+                common_dir=root / "a",
+                root=root,
+                repository="acme/a",
+                hostname="github.com",
+                github_login="alice",
+            )
+            first.last_error = {"kind": "RateLimitError", "rate_limit_account": "github.com:alice"}
+            first.next_retry_at = isoformat(datetime.now(UTC) + timedelta(minutes=20))
+            registry.update(first)
+            for name in ("b", "c"):
+                registry.register(
+                    common_dir=root / name,
+                    root=root,
+                    repository=f"acme/{name}",
+                    hostname="github.com",
+                    github_login="alice",
+                )
+            AccountStore().bind("github.com", repository_key("acme/b"), "bob")
+            worker = Worker(registry)
+            with mock.patch.object(worker, "_run_registration") as run:
+                result = worker.run_once()
+            self.assertEqual(1, result["attempted"])
+            self.assertEqual("acme/b", run.call_args.args[0].repository)
+
+    def test_rate_limit_without_reset_uses_polling_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = RegistryStore(Path(directory))
+            registry.register(
+                common_dir=Path(directory) / "common",
+                root=Path(directory),
+                repository="acme/one",
+                hostname="github.com",
+                github_login="alice",
+            )
+            now = datetime.now(UTC)
+            with mock.patch("kanbanlan.worker.Config.load", side_effect=RateLimitError("limited")):
+                result = Worker(registry).run_once()
+            self.assertEqual(1, result["failed"])
+            retry = datetime.fromisoformat(registry.registrations()[0].next_retry_at)
+            self.assertGreaterEqual((retry - now).total_seconds(), 300)
+
     def test_process_lock_rejects_a_live_pid_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory) / "worker.lock"

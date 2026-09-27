@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -491,6 +491,15 @@ def build_snapshot(
 SERVE_STALE_FACTOR = 10
 
 
+def _future_reset(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return parse_time(value) > utc_now()
+    except (ValueError, TypeError):
+        return False
+
+
 class CacheStore:
     def __init__(self, config: Config, directory: Path):
         self.config = config
@@ -593,6 +602,7 @@ class CacheStore:
             return False
 
     def _refresh_locked(self, client: Any) -> dict[str, Any]:
+        self.check_refresh_allowed()
         attempted_at = utc_now()
         try:
             if hasattr(client, "snapshot"):
@@ -619,7 +629,7 @@ class CacheStore:
             )
             return snapshot
         except RateLimitError as exc:
-            self._write_failure_health(attempted_at, exc, refresh_status="throttled")
+            self.record_rate_limit(exc)
             raise
         except Exception as exc:
             self._write_failure_health(attempted_at, exc)
@@ -656,6 +666,28 @@ class CacheStore:
                     return snapshot
                 raise
 
+    def check_refresh_allowed(self) -> None:
+        """Refuse a live read during cooldown; never certify cached state as live."""
+
+        deferral = self.rate_limit_deferral(self.snapshot())
+        if deferral:
+            exc = RateLimitError(
+                f"GitHub refresh deferred until {deferral['reset_at']} to preserve quota",
+                reset_at=deferral["reset_at"],
+            )
+            self._write_failure_health(utc_now(), exc, refresh_status="throttled")
+            raise exc
+
+    def record_rate_limit(self, exc: RateLimitError) -> None:
+        """Remember an upstream refusal so repeated commands wait too."""
+
+        snapshot = self.snapshot() or {}
+        reset_at = exc.reset_at or (snapshot.get("rate_limit") or {}).get("resetAt")
+        if not _future_reset(reset_at):
+            reset_at = isoformat(utc_now() + timedelta(seconds=60))
+        exc.reset_at = reset_at
+        self._write_failure_health(utc_now(), exc, refresh_status="throttled")
+
     def rate_limit_deferral(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         """Explain why a refresh should wait, or return None to proceed.
 
@@ -664,6 +696,11 @@ class CacheStore:
         snapshot keeps serving while its recorded ``remaining`` sits below the
         configured floor and the reset is still ahead.
         """
+
+        health = self._read_json(self.health_path) or {}
+        reset_at = (health.get("error") or {}).get("reset_at")
+        if health.get("refresh_status") == "throttled" and _future_reset(reset_at):
+            return {"remaining": None, "reset_at": reset_at, "reason": "cooldown"}
 
         floor = self.config.rate_limit_floor
         if floor <= 0 or not self._usable(snapshot):
@@ -748,6 +785,7 @@ class CacheStore:
                 "error": {
                     "kind": error.__class__.__name__,
                     "message": str(error),
+                    **({"reset_at": error.reset_at} if isinstance(error, RateLimitError) else {}),
                 },
             },
         )

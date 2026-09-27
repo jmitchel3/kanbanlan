@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest import mock
 
-from kanbanlan.workflow import expected_state, plan_reconciliation
+from kanbanlan.config import Config
+from kanbanlan.runner import CommandError, CommandResult, RateLimitError
+from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
+from kanbanlan.workflow import expected_state, plan_reconciliation, read_board
 
 
 def item(**overrides):
@@ -24,6 +31,48 @@ def item(**overrides):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_low_quota_stops_both_reconciliation_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(Config("acme/widget", "acme", "organization", 2), Path(directory))
+            snapshot = {
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": isoformat(datetime.now(UTC)),
+                "rate_limit": {
+                    "remaining": 10,
+                    "resetAt": isoformat(datetime.now(UTC) + timedelta(minutes=20)),
+                },
+            }
+            store._write_json(store.snapshot_path, snapshot)
+            provider = mock.Mock()
+
+            with self.assertRaises(RateLimitError):
+                read_board(store, provider)
+
+            self.assertEqual([], provider.mock_calls)
+            self.assertEqual(snapshot, store.snapshot())
+
+    def test_issue_list_rate_limit_is_classified_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(Config("acme/widget", "acme", "organization", 2), Path(directory))
+            provider = mock.Mock()
+            provider.list_open_requests.side_effect = CommandError(
+                CommandResult(
+                    ("gh", "issue", "list"),
+                    1,
+                    "",
+                    "gh: API rate limit already exceeded for user ID 259989802.",
+                )
+            )
+            with mock.patch.object(store, "refresh", return_value={"items": []}):
+                with self.assertRaises(RateLimitError) as raised:
+                    read_board(store, provider)
+
+            self.assertIsNotNone(raised.exception.reset_at)
+            self.assertEqual("throttled", store.inspect()["refresh_status"])
+            with self.assertRaises(RateLimitError):
+                read_board(store, provider)
+            provider.list_open_requests.assert_called_once()
+
     def test_claim_and_pull_request_override_labels(self) -> None:
         self.assertEqual(
             ("status:in-progress", "In progress", "active CLAIM comment exists"),

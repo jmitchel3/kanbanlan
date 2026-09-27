@@ -115,6 +115,7 @@ class RunnerRetryTests(unittest.TestCase):
     def test_rate_limit_failures_are_recognized_from_stderr_only(self) -> None:
         for stderr in (
             "gh: API rate limit exceeded for user ID 1 (HTTP 403)",
+            "gh: API rate limit already exceeded for user ID 259989802.",
             "gh: You have exceeded a secondary rate limit. (HTTP 403)",
             "gh: Something went wrong (HTTP 429)",
         ):
