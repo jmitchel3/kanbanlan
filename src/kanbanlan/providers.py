@@ -32,6 +32,15 @@ class CoordinationProvider(Protocol):
 
     def add_to_projection(self, url: str) -> dict[str, Any]: ...
 
+    def projection_metadata(self) -> dict[str, Any]: ...
+
+    def find_request(
+        self,
+        kanbanlan_id: str,
+        *,
+        repository: str | None = None,
+    ) -> dict[str, Any] | None: ...
+
     def set_request_status(
         self,
         reference: int | str,

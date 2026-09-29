@@ -28,6 +28,7 @@ from kanbanlan.snapshot import (
     build_snapshot,
     isoformat,
     parse_time,
+    qualified_reference,
     utc_now,
 )
 
@@ -167,6 +168,23 @@ ITEM_FIELDS
 PROJECT_QUERY = _PROJECT_PAGE_TEMPLATE.replace("ITEM_FIELDS", PROJECT_ITEM_FIELDS)
 
 PROJECT_PROBE_QUERY = _PROJECT_PAGE_TEMPLATE.replace("ITEM_FIELDS", PROBE_ITEM_FIELDS)
+
+# How many of the newest issues a replayed capture checks before falling back
+# to search, which lags issue creation.
+RECENT_REQUEST_LIMIT = 30
+
+# The Project's identity and fields without a single item: what one card's
+# Status write needs, at a fixed cost however large the board grows.
+PROJECT_METADATA_QUERY = _PROJECT_PAGE_TEMPLATE.replace(", $after: String", "").replace(
+    """      items(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+ITEM_FIELDS
+        }
+      }
+""",
+    "",
+)
 
 ITEM_HYDRATION_QUERY = """
 query($ids: [ID!]!) {
@@ -1112,6 +1130,69 @@ class GitHub:
 
     def add_to_projection(self, url: str) -> dict[str, Any]:
         return self.add_issue_to_project(url)
+
+    def projection_metadata(self) -> dict[str, Any]:
+        """Return the Project's id and fields without reading its items."""
+
+        config = self._config()
+        owner_type = "organization" if config.project_owner_type == "organization" else "user"
+        payload = self.graphql(
+            PROJECT_METADATA_QUERY.replace("OWNER", owner_type),
+            {"owner": config.project_owner, "number": config.project_number},
+            retry=True,
+        )
+        project = (payload.get(owner_type) or {}).get("projectV2")
+        if not project:
+            raise RuntimeError(
+                f"Project {config.project_owner}/{config.project_number} was not found"
+            )
+        return project
+
+    def find_request(
+        self,
+        kanbanlan_id: str,
+        *,
+        repository: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find one request by its Kanbanlan ID without reading the board.
+
+        Issue search indexes a new issue only after a delay, and a replayed
+        capture most often follows the lost attempt by seconds, so the newest
+        issues are read directly first and search covers anything older.
+        """
+
+        target = self._repository(repository)
+        for search in (None, f'"{kanbanlan_id}" in:body'):
+            args = [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                target,
+                "--state",
+                "all",
+                "--limit",
+                str(RECENT_REQUEST_LIMIT),
+                "--json",
+                "number,url,title,state,body,labels",
+            ]
+            if search:
+                args.extend(["--search", search])
+            for issue in self.runner.json(args, retry=True) or []:
+                if extract_kanbanlan_id(issue.get("body")) == kanbanlan_id:
+                    return {
+                        "kanbanlan_id": kanbanlan_id,
+                        "number": issue["number"],
+                        "repository": target,
+                        "provider_ref": qualified_reference(target, issue["number"]),
+                        "canonical_url": issue.get("url"),
+                        "url": issue.get("url"),
+                        "title": issue.get("title"),
+                        "state": issue.get("state"),
+                        "type": "ISSUE",
+                        "labels": issue.get("labels") or [],
+                    }
+        return None
 
     def set_project_status(self, item_id: str, project: dict[str, Any], status: str) -> None:
         field = _status_field(project)

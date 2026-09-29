@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_capture, build_parser
+from kanbanlan.cli import _cmd_capture, _place_captured_request, build_parser
 from kanbanlan.config import Config, normalize_repository_target
 from kanbanlan.github import GitHub
 from kanbanlan.identity import attach_kanbanlan_id
@@ -68,6 +68,18 @@ def project_snapshot(kanbanlan_id: str, *, repository: str, number: int = 4) -> 
         "items": [issue_item(number, kanbanlan_id, repository=repository)],
     }
     return build_snapshot(config(), project, [], {}, GENERATED_AT, scope=SCOPE_PROJECT)
+
+
+STATUS_FIELD = {
+    "id": "field-status",
+    "name": "Status",
+    "dataType": "SINGLE_SELECT",
+    "options": [{"id": "opt-inbox", "name": "Inbox", "color": "GRAY", "description": ""}],
+}
+IDENTITY = "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA"
+OTHER = "KBL-BBBBBBBBBBBBBBBBBBBBBBBBBB"
+CACHED = {"project": {"id": "project-1", "fields": {"nodes": [STATUS_FIELD]}}, "items": []}
+FRESH_PROJECT = {"id": "project-1", "fields": {"nodes": [{**STATUS_FIELD, "id": "field-new"}]}}
 
 
 class RepositoryTargetTests(unittest.TestCase):
@@ -198,6 +210,49 @@ class PrepareCaptureTargetTests(unittest.TestCase):
         self.assertEqual([], github.runner.calls)
 
 
+class FindRequestTests(unittest.TestCase):
+    def find(self, recent: list[dict[str, Any]], searched: list[dict[str, Any]]):
+        runner = StubRunner()
+
+        def json_(args, **kwargs):
+            runner.calls.append(list(args))
+            return searched if "--search" in args else recent
+
+        runner.json = json_  # type: ignore[method-assign]
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+        github.runner = runner
+        return github.find_request(IDENTITY, repository=PEER), runner.calls
+
+    def issue(self, number: int, identity: str) -> dict[str, Any]:
+        body = attach_kanbanlan_id("body", identity)
+        return {
+            "number": number,
+            "url": f"https://x/{number}",
+            "title": "T",
+            "state": "OPEN",
+            "body": body,
+        }
+
+    def test_a_just_created_issue_is_found_without_waiting_for_search(self) -> None:
+        found, calls = self.find([self.issue(9, OTHER), self.issue(8, IDENTITY)], [])
+
+        self.assertEqual((8, f"github:{PEER}#8"), (found["number"], found["provider_ref"]))
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("--search", calls[0])
+
+    def test_an_older_issue_is_found_by_search(self) -> None:
+        found, calls = self.find([self.issue(9, OTHER)], [self.issue(2, IDENTITY)])
+
+        self.assertEqual(2, found["number"])
+        self.assertIn(f'"{IDENTITY}" in:body', calls[1])
+
+    def test_a_body_that_only_mentions_the_id_is_not_a_match(self) -> None:
+        mention = {**self.issue(5, OTHER), "body": f"see {IDENTITY}"}
+        found, _ = self.find([mention], [mention])
+
+        self.assertIsNone(found)
+
+
 class CaptureRoutingTests(unittest.TestCase):
     def capture(
         self,
@@ -206,6 +261,7 @@ class CaptureRoutingTests(unittest.TestCase):
         target: str,
         preparation: dict[str, Any] | None = None,
         projection_error: Exception | None = None,
+        cached: dict[str, Any] | None = CACHED,
         json_output: bool = False,
     ) -> tuple[int, str, mock.Mock, mock.Mock]:
         provider = mock.Mock()
@@ -217,29 +273,13 @@ class CaptureRoutingTests(unittest.TestCase):
             "already_linked": True,
             "project_url": "https://github.test/orgs/acme/projects/2",
         }
+        provider.add_to_projection.return_value = {"id": "PVTI_4"}
+        provider.projection_metadata.return_value = FRESH_PROJECT
         if projection_error is not None:
             provider.add_to_projection.side_effect = projection_error
         store = mock.Mock()
-        # The repository path reads the board until the new request is listed.
-        store.refresh.return_value = project_snapshot(
-            "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA", repository=LOCAL
-        )
-        provider.list_open_requests.return_value = []
-
-        captured: dict[str, Any] = {}
-
-        def snapshot(*, generated_at, scope):
-            captured["scope"] = scope
-            return project_snapshot(captured["kanbanlan_id"], repository=target)
-
-        provider.snapshot.side_effect = snapshot
-
-        def new_id() -> str:
-            captured["kanbanlan_id"] = "KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA"
-            return captured["kanbanlan_id"]
-
-        argv = (["--json"] if json_output else []) + argv
-        args = build_parser().parse_args(argv)
+        store.snapshot.return_value = cached
+        args = build_parser().parse_args((["--json"] if json_output else []) + argv)
         stream = StringIO()
         with (
             mock.patch(
@@ -247,18 +287,21 @@ class CaptureRoutingTests(unittest.TestCase):
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
             mock.patch("kanbanlan.cli._actor_session", return_value=None),
-            mock.patch("kanbanlan.cli.new_kanbanlan_id", side_effect=new_id),
             mock.patch(
-                "kanbanlan.cli.apply_reconciliation",
-                return_value=(
-                    [],
-                    project_snapshot("KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA", repository=LOCAL),
-                ),
+                "kanbanlan.cli.new_kanbanlan_id",
+                return_value="KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
+            mock.patch("kanbanlan.cli._refresh_after_mutation") as refresh,
             redirect_stdout(stream),
         ):
             code = _cmd_capture(args)
+        self.refresh_after_mutation = refresh
         return code, stream.getvalue(), provider, store
+
+    def assert_board_never_read(self, provider: mock.Mock, store: mock.Mock) -> None:
+        provider.snapshot.assert_not_called()
+        provider.list_open_requests.assert_not_called()
+        store.refresh.assert_not_called()
 
     def test_capture_defaults_to_this_repository_and_never_guesses(self) -> None:
         code, output, provider, store = self.capture(
@@ -269,7 +312,8 @@ class CaptureRoutingTests(unittest.TestCase):
         self.assertEqual(0, code)
         provider.prepare_capture_target.assert_not_called()
         self.assertEqual(LOCAL, provider.create_request.call_args.kwargs["repository"])
-        store.refresh.assert_called()
+        self.assert_board_never_read(provider, store)
+        self.refresh_after_mutation.assert_called_once()
 
     def test_an_explicit_target_is_prepared_before_the_request_is_created(self) -> None:
         code, output, provider, _ = self.capture(
@@ -299,7 +343,7 @@ class CaptureRoutingTests(unittest.TestCase):
 
         self.assertEqual(0, code)
         provider.prepare_capture_target.assert_not_called()
-        store.refresh.assert_called()
+        self.assert_board_never_read(provider, store)
 
     def test_a_routed_request_reaches_inbox_in_the_repository_that_owns_it(self) -> None:
         code, _, provider, store = self.capture(
@@ -308,11 +352,63 @@ class CaptureRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(0, code)
-        provider.snapshot.assert_called_once()
-        self.assertEqual(SCOPE_PROJECT, provider.snapshot.call_args.kwargs["scope"])
-        provider.set_request_status.assert_called_once_with(4, "status:intake", repository=PEER)
-        self.assertEqual("Inbox", provider.set_projection_status.call_args[0][2])
-        store.refresh.assert_not_called()
+        self.assert_board_never_read(provider, store)
+        provider.set_projection_status.assert_called_once_with("PVTI_4", CACHED["project"], "Inbox")
+        self.refresh_after_mutation.assert_not_called()
+
+    def test_capture_places_the_card_without_reading_the_board(self) -> None:
+        code, _, provider, store = self.capture(["capture", "Add a page"], target=LOCAL)
+
+        self.assertEqual(0, code)
+        self.assert_board_never_read(provider, store)
+        provider.add_to_projection.assert_called_once_with(f"https://github.test/{LOCAL}/issues/4")
+        provider.set_projection_status.assert_called_once_with("PVTI_4", CACHED["project"], "Inbox")
+        provider.projection_metadata.assert_not_called()
+        provider.set_request_status.assert_not_called()
+
+    def test_without_a_cached_board_only_the_project_fields_are_read(self) -> None:
+        code, _, provider, store = self.capture(
+            ["capture", "Add a page"], target=LOCAL, cached=None
+        )
+
+        self.assertEqual(0, code)
+        self.assert_board_never_read(provider, store)
+        provider.set_projection_status.assert_called_once_with("PVTI_4", FRESH_PROJECT, "Inbox")
+
+    def test_stale_cached_field_ids_fall_back_to_fresh_project_fields(self) -> None:
+        tried: list[dict[str, Any]] = []
+
+        def set_status(item_id: str, project: dict[str, Any], status: str) -> None:
+            tried.append(project)
+            if project is CACHED["project"]:
+                raise RuntimeError("Could not resolve to a node with the global id")
+
+        provider = mock.Mock()
+        provider.add_to_projection.return_value = {"id": "PVTI_9"}
+        provider.projection_metadata.return_value = FRESH_PROJECT
+        provider.set_projection_status.side_effect = set_status
+        store = mock.Mock()
+        store.snapshot.return_value = CACHED
+
+        item = _place_captured_request(
+            provider, store, f"https://github.test/{LOCAL}/issues/9", "KBL-X", LOCAL, "T"
+        )
+
+        self.assertEqual([CACHED["project"], FRESH_PROJECT], tried)
+        self.assertEqual(
+            (9, f"github:{LOCAL}#9", "PVTI_9", "Inbox"),
+            (item["number"], item["provider_ref"], item["project_item_id"], item["status"]),
+        )
+
+    def test_a_missing_project_item_id_is_a_project_setup_failure(self) -> None:
+        provider = mock.Mock()
+        provider.add_to_projection.return_value = {}
+        with self.assertRaises(RuntimeError) as raised:
+            _place_captured_request(
+                provider, mock.Mock(), f"https://github.test/{LOCAL}/issues/9", "K", LOCAL, "T"
+            )
+
+        self.assertIn("did not report the new Project item", str(raised.exception))
 
     def test_success_json_identifies_the_repository_and_canonical_request(self) -> None:
         code, output, _, _ = self.capture(

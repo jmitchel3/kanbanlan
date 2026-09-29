@@ -65,7 +65,13 @@ from kanbanlan.sessions import (
     hook_workspaces,
     session_from_hook_payload,
 )
-from kanbanlan.snapshot import SCHEMA_VERSION, SCOPE_PROJECT, CacheStore, utc_now
+from kanbanlan.snapshot import (
+    SCHEMA_VERSION,
+    SCOPE_PROJECT,
+    CacheStore,
+    qualified_reference,
+    utc_now,
+)
 from kanbanlan.ui import (
     BOLD,
     CYAN,
@@ -1998,56 +2004,48 @@ def _capture_target(
     return preparation["repository"], preparation
 
 
-def _reconcile_captured_request(
+def _place_captured_request(
     provider: CoordinationProvider,
     store: CacheStore,
+    url: str,
     kanbanlan_id: str,
     target: str,
-    config: Config,
+    title: str,
 ) -> dict[str, Any]:
-    """Bring one freshly created request to Inbox in the repository that owns it."""
+    """Put one freshly created request in the Project's Inbox.
 
-    if target == config.repository:
-        snapshot, open_issues = _await_request(
-            lambda: read_board(store, provider), lambda read: read[0], kanbanlan_id
-        )
-        remaining, refreshed = apply_reconciliation(provider, store, snapshot, open_issues)
-        if remaining:
-            raise RuntimeError("its Project state did not reconcile")
-        return _issue(refreshed, kanbanlan_id)
-    # A peer repository owns this request, so repository-scoped reconciliation
-    # cannot see it. Set exactly this request's initial state instead of
-    # reconciling a repository this session does not own.
-    snapshot = _await_request(
-        lambda: provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT),
-        lambda read: read,
-        kanbanlan_id,
-    )
-    item = _issue(snapshot, kanbanlan_id)
-    provider.set_request_status(item["number"], "status:intake", repository=target)
-    provider.set_projection_status(item["project_item_id"], snapshot["project"], "Inbox")
-    return item
+    Only this card is written, so nothing here reads the board or waits on
+    the refresh lock: the Project item id comes back from the add, and the
+    Status field comes from the cached snapshot, or from a metadata-only read
+    when the cache is missing or its field ids have gone stale. The issue was
+    created with ``status:intake`` already.
+    """
 
-
-# GitHub can list a just-added Project item a few seconds late. A capture
-# that gave up at once would leave a created issue behind a failed command,
-# so the read after creation is retried for about ten seconds first.
-CAPTURE_VISIBILITY_DELAYS = (1.0, 2.0, 3.0, 4.0)
-
-
-def _await_request(read: Any, snapshot_of: Any, kanbanlan_id: str) -> Any:
-    """Repeat ``read`` until its snapshot lists ``kanbanlan_id``, or give up."""
-
-    for delay in (*CAPTURE_VISIBILITY_DELAYS, None):
-        value = read()
-        try:
-            _issue(snapshot_of(value), kanbanlan_id)
-            return value
-        except RuntimeError:
-            if delay is None:
-                return value
-            time.sleep(delay)
-    raise AssertionError("unreachable")
+    added = provider.add_to_projection(url)
+    item_id = (added or {}).get("id")
+    if not item_id:
+        raise RuntimeError("GitHub did not report the new Project item")
+    cached = (store.snapshot() or {}).get("project")
+    try:
+        if not cached:
+            raise RuntimeError("no cached Project fields")
+        provider.set_projection_status(item_id, cached, "Inbox")
+    except (CommandError, RuntimeError):
+        provider.set_projection_status(item_id, provider.projection_metadata(), "Inbox")
+    number = int(url.rstrip("/").rsplit("/", 1)[-1])
+    return {
+        "kanbanlan_id": kanbanlan_id,
+        "number": number,
+        "repository": target,
+        "provider_ref": qualified_reference(target, number),
+        "canonical_url": url,
+        "url": url,
+        "title": title,
+        "state": "OPEN",
+        "type": "ISSUE",
+        "status": "Inbox",
+        "project_item_id": item_id,
+    }
 
 
 def _capture_live(args: argparse.Namespace) -> int:
@@ -2063,6 +2061,21 @@ def _capture_live(args: argparse.Namespace) -> int:
         # a second issue for the same request.
         existing = _existing_request(provider, store, kanbanlan_id, target, config)
         if existing is not None:
+            if existing.get("project_item_id") is None and _still_intake(existing):
+                # The lost attempt may have died between creating the issue
+                # and placing it; adding is idempotent, so finish the job.
+                with status("Adding issue to the configured Project Inbox"):
+                    existing = {
+                        **existing,
+                        **_place_captured_request(
+                            provider,
+                            store,
+                            existing["url"],
+                            kanbanlan_id,
+                            target,
+                            existing.get("title") or args.title,
+                        ),
+                    }
             return _emit_capture(args, existing, kanbanlan_id, target, config, None, actor)
     body = args.body or (
         "## Outcome\n\n"
@@ -2073,10 +2086,8 @@ def _capture_live(args: argparse.Namespace) -> int:
     with status(f"Creating Inbox issue in {target}"):
         url = provider.create_request(args.title, body, args.priority, repository=target)
     try:
-        with status("Adding issue to the configured Project"):
-            provider.add_to_projection(url)
-        with status("Reconciling initial issue state"):
-            item = _reconcile_captured_request(provider, store, kanbanlan_id, target, config)
+        with status("Adding issue to the configured Project Inbox"):
+            item = _place_captured_request(provider, store, url, kanbanlan_id, target, args.title)
     except (CommandError, RuntimeError) as exc:
         raise RuntimeError(
             f"the issue was created at {url}, but Project setup failed: {exc}. "
@@ -2093,10 +2104,14 @@ def _capture_live(args: argparse.Namespace) -> int:
         actor=actor,
         repository=target,
     )
-    if config.session_tracking_enabled() and target == config.repository:
+    if target == config.repository:
         _refresh_after_mutation(root, store, provider)
-    item = {**item, "url": item.get("url") or url}
     return _emit_capture(args, item, kanbanlan_id, target, config, preparation, actor)
+
+
+def _still_intake(item: dict[str, Any]) -> bool:
+    names = {label.get("name") for label in item.get("labels") or []}
+    return item.get("state") == "OPEN" and "status:intake" in names
 
 
 def _existing_request(
@@ -2106,14 +2121,21 @@ def _existing_request(
     target: str,
     config: Config,
 ) -> dict[str, Any] | None:
-    if target == config.repository:
-        snapshot = store.refresh(provider)
-    else:
-        snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
-    try:
-        return _issue(snapshot, kanbanlan_id)
-    except RuntimeError:
-        return None
+    """Find a request a replayed capture may already have created.
+
+    The cached board answers first; otherwise one issue search in the target
+    repository settles it, so a replay never waits on a full board read.
+    """
+
+    snapshot = store.snapshot()
+    if snapshot and target == config.repository:
+        try:
+            cached = _issue(snapshot, kanbanlan_id)
+        except RuntimeError:
+            cached = None
+        if cached is not None and cached.get("number") is not None:
+            return cached
+    return provider.find_request(kanbanlan_id, repository=target)
 
 
 def _emit_capture(
