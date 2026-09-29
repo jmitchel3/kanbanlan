@@ -524,24 +524,77 @@ class FailureDetailTests(unittest.TestCase):
         self.assertEqual("bad {value}\n}", _executor_error(stderr, ""))
 
 
-class CaptureVisibilityTests(unittest.TestCase):
-    def test_capture_waits_for_github_to_list_the_new_request(self) -> None:
-        reads = iter([snapshot([]), snapshot([]), snapshot([item(74, ALPHA, "Inbox")])])
-        with mock.patch.object(cli.time, "sleep") as sleep:
-            value = cli._await_request(lambda: next(reads), lambda read: read, ALPHA)
+class ReplayLookupTests(unittest.TestCase):
+    def lookup(self, cached: dict[str, Any] | None, found: dict[str, Any] | None = None):
+        provider = mock.Mock()
+        provider.find_request.return_value = found
+        store = mock.Mock()
+        store.snapshot.return_value = cached
+        value = cli._existing_request(provider, store, ALPHA, REPOSITORY, config())
+        store.refresh.assert_not_called()
+        provider.snapshot.assert_not_called()
+        return value, provider
 
-        self.assertEqual(74, cli._issue(value, ALPHA)["number"])
-        self.assertEqual([mock.call(1.0), mock.call(2.0)], sleep.call_args_list)
+    def test_a_request_on_the_cached_board_needs_no_github_read(self) -> None:
+        value, provider = self.lookup(snapshot([item(74, ALPHA, "Inbox")]))
 
-    def test_capture_stops_waiting_after_a_bounded_time(self) -> None:
-        reads: list[int] = []
+        self.assertEqual(74, value["number"])
+        provider.find_request.assert_not_called()
 
-        def read() -> dict[str, Any]:
-            reads.append(1)
-            return snapshot([])
+    def test_a_request_missing_from_the_cache_is_found_by_one_search(self) -> None:
+        found = {"number": 75, "kanbanlan_id": ALPHA}
+        value, provider = self.lookup(snapshot([]), found)
 
-        with mock.patch.object(cli.time, "sleep") as sleep:
-            cli._await_request(read, lambda value: value, ALPHA)
+        self.assertEqual(found, value)
+        provider.find_request.assert_called_once_with(ALPHA, repository=REPOSITORY)
 
-        self.assertEqual(len(cli.CAPTURE_VISIBILITY_DELAYS) + 1, len(reads))
-        self.assertEqual(10.0, sum(call.args[0] for call in sleep.call_args_list))
+    def test_no_cache_and_no_match_means_the_capture_runs(self) -> None:
+        value, _ = self.lookup(None, None)
+
+        self.assertIsNone(value)
+
+
+class ReplayRepairTests(unittest.TestCase):
+    def replay(self, existing: dict[str, Any]) -> mock.Mock:
+        provider = mock.Mock()
+        provider.add_to_projection.return_value = {"id": "PVTI_7"}
+        store = mock.Mock()
+        store.snapshot.return_value = None
+        args = cli.build_parser().parse_args(
+            ["--json", "capture", "Title", "--kanbanlan-id", ALPHA]
+        )
+        with (
+            mock.patch.object(
+                cli, "_context", return_value=(Path("/tmp"), config(), provider, store)
+            ),
+            mock.patch.object(cli, "_actor_session", return_value=None),
+            mock.patch.object(cli, "_capture_target", return_value=(REPOSITORY, None)),
+            mock.patch.object(cli, "_existing_request", return_value=existing),
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(0, cli._capture_live(args))
+        provider.create_request.assert_not_called()
+        return provider
+
+    def found(self, label: str, state: str = "OPEN") -> dict[str, Any]:
+        return {
+            "kanbanlan_id": ALPHA,
+            "number": 7,
+            "url": f"https://github.test/{REPOSITORY}/issues/7",
+            "state": state,
+            "labels": [{"name": label}],
+        }
+
+    def test_a_replay_places_an_issue_the_lost_attempt_left_off_the_board(self) -> None:
+        provider = self.replay(self.found("status:intake"))
+
+        provider.add_to_projection.assert_called_once_with(
+            f"https://github.test/{REPOSITORY}/issues/7"
+        )
+        self.assertEqual("Inbox", provider.set_projection_status.call_args.args[2])
+
+    def test_a_replay_never_moves_a_request_that_already_progressed(self) -> None:
+        provider = self.replay(self.found("status:in-progress"))
+
+        provider.add_to_projection.assert_not_called()
+        provider.set_projection_status.assert_not_called()
