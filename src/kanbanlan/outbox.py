@@ -427,6 +427,6 @@ def drain_outbox(root: Path, store: Any, provider: Any, *, wait: float = 0.0) ->
     return drain(
         Outbox(store.directory),
         execute=execute_intent(root),
-        refresh=lambda: store.refresh(provider),
+        refresh=lambda: store.refresh_for_write(provider),
         wait=wait,
     )

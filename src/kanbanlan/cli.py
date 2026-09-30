@@ -2174,7 +2174,7 @@ def _triage_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking request {args.issue}"):
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh_for_write(provider)
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
@@ -2352,7 +2352,7 @@ def _release_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh_for_write(provider)
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
@@ -2366,7 +2366,7 @@ def _release_live(args: argparse.Namespace) -> int:
             number,
             (f"RELEASED: {_utc_timestamp()} — {args.reason}\nSession: {session}"),
         )
-        latest = store.refresh(provider)
+        latest = store.refresh_for_write(provider)
         if args.blocked:
             _set_state(provider, latest, number, "status:blocked", "Blocked")
         else:
@@ -2511,7 +2511,7 @@ def _review_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking pull requests for request {args.issue}"):
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh_for_write(provider)
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
@@ -2575,7 +2575,7 @@ def _close_live(args: argparse.Namespace) -> int:
             f"canonical home {provider.provider_name!r} does not support closing a request"
         )
     with status(f"Checking request {args.issue}"):
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh_for_write(provider)
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
@@ -2611,7 +2611,7 @@ def _close_live(args: argparse.Namespace) -> int:
             reason=reason,
             comment=f"CLOSED: {timestamp} — {args.reason}",
         )
-        latest = store.refresh(provider)
+        latest = store.refresh_for_write(provider)
         _set_state(provider, latest, number, None, "Done")
         _record_session_activity(
             config=config,
@@ -2645,7 +2645,7 @@ def _handoff_live(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
     with status(f"Checking active claim for request {args.issue}"):
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh_for_write(provider)
     item = _issue(snapshot, args.issue)
     number = item["number"]
     label = request_label(item)
@@ -2662,7 +2662,7 @@ def _handoff_live(args: argparse.Namespace) -> int:
                 f"Worktree: {Path(args.worktree).resolve()}"
             ),
         )
-        refreshed = store.refresh(provider)
+        refreshed = store.refresh_for_write(provider)
         _set_state(provider, refreshed, number, "status:in-progress", "In progress")
         _record_session_activity(
             config=config,
@@ -3373,7 +3373,7 @@ def _refresh_after_mutation(
 
     mode = os.environ.get("KANBANLAN_BACKGROUND_REFRESH", "1")
     if mode == "0":
-        store.refresh(provider)
+        store.refresh_for_write(provider)
         return
     if mode == "skip":
         # The sync drainer refreshes once after the whole batch it applied.

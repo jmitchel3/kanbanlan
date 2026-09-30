@@ -271,7 +271,7 @@ class RehomeCommandTests(unittest.TestCase):
         self.assertIn("rerun with --apply", output)
         provider.transfer_request.assert_not_called()
         provider.prepare_repository_target.assert_not_called()
-        store.refresh.assert_not_called()
+        store.refresh_for_write.assert_not_called()
 
     def test_a_blocked_plan_reports_two_without_mutating(self) -> None:
         provider = self.provider(
@@ -301,7 +301,7 @@ class RehomeCommandTests(unittest.TestCase):
         provider.set_request_status.assert_called_once_with(12, "status:intake", repository=PEER)
         self.assertEqual("Inbox", provider.set_projection_status.call_args[0][2])
         self.assertIn(f"github:{LOCAL}#7 -> github:{PEER}#12", output)
-        store.refresh.assert_called_once()
+        store.refresh_for_write.assert_called_once()
 
     def test_apply_json_names_both_provider_references_and_dropped_fields(self) -> None:
         provider = self.provider(

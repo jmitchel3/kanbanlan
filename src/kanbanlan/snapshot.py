@@ -531,6 +531,26 @@ class CacheStore:
                 return snapshot
             return self._refresh_locked(client)
 
+    def refresh_for_write(self, client: Any) -> dict[str, Any]:
+        """Return a snapshot a lifecycle write can act on.
+
+        This is ``refresh``, except while a full-board refresh is deferred
+        to preserve quota: then the last usable snapshot answers and is
+        marked stale, so the first read after the cooldown fetches the board
+        again. Only the board read is deferred; the write itself still goes
+        to GitHub, and a write GitHub refuses fails with its own reset time.
+        """
+
+        try:
+            return self.refresh(client)
+        except RateLimitError as exc:
+            snapshot = self.snapshot()
+            if not exc.deferred or not self._usable(snapshot):
+                raise
+            assert snapshot is not None
+            self.invalidate()
+            return snapshot
+
     def serveable(self, snapshot: dict[str, Any] | None) -> bool:
         """Report whether a snapshot may answer a local read without GitHub.
 
@@ -667,15 +687,23 @@ class CacheStore:
                 raise
 
     def check_refresh_allowed(self) -> None:
-        """Refuse a live read during cooldown; never certify cached state as live."""
+        """Refuse a full-board read during cooldown; never certify cached state as live.
+
+        An active cooldown is left exactly as recorded, so repeated checks
+        never replace GitHub's own refusal or move its reset time. Only a
+        quota-floor deferral is written to health, with the reset the
+        snapshot reported, so status shows why the board is not refreshing.
+        """
 
         deferral = self.rate_limit_deferral(self.snapshot())
         if deferral:
             exc = RateLimitError(
                 f"GitHub refresh deferred until {deferral['reset_at']} to preserve quota",
                 reset_at=deferral["reset_at"],
+                deferred=True,
             )
-            self._write_failure_health(utc_now(), exc, refresh_status="throttled")
+            if deferral.get("reason") != "cooldown":
+                self._write_failure_health(utc_now(), exc, refresh_status="throttled")
             raise exc
 
     def record_rate_limit(self, exc: RateLimitError) -> None:

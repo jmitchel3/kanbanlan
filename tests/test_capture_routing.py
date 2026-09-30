@@ -302,6 +302,7 @@ class CaptureRoutingTests(unittest.TestCase):
         provider.snapshot.assert_not_called()
         provider.list_open_requests.assert_not_called()
         store.refresh.assert_not_called()
+        store.refresh_for_write.assert_not_called()
 
     def test_capture_defaults_to_this_repository_and_never_guesses(self) -> None:
         code, output, provider, store = self.capture(
