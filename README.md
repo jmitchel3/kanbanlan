@@ -238,16 +238,23 @@ fraction of a second:
 - A lifecycle command validates against the local snapshot with every pending
   change laid over it, records its change in the cache directory's outbox, and
   returns. A detached `kanbanlan sync --drain` then replays each change, in
-  order, as the ordinary live command, which re-validates against GitHub. A
-  queued `capture` returns its Kanbanlan ID at once; the issue number follows.
+  order, as the ordinary live command, which re-validates against that one
+  card on GitHub. A queued `capture` returns its Kanbanlan ID at once; the
+  issue number follows.
+- Neither a lifecycle command nor its replay reads the whole board or waits
+  on the refresh lock or on another session's queue. Each reads and writes
+  only its own card (labels, claim comments, Project item and Status), so it
+  costs the same on any board size.
 - Sessions on the same machine arbitrate claims instantly under a local lock.
-  The replayed claim still posts to GitHub and verifies it afterwards, so a
-  claim lost to another machine is reported on the next command.
+  The replayed claim still posts to GitHub and verifies it against the card's
+  claim comments afterwards, so a claim lost to another machine is reported
+  as a failed change on the next command instead of blocking anyone.
 - Reads serve the local snapshot and refresh it in the background when it is
-  stale. A snapshot older than ten staleness windows, a request the snapshot
-  does not know, or a check it cannot decide (a `review` whose pull request is
-  newer than the snapshot, a reconcile that finds drift) runs live instead,
-  after the queue drains.
+  stale; only a missing snapshot makes a read wait. When the local view cannot
+  decide a lifecycle command (a request the snapshot does not know, a snapshot
+  older than ten staleness windows, a `review` whose pull request is newer than
+  the snapshot), the command reads that one card and decides again. A
+  reconcile that finds drift in the local copies confirms it live.
 - A change that fails to sync is never retried on its own. It is reported on
   later commands, blocks further changes to the same request, and is managed
   with `kanbanlan sync`, `kanbanlan sync --retry ID`, and

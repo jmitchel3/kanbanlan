@@ -249,12 +249,10 @@ class StateWriteTests(unittest.TestCase):
                 overlap.wait()
                 writes.append(f"status:{item_id}:{status}")
 
-        snapshot = {
-            "project": {"id": "project-1"},
-            "items": [{"number": 7, "project_item_id": "item-7", "repository": LOCAL}],
-        }
-        with mock.patch("kanbanlan.cli._issue", return_value=snapshot["items"][0]):
-            _set_state(Provider(), snapshot, 7, "status:ready", "Ready")
+        store = mock.Mock()
+        store.snapshot.return_value = {"project": {"id": "project-1", "fields": {"nodes": []}}}
+        item = {"number": 7, "project_item_id": "item-7", "repository": LOCAL}
+        _set_state(Provider(), store, item, "status:ready", "Ready")
 
         self.assertEqual(["label:7:status:ready", "status:item-7:Ready"], sorted(writes))
 
@@ -266,12 +264,11 @@ class StateWriteTests(unittest.TestCase):
             def set_projection_status(self, item_id, projection, status):
                 pass
 
+        store = mock.Mock()
+        store.snapshot.return_value = {"project": {"id": "project-1", "fields": {"nodes": []}}}
         item = {"number": 7, "project_item_id": "item-7"}
-        with (
-            mock.patch("kanbanlan.cli._issue", return_value=item),
-            self.assertRaisesRegex(RuntimeError, "label write failed"),
-        ):
-            _set_state(Provider(), {"project": {}}, 7, "status:ready", "Ready")
+        with self.assertRaisesRegex(RuntimeError, "label write failed"):
+            _set_state(Provider(), store, item, "status:ready", "Ready")
 
 
 class BoardReadTests(unittest.TestCase):

@@ -177,11 +177,13 @@ class Runner:
         *,
         input_value: Any | None = None,
         retry: bool = False,
+        timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
     ) -> Any:
         result = self.run(
             args,
             input_text=json.dumps(input_value) if input_value is not None else None,
             retry=retry,
+            timeout=timeout,
         )
         try:
             return json.loads(result.stdout)

@@ -564,6 +564,11 @@ class CacheStore:
         age = self._snapshot_age(snapshot)
         return age is not None and age <= self.config.stale_seconds * SERVE_STALE_FACTOR
 
+    def usable(self, snapshot: dict[str, Any] | None) -> bool:
+        """Report whether a snapshot of any age can answer a local read."""
+
+        return self._usable(snapshot)
+
     def needs_revalidation(self, snapshot: dict[str, Any] | None) -> bool:
         return self._snapshot_state(snapshot) != "fresh" and not self.rate_limit_deferral(snapshot)
 

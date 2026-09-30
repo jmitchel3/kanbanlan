@@ -4,9 +4,11 @@ A lifecycle command validates against the local view (the shared snapshot
 with every pending change laid over it), records its change here as an
 intent, and returns. A drainer then replays each intent, oldest first, as
 the ordinary live command in a child process, which re-validates against
-GitHub and performs every read and write the synchronous command always
-did, including the post-claim verification that detects a claim lost to
-another machine.
+the live card and performs every write the synchronous command always did,
+including the post-claim verification that detects a claim lost to another
+machine. Each replay reads and writes only its own card, so neither the
+drainer nor its children ever read the whole board or wait on the refresh
+lock.
 
 Rules the drainer keeps:
 
@@ -23,7 +25,8 @@ Rules the drainer keeps:
 - An intent found "running" belonged to a drainer that died mid-command.
   Its effect on GitHub is unknown, so it is failed too, never replayed.
 - Applied intents keep overlaying the snapshot until one refresh taken
-  after them lands, so a read never flickers back to the old state.
+  after them lands, so a read never flickers back to the old state. That
+  refresh runs detached, and whoever next sees its snapshot settles them.
 """
 
 from __future__ import annotations
@@ -411,9 +414,29 @@ def _drain_locked(
     applied = [value for value in outbox.intents() if value.state == APPLIED]
     if applied:
         # A failed refresh leaves them applied; the next drain refreshes again.
-        refresh()
-        for intent in applied:
-            outbox.remove(intent)
+        settle(outbox, refresh())
+
+
+def settle(outbox: Outbox, snapshot: dict[str, Any] | None) -> None:
+    """Drop applied intents that ``snapshot`` already reflects.
+
+    A snapshot records when its read began, so one begun after an intent
+    finished applying shows that intent's effect and no longer needs it
+    laid over the top.
+    """
+
+    try:
+        generated_at = parse_time((snapshot or {})["generated_at"])
+    except (KeyError, TypeError, ValueError):
+        return
+    for intent in outbox.intents():
+        if intent.state != APPLIED or not intent.finished_at:
+            continue
+        try:
+            if parse_time(intent.finished_at) <= generated_at:
+                outbox.remove(intent)
+        except (TypeError, ValueError):
+            continue
 
 
 def _due(intent: Intent, now: datetime) -> bool:
@@ -533,11 +556,35 @@ def _executor_error(stderr: str, stdout: str) -> str:
 
 
 def drain_outbox(root: Path, store: Any, provider: Any, *, wait: float = 0.0) -> bool:
-    """Drain one repository's outbox, replaying each change as a live command."""
+    """Drain one repository's outbox, replaying each change as a live command.
 
+    The board is refreshed afterwards by a detached process rather than
+    here: a full read of a large Project takes minutes and serializes on the
+    refresh lock, and nothing the drainer does depends on it.
+    """
+
+    outbox = Outbox(store.directory)
+    settle(outbox, store.snapshot())
     return drain(
-        Outbox(store.directory),
+        outbox,
         execute=execute_intent(root),
-        refresh=lambda: store.refresh_for_write(provider),
+        refresh=lambda: refresh_in_background(root, store),
         wait=wait,
     )
+
+
+def refresh_in_background(root: Path, store: Any) -> dict[str, Any] | None:
+    """Start a detached board refresh and return the snapshot it will replace."""
+
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "kanbanlan", "-C", str(root), "--json", "refresh"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+    return store.snapshot()
