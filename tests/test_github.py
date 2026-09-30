@@ -455,3 +455,50 @@ class ReadRequestTests(unittest.TestCase):
         self.assertTrue(all(len(value) <= SEARCH_QUERY_LIMIT for value in queries))
         joined = " ".join(queries)
         self.assertTrue(all(f"repo:{value}" in joined for value in repositories))
+
+
+class BoundedReadTests(unittest.TestCase):
+    """A read given a time limit shares it across its calls and never retries."""
+
+    def test_a_card_read_and_its_searches_share_one_limit(self) -> None:
+        github = GitHub(Path("/tmp"), config())
+        issue = ReadRequestTests().issue()
+        github.graphql = mock.Mock(
+            side_effect=[{"repository": {"issue": issue}}, {"search": {"nodes": []}}]
+        )
+
+        github.read_request(7, pull_requests=True, timeout=15)
+
+        for call in github.graphql.call_args_list:
+            self.assertFalse(call.kwargs["retry"])
+            self.assertLessEqual(call.kwargs["timeout"], 15)
+
+    def test_an_unbounded_card_read_keeps_retrying(self) -> None:
+        github = GitHub(Path("/tmp"), config())
+        github.graphql = mock.Mock(
+            return_value={"repository": {"issue": ReadRequestTests().issue()}}
+        )
+
+        github.read_request(7)
+
+        self.assertEqual({"retry": True}, github.graphql.call_args.kwargs)
+
+    def test_a_bounded_lookup_by_identity_never_retries(self) -> None:
+        runner = mock.Mock()
+        runner.json.return_value = []
+        github = GitHub(Path("/tmp"), config(), runner=runner)
+
+        github.find_request("KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA", timeout=15)
+
+        self.assertEqual(2, runner.json.call_count)
+        for call in runner.json.call_args_list:
+            self.assertFalse(call.kwargs["retry"])
+            self.assertLessEqual(call.kwargs["timeout"], 15)
+
+    def test_a_spent_limit_stops_before_calling_github(self) -> None:
+        from kanbanlan.github import _Budget
+
+        budget = _Budget(0)
+
+        with self.assertRaisesRegex(RuntimeError, "time allowed"):
+            budget.options()

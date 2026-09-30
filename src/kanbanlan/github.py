@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1256,15 +1257,18 @@ class GitHub:
         kanbanlan_id: str,
         *,
         repository: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any] | None:
         """Find one request by its Kanbanlan ID without reading the board.
 
         Issue search indexes a new issue only after a delay, and a replayed
         capture most often follows the lost attempt by seconds, so the newest
         issues are read directly first and search covers anything older.
+        ``timeout`` bounds the whole lookup and turns off retries.
         """
 
         target = self._repository(repository)
+        budget = _Budget(timeout)
         for search in (None, f'"{kanbanlan_id}" in:body'):
             args = [
                 "gh",
@@ -1281,7 +1285,7 @@ class GitHub:
             ]
             if search:
                 args.extend(["--search", search])
-            for issue in self.runner.json(args, retry=True) or []:
+            for issue in self.runner.json(args, **budget.options()) or []:
                 if extract_kanbanlan_id(issue.get("body")) == kanbanlan_id:
                     return {
                         "kanbanlan_id": kanbanlan_id,
@@ -1311,18 +1315,23 @@ class GitHub:
         stay fixed however large the Project grows, and no refresh lock is
         involved. ``pull_requests`` adds the open pull requests that deliver
         it: the ones that close it, plus the ones that only declare its
-        Kanbanlan ID in a repository the Project references.
+        Kanbanlan ID in a repository the Project references. ``timeout``
+        bounds the whole read, searches included, and turns off retries.
+
+        The card's ``generated_at`` is when the read began, so a change that
+        finished before it is known to be reflected in the card.
         """
 
         config = self._config()
         target = self._repository(repository)
         owner, repo = target.split("/", 1)
         number = _issue_number(reference)
+        started = utc_now()
+        budget = _Budget(timeout)
         payload = self.graphql(
             REQUEST_CARD_QUERY,
             {"owner": owner, "repo": repo, "number": number},
-            retry=True,
-            timeout=timeout,
+            **budget.options(),
         )
         issue = (payload.get("repository") or {}).get("issue")
         if not issue:
@@ -1353,7 +1362,7 @@ class GitHub:
             seen = {value.get("url") for value in found}
             for query in _search_queries(f'"{kanbanlan_id}" is:pr is:open', repositories):
                 result = self.graphql(
-                    REQUEST_PULL_REQUEST_SEARCH, {"query": query}, retry=True, timeout=timeout
+                    REQUEST_PULL_REQUEST_SEARCH, {"query": query}, **budget.options()
                 )
                 for value in (result.get("search") or {}).get("nodes", []):
                     if value and value.get("url") and value["url"] not in seen:
@@ -1371,7 +1380,7 @@ class GitHub:
             {"id": project.get("id"), "number": project.get("number"), "items": [raw_item]},
             found if pull_requests else [],
             payload.get("rateLimit") or {},
-            generated_at=utc_now(),
+            generated_at=started,
         )
 
     def set_project_status(self, item_id: str, project: dict[str, Any], status: str) -> None:
@@ -1749,6 +1758,26 @@ def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
         if value and value.get("name") == "Status" and "options" in value:
             return value
     return None
+
+
+class _Budget:
+    """Share one time limit across the several calls of a bounded read.
+
+    Without a limit every call keeps the runner's default timeout and
+    retries transient failures; with one, calls get what is left of it and
+    never retry, since a retry's backoff alone could outlast the limit.
+    """
+
+    def __init__(self, seconds: float | None):
+        self.deadline = None if seconds is None else time.monotonic() + seconds
+
+    def options(self) -> dict[str, Any]:
+        if self.deadline is None:
+            return {"retry": True}
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("GitHub did not answer within the time allowed")
+        return {"retry": False, "timeout": remaining}
 
 
 def _is_configured_project(project: dict[str, Any], config: Config) -> bool:

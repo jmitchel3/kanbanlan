@@ -578,6 +578,53 @@ class InstantCommandTests(unittest.TestCase):
         self.assertIn("GitHub unavailable", payload["error"]["message"])
         self.assertEqual([], self.outbox.intents())
 
+    def applied_triage(self, finished_seconds_ago: float) -> Intent:
+        value = intent(
+            "triage",
+            ALPHA,
+            {"status": "Ready"},
+            state=APPLIED,
+            finished_at=isoformat(datetime.now(UTC) - timedelta(seconds=finished_seconds_ago)),
+        )
+        self.outbox.write(value)
+        return value
+
+    def test_a_live_card_is_not_overlaid_with_changes_it_already_shows(self) -> None:
+        # This machine's triage applied; someone has since moved the card
+        # back to Inbox, and the old snapshot is too stale to serve.
+        self.write_snapshot([item(7, ALPHA, "Inbox")], age_seconds=180 * 11)
+        self.applied_triage(finished_seconds_ago=60)
+        self.provider.read_request.return_value = self.card(item(7, ALPHA, "Inbox"))
+
+        code, payload, _ = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(0, code, payload)
+        self.assertEqual("Ready", payload["result"]["status"])
+
+    def test_a_change_applied_after_the_card_was_read_still_overlays_it(self) -> None:
+        self.write_snapshot([item(7, ALPHA, "Inbox")], age_seconds=180 * 11)
+        card = self.card(item(7, ALPHA, "Inbox"))
+        card["generated_at"] = isoformat(datetime.now(UTC) - timedelta(seconds=120))
+        self.applied_triage(finished_seconds_ago=60)
+        self.provider.read_request.return_value = card
+
+        code, payload, _ = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(1, code)
+        self.assertIn("not Inbox", payload["error"]["message"])
+
+    def test_a_card_read_to_decide_is_bounded_and_never_retried(self) -> None:
+        self.write_snapshot([])
+        self.provider.find_request.return_value = {"number": 7, "repository": REPOSITORY}
+        self.provider.read_request.return_value = self.card(item(7, ALPHA, "Inbox"))
+
+        self.run_cli("triage", ALPHA)
+
+        lookup = self.provider.find_request.call_args.kwargs["timeout"]
+        read = self.provider.read_request.call_args.kwargs["timeout"]
+        self.assertLessEqual(lookup, cli.PLAN_READ_TIMEOUT_SECONDS)
+        self.assertLessEqual(read, cli.PLAN_READ_TIMEOUT_SECONDS)
+
     def test_claim_without_a_worktree_queues_too(self) -> None:
         self.write_snapshot([item(7, ALPHA, "Ready")])
         with mock.patch.object(cli, "_claim_checkout", return_value=("work/a", "/tmp/a")):

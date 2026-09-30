@@ -49,10 +49,19 @@ class OneCardGitHub:
 
     provider_name = "github"
 
-    def __init__(self, status: str, *, claimed_by: str | None = None, pull_request: bool = False):
+    def __init__(
+        self,
+        status: str,
+        *,
+        claimed_by: str | None = None,
+        pull_request: bool = False,
+        on_board: bool = True,
+    ):
         from kanbanlan.providers import ProviderCapabilities
 
         self.capabilities = ProviderCapabilities()
+        self.on_board = on_board
+        self.hidden_prefix: str | None = None
         self.status = status
         self.state = "OPEN"
         self.comments: list[dict[str, Any]] = []
@@ -133,10 +142,16 @@ class OneCardGitHub:
             "id": "project-1",
             "items": [
                 {
-                    "id": "item-7",
+                    "id": "item-7" if self.on_board else None,
                     "type": "ISSUE",
                     "isArchived": False,
-                    "fieldValues": {"nodes": [{"name": self.status, "field": {"name": "Status"}}]},
+                    "fieldValues": {
+                        "nodes": (
+                            [{"name": self.status, "field": {"name": "Status"}}]
+                            if self.on_board
+                            else []
+                        )
+                    },
                     "content": {
                         "id": "issue-7",
                         "number": 7,
@@ -147,7 +162,16 @@ class OneCardGitHub:
                         "repository": {"nameWithOwner": REPOSITORY},
                         "labels": {"nodes": [{"name": "priority:p2", "color": ""}]},
                         "assignees": {"nodes": []},
-                        "comments": {"nodes": list(self.comments)},
+                        "comments": {
+                            "nodes": [
+                                value
+                                for value in self.comments
+                                if not (
+                                    self.hidden_prefix
+                                    and value["body"].startswith(self.hidden_prefix)
+                                )
+                            ]
+                        },
                     },
                 }
             ],
@@ -161,11 +185,14 @@ def cached_snapshot(github: OneCardGitHub, *, age_seconds: float) -> dict[str, A
     return value
 
 
-def guard_refresh_lock() -> Any:
+def guard_refresh_lock(*names: str) -> Any:
+    """Fail on entering ``refresh.lock``, or any other lock file named."""
+
     enter = locks.FileLock.__enter__
+    refused = {"refresh.lock", *names}
 
     def guarded(self: locks.FileLock) -> locks.FileLock:
-        if Path(self.path).name == "refresh.lock":
+        if Path(self.path).name in refused:
             raise BoardRead(f"took {self.path}")
         return enter(self)
 
@@ -257,7 +284,11 @@ class NoBoardReadTests(unittest.TestCase):
             mock.patch.object(CacheStore, "refresh", refuse),
             mock.patch.object(CacheStore, "ensure", refuse),
             mock.patch("subprocess.Popen"),
-            guard_refresh_lock(),
+            mock.patch.object(cli, "CLAIM_VERIFY_DELAYS", (0.0, 0.0, 0.0)),
+            mock.patch.object(cli, "CLAIM_CONFIRM_DELAY", 0.0),
+            # A session never waits for a drainer: it neither drains nor
+            # takes the drain lock itself.
+            guard_refresh_lock("drain.lock"),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -316,6 +347,114 @@ class NoBoardReadTests(unittest.TestCase):
                     self.assertTrue(
                         set(github.calls) <= {"read_request", "find_request"}, github.calls
                     )
+
+    def test_a_queued_capture_reads_and_writes_nothing(self) -> None:
+        environment = {"KANBANLAN_WRITE_BEHIND": "1"}
+        for label, snapshot in (
+            ("fresh", cached_snapshot(OneCardGitHub("Inbox"), age_seconds=0)),
+            ("missing", None),
+        ):
+            with self.subTest(snapshot=label):
+                self.root = Path(tempfile.mkdtemp(dir=self.directory.name))
+                github = OneCardGitHub("Inbox")
+
+                code, payload = self.run_command(
+                    ["capture", "New thing"], github, environment=environment, snapshot=snapshot
+                )
+
+                self.assertEqual(0, code, payload)
+                self.assertEqual("write-behind", payload["result"]["sync"]["mode"])
+                self.assertEqual([], github.calls)
+
+    def test_a_running_drainer_never_holds_up_a_session(self) -> None:
+        store = CacheStore(config(), self.root / "cache")
+        box = Outbox(store.directory)
+        box._prepare()
+        github = OneCardGitHub("Inbox")
+        # Another session's drainer is mid-batch and holds the drain lock.
+        with locks.FileLock(box.drain_lock_path):
+            code, payload = self.run_command(
+                ["triage", IDENTITY],
+                github,
+                environment={"KANBANLAN_WRITE_BEHIND": "1"},
+                snapshot=cached_snapshot(github, age_seconds=0),
+            )
+
+        self.assertEqual(0, code, payload)
+        self.assertEqual("Ready", payload["result"]["status"])
+
+    def test_an_issue_off_the_configured_project_is_refused_not_added(self) -> None:
+        for name, environment, argv in (
+            (
+                "replay",
+                {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"},
+                ["close", "7", "--reason", "x", "--force"],
+            ),
+            ("replay review", {"KANBANLAN_SYNC_EXECUTOR": "1"}, ["review", "7"]),
+            ("typed", {"KANBANLAN_WRITE_BEHIND": "1"}, ["close", "7", "--reason", "x"]),
+        ):
+            with self.subTest(path=name):
+                self.root = Path(tempfile.mkdtemp(dir=self.directory.name))
+                github = OneCardGitHub("Inbox", on_board=False, pull_request=True)
+
+                code, payload = self.run_command(
+                    argv, github, environment=environment, snapshot=None
+                )
+
+                self.assertEqual(1, code)
+                self.assertIn("not on the configured kanban home", payload["error"]["message"])
+                self.assertEqual(["read_request"], github.calls)
+
+    def test_a_claim_that_never_becomes_visible_fails_closed(self) -> None:
+        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
+        github = OneCardGitHub("Ready")
+        github.hidden_prefix = "CLAIM:"
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            environment=environment,
+            snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("claimed first", payload["error"]["message"])
+        self.assertNotIn("status:In progress", github.calls)
+        self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
+
+    def test_a_claim_is_confirmed_by_a_second_read_before_it_moves_the_card(self) -> None:
+        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
+        github = OneCardGitHub("Ready")
+        read = github.read_request
+        reads: list[int] = []
+
+        def lagging(reference: Any, **kwargs: Any) -> dict[str, Any]:
+            reads.append(1)
+            if len(reads) == 3:
+                # A replica catches up: an earlier claim from elsewhere appears.
+                github.comments.insert(
+                    0,
+                    {
+                        "body": "CLAIM: 2026-09-28T00:00:00Z\nSession: elsewhere",
+                        "createdAt": "2026-09-28T00:00:00Z",
+                        "author": {"login": "other"},
+                    },
+                )
+            return read(reference, **kwargs)
+
+        github.read_request = lagging  # type: ignore[method-assign]
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            environment=environment,
+            snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("claimed first by elsewhere", payload["error"]["message"])
+        self.assertEqual(3, len(reads))
+        self.assertNotIn("status:In progress", github.calls)
 
     def test_a_claim_proceeds_during_a_refresh_cooldown(self) -> None:
         # The board refresh is deferred for quota; a claim needs only its card.

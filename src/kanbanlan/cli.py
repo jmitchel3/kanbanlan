@@ -40,6 +40,7 @@ from kanbanlan.domain import request_label, resolve_request_item
 from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
 from kanbanlan.identity import attach_kanbanlan_id, new_kanbanlan_id, normalize_kanbanlan_id
 from kanbanlan.outbox import (
+    APPLIED,
     FAILED,
     PENDING_STATES,
     QUEUED,
@@ -76,6 +77,7 @@ from kanbanlan.snapshot import (
     SCHEMA_VERSION,
     SCOPE_PROJECT,
     CacheStore,
+    parse_time,
     qualified_reference,
     utc_now,
 )
@@ -2852,7 +2854,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 # A lifecycle command that must read its card before deciding waits at most
-# this long for each GitHub call; the drainer's replays keep the default.
+# this long in all, without retries; the drainer's replays keep the defaults.
 PLAN_READ_TIMEOUT_SECONDS = 15.0
 
 
@@ -2895,16 +2897,25 @@ def _instant(args: argparse.Namespace, kind: str, planner: Any, live: Any) -> in
     requested = getattr(args, "issue", None)
     quiet = bool(getattr(args, "json_output", False))
     card: dict[str, Any] | None = None
-    card_pull_requests = False
+    # Both decide on linked pull requests, so a card read for them has them.
+    card_pull_requests = kind in ("review", "close")
     if requested is not None and _needs_card(store, config, snapshot, outbox, requested):
         card = _plan_card(
-            provider, store, config, snapshot, requested, pull_requests=False, quiet=quiet
+            provider,
+            store,
+            config,
+            snapshot,
+            requested,
+            pull_requests=card_pull_requests,
+            quiet=quiet,
         )
     while True:
         try:
             with outbox.arbitration():
                 settle(outbox, snapshot)
-                view = overlay(_with_card(snapshot, card, config), outbox.pending())
+                view = overlay(
+                    _with_card(snapshot, card, config), _unreflected(outbox.pending(), card)
+                )
                 plan = planner(args, root, config, view, actor)
                 kanbanlan_id = plan.kanbanlan_id or (plan.item or {}).get("kanbanlan_id")
                 blocker = outbox.blocking_failure(kanbanlan_id)
@@ -3013,6 +3024,8 @@ def _plan_card(
                 pull_requests=pull_requests,
                 timeout=PLAN_READ_TIMEOUT_SECONDS,
             )
+    except _NotOnBoard:
+        raise
     except (CommandError, RuntimeError) as exc:
         if required or snapshot is None or _missing(snapshot, reference):
             raise
@@ -3026,6 +3039,45 @@ def _missing(snapshot: dict[str, Any], reference: str) -> bool:
         _issue(snapshot, reference)
     except RuntimeError:
         return True
+    return False
+
+
+def _unreflected(intents: list[Intent], card: dict[str, Any] | None) -> list[Intent]:
+    """Leave out applied changes a freshly read card already shows.
+
+    ``settle`` drops an applied change once a board snapshot read after it
+    lands; the same rule applies per card. Laying such a change over the
+    live card again would hide anything that moved the card since.
+    """
+
+    if card is None:
+        return intents
+    try:
+        read_at = parse_time(card["generated_at"])
+    except (KeyError, TypeError, ValueError):
+        return intents
+    items = [item for item in card.get("items", []) if item.get("type") == "ISSUE"]
+    kept: list[Intent] = []
+    for intent in intents:
+        if intent.state == APPLIED and intent.finished_at and _names_card(intent, items):
+            try:
+                if parse_time(intent.finished_at) <= read_at:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        kept.append(intent)
+    return kept
+
+
+def _names_card(intent: Intent, items: list[dict[str, Any]]) -> bool:
+    for item in items:
+        if intent.kanbanlan_id and item.get("kanbanlan_id") == intent.kanbanlan_id:
+            return True
+        if intent.reference and intent.reference in (
+            item.get("provider_ref"),
+            item.get("kanbanlan_id"),
+        ):
+            return True
     return False
 
 
@@ -3562,11 +3614,7 @@ def _set_state(
 
     item_id = item.get("project_item_id")
     if not item_id:
-        # A card missing from the Project is put back; adding is idempotent.
-        added = provider.add_to_projection(item.get("canonical_url") or item["url"])
-        item_id = (added or {}).get("id")
-        if not item_id:
-            raise RuntimeError(f"GitHub did not report a Project item for {request_label(item)}")
+        raise _NotOnBoard(f"request {request_label(item)} is not on the configured kanban home")
     # The label and the Project Status are separate records, so both writes
     # run at once; each still raises exactly as it would alone.
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -3602,6 +3650,8 @@ def _card_address(
     store: CacheStore,
     config: Config,
     reference: int | str,
+    *,
+    timeout: float | None = None,
 ) -> tuple[str, int]:
     """Find the repository and number ``reference`` names, without the board.
 
@@ -3621,13 +3671,13 @@ def _card_address(
                 cached = None
         if cached and cached.get("number") is not None:
             return cached.get("repository") or config.repository, cached["number"]
-        found = provider.find_request(kanbanlan_id, repository=config.repository)
+        found = provider.find_request(kanbanlan_id, repository=config.repository, timeout=timeout)
         if not found:
-            raise RuntimeError(f"request {value!r} is not on the configured kanban home")
+            raise _NotOnBoard(f"request {value!r} is not on the configured kanban home")
         return found.get("repository") or config.repository, found["number"]
     match = CARD_REFERENCE_RE.fullmatch(value)
     if not match:
-        raise RuntimeError(f"request {value!r} is not on the configured kanban home")
+        raise _NotOnBoard(f"request {value!r} is not on the configured kanban home")
     return match.group("repository") or config.repository, int(match.group("number"))
 
 
@@ -3644,18 +3694,29 @@ def _read_card(
 
     This is how a lifecycle command checks GitHub: one card's reads, never
     the board and never the refresh lock, so it costs the same on a board of
-    ten cards or ten thousand.
+    ten cards or ten thousand. ``timeout`` bounds the whole read, lookup of
+    a Kanbanlan ID included.
+
+    Only a request on the configured Project counts, as it would in a board
+    read: an issue that is not on it, or whose item is archived, is refused
+    rather than acted on and silently added.
     """
 
-    repository, number = _card_address(provider, store, config, reference)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    repository, number = _card_address(provider, store, config, reference, timeout=timeout)
     card = provider.read_request(
         number,
         repository=repository,
         pull_requests=pull_requests,
-        timeout=timeout,
+        timeout=None if deadline is None else max(deadline - time.monotonic(), 1.0),
     )
-    # The number may have come from a Kanbanlan ID; the card must carry it.
-    _issue(card, reference)
+    try:
+        # The number may have come from a Kanbanlan ID; the card must carry it.
+        item = _issue(card, reference)
+    except RuntimeError as exc:
+        raise _NotOnBoard(str(exc)) from None
+    if not item.get("project_item_id"):
+        raise _NotOnBoard(f"request {reference!r} is not on the configured kanban home")
     return card
 
 
@@ -3678,8 +3739,14 @@ def _verify_claim(
         time.sleep(delay)
         item = _issue(_read_card(provider, store, config, number), number)
         if item.get("active_claim"):
-            return item
-    return item
+            break
+    claim = item.get("active_claim") or {}
+    if claim.get("session") != session:
+        return item
+    # A replica that had not yet seen an earlier claim could show this one
+    # winning; one more read a moment later narrows that window.
+    time.sleep(CLAIM_CONFIRM_DELAY)
+    return _issue(_read_card(provider, store, config, number), number)
 
 
 # A provider reference to one issue: 12, #12, OWNER/REPO#12, or its qualified
@@ -3688,8 +3755,14 @@ CARD_REFERENCE_RE = re.compile(
     r"(?:github:)?(?:(?P<repository>[^/#\s]+/[^/#\s]+)#|#)?(?P<number>\d+)"
 )
 
-# Pauses before each read of a just-posted claim, until one shows it.
+# Pauses before each read of a just-posted claim, until one shows it, and
+# before the read that confirms this session won.
 CLAIM_VERIFY_DELAYS = (0.0, 0.5, 1.0)
+CLAIM_CONFIRM_DELAY = 1.0
+
+
+class _NotOnBoard(RuntimeError):
+    """GitHub answered: the reference names no card on the configured Project."""
 
 
 def _issue(snapshot: dict[str, Any], reference: int | str) -> dict[str, Any]:
