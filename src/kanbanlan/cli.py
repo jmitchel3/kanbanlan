@@ -43,7 +43,7 @@ from kanbanlan.outbox import (
     FAILED,
     PENDING_STATES,
     QUEUED,
-    RUNNING,
+    WAITING,
     Intent,
     Outbox,
     drain_outbox,
@@ -55,7 +55,13 @@ from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
 from kanbanlan.registry import RegistryStore
 from kanbanlan.rehome import format_plan, plan_rehome, rehome_result
-from kanbanlan.runner import CommandError, RateLimitError, Runner, is_transient_failure
+from kanbanlan.runner import (
+    CommandError,
+    RateLimitError,
+    Runner,
+    is_rate_limit_failure,
+    is_transient_failure,
+)
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
 from kanbanlan.sessions import (
     AgentSession,
@@ -556,7 +562,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (CommandError, RuntimeError, ValueError) as exc:
         message, hint = _friendly_error(exc)
-        _emit_error(args, message, kind=exc.__class__.__name__, hint=hint)
+        kind = exc.__class__.__name__
+        # A quota refusal that surfaced as a failed gh command is reported as
+        # one, so the outbox drainer can wait for the reset instead of failing.
+        if isinstance(exc, CommandError) and is_rate_limit_failure(exc.result):
+            kind = RateLimitError.__name__
+        reset_at = exc.reset_at if isinstance(exc, RateLimitError) else None
+        _emit_error(args, message, kind=kind, hint=hint, reset_at=reset_at)
         return 1
 
 
@@ -580,6 +592,7 @@ def _emit_error(
     *,
     kind: str,
     hint: str | None = None,
+    reset_at: str | None = None,
 ) -> None:
     if args.json_output:
         _write_json(
@@ -589,6 +602,7 @@ def _emit_error(
                     "kind": kind,
                     "message": message,
                     "hint": hint,
+                    **({"reset_at": reset_at} if reset_at else {}),
                 },
             },
             stream=sys.stderr,
@@ -3260,7 +3274,7 @@ def _drain_inline(
     """Apply every queued change before a live command, waiting for any drainer."""
 
     outbox = Outbox(store.directory)
-    if not any(value.state in (QUEUED, RUNNING) for value in outbox.intents()):
+    if not outbox.has_work():
         return
     with status("Applying queued changes to GitHub first"):
         drain_outbox(root, store, provider, wait=900.0)
@@ -3283,6 +3297,11 @@ def _sync_summary(outbox: Outbox) -> dict[str, Any]:
             {"id": value.id, "kind": value.kind, "request": value.label, "error": value.error}
             for value in intents
             if value.state == FAILED
+        ],
+        "waiting": [
+            {"id": value.id, "kind": value.kind, "request": value.label, "retry_at": value.retry_at}
+            for value in intents
+            if value.state == WAITING
         ],
     }
 
@@ -3324,10 +3343,11 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     elif args.retry:
         with outbox.arbitration():
             intent = outbox.find(args.retry)
-            if intent.state != FAILED:
+            if intent.state not in (FAILED, WAITING):
                 raise RuntimeError(f"change {intent.id} is {intent.state}, not failed")
             intent.state = QUEUED
             intent.error = None
+            intent.retry_at = None
             intent.finished_at = None
             outbox.write(intent)
         _start_sync(root)
@@ -3335,9 +3355,13 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         with outbox.arbitration():
             targets = outbox.failed() if args.dismiss == "all" else [outbox.find(args.dismiss)]
             for intent in targets:
-                if intent.state != FAILED:
+                if intent.state not in (FAILED, WAITING):
                     raise RuntimeError(f"change {intent.id} is {intent.state}, not failed")
                 outbox.remove(intent)
+    elif outbox.has_work():
+        # A change that waited out a quota reset is due again; start the
+        # drainer that queues it rather than leaving it for the worker.
+        _start_sync(root)
     intents = outbox.intents()
     payload = {"changes": [value.to_dict() for value in intents]}
     if _emit_result(args, payload):
@@ -3346,7 +3370,10 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         print("No lifecycle changes are waiting to sync.")
         return 0
     for intent in intents:
-        section(f"{intent.id} {intent.kind} {intent.label} [{intent.state}]")
+        state = intent.state
+        if state == WAITING:
+            state = f"waiting for GitHub quota until {intent.retry_at}"
+        section(f"{intent.id} {intent.kind} {intent.label} [{state}]")
         field("Queued", intent.created_at)
         if intent.error:
             field("Error", intent.error)

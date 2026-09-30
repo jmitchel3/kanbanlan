@@ -18,6 +18,7 @@ from kanbanlan.outbox import (
     FAILED,
     QUEUED,
     RUNNING,
+    WAITING,
     Execution,
     Intent,
     Outbox,
@@ -154,6 +155,13 @@ class OverlayTests(unittest.TestCase):
 
         self.assertEqual("Inbox", cli._issue(view, ALPHA)["status"])
 
+    def test_a_change_waiting_for_quota_still_overlays(self) -> None:
+        base = snapshot([item(7, ALPHA, "Inbox")])
+
+        view = overlay(base, [intent("triage", ALPHA, {"status": "Ready"}, state=WAITING)])
+
+        self.assertEqual("Ready", cli._issue(view, ALPHA)["status"])
+
     def test_the_snapshot_itself_is_never_modified(self) -> None:
         base = snapshot([item(7, ALPHA, "Inbox")])
 
@@ -264,6 +272,118 @@ class DrainTests(unittest.TestCase):
         drain(self.outbox, execute=execute, refresh=lambda: None)
 
         self.assertEqual([first.id, late[0].id], self.executed)
+
+
+class QuotaWaitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.outbox = Outbox(Path(self.directory.name))
+        self.executed: list[str] = []
+        self.limited: set[str] = set()
+        self.reset_at: str | None = None
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def add(self, kind: str, kanbanlan_id: str | None, **kwargs) -> Intent:
+        value = intent(kind, kanbanlan_id, {}, **kwargs)
+        self.outbox.write(value)
+        return value
+
+    def execute(self, value: Intent) -> Execution:
+        self.executed.append(value.id)
+        if value.id in self.limited:
+            return Execution(
+                False,
+                "API rate limit exceeded",
+                rate_limited=True,
+                retry_at=self.reset_at,
+            )
+        return Execution(True)
+
+    def run_drain(self) -> bool:
+        return drain(self.outbox, execute=self.execute, refresh=lambda: None)
+
+    def states(self) -> dict[str, Intent]:
+        return {value.id: value for value in self.outbox.intents()}
+
+    def test_a_quota_refusal_waits_with_its_reset_and_holds_later_changes(self) -> None:
+        first = self.add("claim", ALPHA)
+        second = self.add("release", ALPHA)
+        other = self.add("triage", BETA)
+        self.limited = {first.id}
+        self.reset_at = isoformat(datetime.now(UTC) + timedelta(minutes=20))
+
+        self.run_drain()
+
+        self.assertEqual([first.id], self.executed)
+        states = self.states()
+        self.assertEqual(
+            (WAITING, self.reset_at), (states[first.id].state, states[first.id].retry_at)
+        )
+        self.assertEqual(QUEUED, states[second.id].state)
+        self.assertEqual(QUEUED, states[other.id].state)
+        self.assertEqual([], self.outbox.failed())
+
+    def test_a_drain_before_the_reset_runs_nothing(self) -> None:
+        self.add(
+            "claim",
+            ALPHA,
+            state=WAITING,
+            retry_at=isoformat(datetime.now(UTC) + timedelta(minutes=5)),
+        )
+        self.add("triage", BETA)
+
+        self.run_drain()
+
+        self.assertEqual([], self.executed)
+        self.assertFalse(self.outbox.has_work())
+
+    def test_the_next_drain_after_the_reset_requeues_it_in_order(self) -> None:
+        past = isoformat(datetime.now(UTC) - timedelta(seconds=1))
+        first = self.add("claim", ALPHA, state=WAITING, retry_at=past, error="rate limited")
+        second = self.add("release", ALPHA)
+        other = self.add("triage", BETA)
+        self.assertTrue(self.outbox.has_work())
+
+        self.run_drain()
+
+        self.assertEqual([first.id, second.id, other.id], self.executed)
+        self.assertEqual([], self.outbox.intents())
+
+    def test_a_refusal_without_a_reset_time_waits_briefly(self) -> None:
+        first = self.add("claim", ALPHA)
+        self.limited = {first.id}
+
+        self.run_drain()
+
+        retry_at = self.states()[first.id].retry_at
+        assert retry_at is not None
+        delay = datetime.fromisoformat(retry_at.replace("Z", "+00:00")) - datetime.now(UTC)
+        self.assertGreater(delay, timedelta(seconds=30))
+        self.assertLessEqual(delay, timedelta(seconds=60))
+
+    def test_a_reset_already_past_still_waits_briefly(self) -> None:
+        first = self.add("claim", ALPHA)
+        self.limited = {first.id}
+        self.reset_at = isoformat(datetime.now(UTC) - timedelta(minutes=1))
+
+        self.run_drain()
+
+        self.assertEqual([first.id], self.executed)
+        self.assertEqual(WAITING, self.states()[first.id].state)
+
+    def test_other_failures_stay_terminal(self) -> None:
+        first = self.add("claim", ALPHA)
+
+        drain(
+            self.outbox,
+            execute=lambda value: Execution(False, "claimed first by claude:other"),
+            refresh=lambda: None,
+        )
+
+        self.assertEqual(FAILED, self.states()[first.id].state)
+        self.assertIsNone(self.states()[first.id].retry_at)
 
 
 class InstantCommandTests(unittest.TestCase):
@@ -476,6 +596,41 @@ class InstantCommandTests(unittest.TestCase):
         (value,) = self.outbox.intents()
         self.assertEqual((failed.id, QUEUED, None), (value.id, value.state, value.error))
 
+    def test_sync_shows_a_change_waiting_for_quota(self) -> None:
+        self.write_snapshot([])
+        reset = isoformat(datetime.now(UTC) + timedelta(minutes=10))
+        self.outbox.write(intent("claim", ALPHA, {}, state=WAITING, retry_at=reset, error="limit"))
+        stdout = StringIO()
+
+        with redirect_stdout(stdout):
+            code = cli.main(["sync"])
+
+        self.assertEqual(0, code)
+        self.assertIn(f"waiting for GitHub quota until {reset}", stdout.getvalue())
+        self.assertEqual([], self.started)
+
+    def test_plain_sync_starts_a_drainer_once_the_reset_passed(self) -> None:
+        self.write_snapshot([])
+        past = isoformat(datetime.now(UTC) - timedelta(seconds=5))
+        self.outbox.write(intent("claim", ALPHA, {}, state=WAITING, retry_at=past))
+
+        code, payload, _ = self.run_cli("sync")
+
+        self.assertEqual(0, code)
+        self.assertEqual([self.root], self.started)
+        assert payload is not None
+        self.assertEqual(WAITING, payload["result"]["changes"][0]["state"])
+
+    def test_a_waiting_change_does_not_block_new_changes_to_its_request(self) -> None:
+        self.write_snapshot([item(7, ALPHA, "Inbox")])
+        reset = isoformat(datetime.now(UTC) + timedelta(minutes=10))
+        self.outbox.write(intent("claim", ALPHA, {}, state=WAITING, retry_at=reset))
+
+        code, _, text = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(0, code, text)
+        self.assertEqual(2, len(self.outbox.intents()))
+
 
 class ExecutorTests(unittest.TestCase):
     def test_the_live_commands_json_error_message_is_recorded(self) -> None:
@@ -522,6 +677,69 @@ class FailureDetailTests(unittest.TestCase):
         stderr = json.dumps({"error": {"message": "bad {value}\n}"}}, indent=2)
 
         self.assertEqual("bad {value}\n}", _executor_error(stderr, ""))
+
+
+class QuotaFailureDetailTests(unittest.TestCase):
+    def failure(self, error: dict[str, Any]) -> Execution:
+        from kanbanlan.outbox import _executor_failure
+
+        return _executor_failure(json.dumps({"ok": False, "error": error}, indent=2), "")
+
+    def test_a_rate_limit_error_kind_carries_its_reset_time(self) -> None:
+        result = self.failure(
+            {"kind": "RateLimitError", "message": "limit", "reset_at": "2026-09-29T12:00:00Z"}
+        )
+
+        self.assertEqual((True, "2026-09-29T12:00:00Z"), (result.rate_limited, result.retry_at))
+
+    def test_the_deferral_message_yields_its_reset_time(self) -> None:
+        result = self.failure(
+            {
+                "kind": "RuntimeError",
+                "message": "GitHub refresh deferred until 2026-09-29T12:00:00Z to preserve quota",
+            }
+        )
+
+        self.assertEqual((True, "2026-09-29T12:00:00Z"), (result.rate_limited, result.retry_at))
+
+    def test_a_message_quoting_rate_limit_words_is_not_a_quota_refusal(self) -> None:
+        result = self.failure(
+            {"kind": "RuntimeError", "message": "claim of 'API rate limit exceeded' failed"}
+        )
+
+        self.assertFalse(result.rate_limited)
+
+    def test_plain_output_is_never_a_quota_refusal(self) -> None:
+        from kanbanlan.outbox import _executor_failure
+
+        result = _executor_failure("gh: API rate limit exceeded\n", "")
+
+        self.assertFalse(result.rate_limited)
+
+    def test_a_rate_limited_gh_command_is_reported_as_a_rate_limit_error(self) -> None:
+        from kanbanlan.runner import CommandError, CommandResult, RateLimitError
+
+        refused = CommandError(
+            CommandResult(("gh", "api"), 1, "", "gh: API rate limit exceeded (HTTP 403)")
+        )
+        stderr = StringIO()
+        with (
+            mock.patch.object(cli, "_cmd_status", side_effect=refused),
+            mock.patch.object(cli, "notify_if_update_available"),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, cli.main(["--json", "status"]))
+        self.assertEqual("RateLimitError", json.loads(stderr.getvalue())["error"]["kind"])
+
+        limited = RateLimitError("limit", reset_at="2026-09-29T12:00:00Z")
+        stderr = StringIO()
+        with (
+            mock.patch.object(cli, "_cmd_status", side_effect=limited),
+            mock.patch.object(cli, "notify_if_update_available"),
+            redirect_stderr(stderr),
+        ):
+            cli.main(["--json", "status"])
+        self.assertEqual("2026-09-29T12:00:00Z", json.loads(stderr.getvalue())["error"]["reset_at"])
 
 
 class ReplayLookupTests(unittest.TestCase):

@@ -15,6 +15,11 @@ Rules the drainer keeps:
 - A failed intent is never retried on its own: it stays in the outbox as
   failed, and every later intent for the same request fails as blocked
   rather than running on top of a state that never happened.
+- The exception is an intent GitHub refused for quota. Nothing was applied
+  and the refusal lifts on its own, so it waits with the reset time, and
+  the first drain after that time queues it again. While it waits no other
+  intent runs: they share the exhausted quota, and holding them keeps every
+  request's changes in creation order.
 - An intent found "running" belonged to a drainer that died mid-command.
   Its effect on GitHub is unknown, so it is failed too, never replayed.
 - Applied intents keep overlaying the snapshot until one refresh taken
@@ -26,6 +31,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -33,18 +39,23 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from kanbanlan.domain import KanbanlanRequest
 from kanbanlan.locks import FileLock
-from kanbanlan.snapshot import count_statuses, isoformat, select_ready, utc_now
+from kanbanlan.snapshot import count_statuses, isoformat, parse_time, select_ready, utc_now
 
 QUEUED = "queued"
 RUNNING = "running"
 APPLIED = "applied"
 FAILED = "failed"
-PENDING_STATES = (QUEUED, RUNNING, APPLIED)
+WAITING = "waiting"
+PENDING_STATES = (QUEUED, RUNNING, APPLIED, WAITING)
+
+# How long a quota refusal that names no reset time holds the queue.
+RATE_LIMIT_FALLBACK_SECONDS = 60
 
 EXECUTOR_ENV = "KANBANLAN_SYNC_EXECUTOR"
 WRITE_BEHIND_ENV = "KANBANLAN_WRITE_BEHIND"
@@ -81,6 +92,7 @@ class Intent:
     error: str | None = None
     finished_at: str | None = None
     note: str | None = None
+    retry_at: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -151,6 +163,29 @@ class Outbox:
 
     def failed(self) -> list[Intent]:
         return [value for value in self.intents() if value.state == FAILED]
+
+    def waiting(self) -> list[Intent]:
+        return [value for value in self.intents() if value.state == WAITING]
+
+    def quota_hold(self, now: datetime | None = None) -> Intent | None:
+        """Return the waiting intent whose quota reset is still ahead, if any."""
+
+        now = now or utc_now()
+        for value in self.waiting():
+            if not _due(value, now):
+                return value
+        return None
+
+    def has_work(self, now: datetime | None = None) -> bool:
+        """Report whether a drain started now would run anything."""
+
+        now = now or utc_now()
+        intents = self.intents()
+        if any(value.state == RUNNING for value in intents):
+            return True
+        if any(value.state == WAITING and _due(value, now) for value in intents):
+            return True
+        return self.quota_hold(now) is None and any(value.state == QUEUED for value in intents)
 
     def find(self, prefix: str) -> Intent:
         matches = [value for value in self.intents() if value.id.startswith(prefix)]
@@ -281,6 +316,10 @@ def _find(
 class Execution:
     ok: bool
     error: str | None = None
+    # Set when GitHub refused the command for quota: nothing was applied,
+    # and the command can run again once the quota resets.
+    rate_limited: bool = False
+    retry_at: str | None = None
 
 
 def drain(
@@ -311,7 +350,7 @@ def drain(
             drained = True
         finally:
             lock.__exit__(None, None, None)
-        if not any(value.state == QUEUED for value in outbox.intents()):
+        if not outbox.has_work():
             return drained
 
 
@@ -321,6 +360,7 @@ def _drain_locked(
     execute: Callable[[Intent], Execution],
     refresh: Callable[[], Any],
 ) -> None:
+    now = utc_now()
     for intent in outbox.intents():
         if intent.state == RUNNING:
             _finish(
@@ -330,7 +370,15 @@ def _drain_locked(
                 "interrupted while syncing; its effect on GitHub is unknown. Check the "
                 "board, then retry or dismiss it with 'kanbanlan sync'",
             )
+        elif intent.state == WAITING and _due(intent, now):
+            # Its seq is unchanged, so it runs ahead of every later intent.
+            intent.state = QUEUED
+            intent.retry_at = None
+            intent.finished_at = None
+            outbox.write(intent)
     while True:
+        if outbox.quota_hold() is not None:
+            break
         queued = [value for value in outbox.intents() if value.state == QUEUED]
         if not queued:
             break
@@ -352,6 +400,12 @@ def _drain_locked(
             result = Execution(False, str(exc))
         if result.ok:
             _finish(outbox, intent, APPLIED, None)
+        elif result.rate_limited:
+            intent.state = WAITING
+            intent.error = result.error or "GitHub rate limit"
+            intent.retry_at = _retry_time(result.retry_at)
+            intent.finished_at = None
+            outbox.write(intent)
         else:
             _finish(outbox, intent, FAILED, result.error or "failed")
     applied = [value for value in outbox.intents() if value.state == APPLIED]
@@ -360,6 +414,28 @@ def _drain_locked(
         refresh()
         for intent in applied:
             outbox.remove(intent)
+
+
+def _due(intent: Intent, now: datetime) -> bool:
+    if not intent.retry_at:
+        return True
+    try:
+        return parse_time(intent.retry_at) <= now
+    except (ValueError, TypeError):
+        return True
+
+
+def _retry_time(value: str | None) -> str:
+    """Return when a quota-refused intent may run again, never in the past."""
+
+    now = utc_now()
+    if value:
+        try:
+            if parse_time(value) > now:
+                return isoformat(parse_time(value))
+        except (ValueError, TypeError):
+            pass
+    return isoformat(now + timedelta(seconds=RATE_LIMIT_FALLBACK_SECONDS))
 
 
 def _finish(outbox: Outbox, intent: Intent, state: str, error: str | None) -> None:
@@ -388,13 +464,39 @@ def execute_intent(root: Path) -> Callable[[Intent], Execution]:
             return Execution(False, "timed out after 600 seconds")
         if completed.returncode == 0:
             return Execution(True)
-        return Execution(False, _executor_error(completed.stderr, completed.stdout))
+        return _executor_failure(completed.stderr, completed.stdout)
 
     return execute
 
 
-def _executor_error(stderr: str, stdout: str) -> str:
-    """Return the failed child command's own error message.
+_ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _executor_failure(stderr: str, stdout: str) -> Execution:
+    """Describe the failed child command, recognizing a quota refusal.
+
+    The child's ``--json`` error names its kind, and a quota refusal is
+    always reported as ``RateLimitError`` with the reset time when known.
+    The message is consulted only for the child's own deferral wording,
+    never for GitHub's markers, because a message can quote request titles.
+    """
+
+    error = _executor_error_payload(stderr, stdout)
+    message = _executor_error(stderr, stdout)
+    if not error or not (
+        error.get("kind") == "RateLimitError"
+        or "to preserve quota" in str(error.get("message")).lower()
+    ):
+        return Execution(False, message)
+    reset_at = error.get("reset_at")
+    if not isinstance(reset_at, str):
+        found = _ISO_TIME.search(f"{error.get('message') or ''} {error.get('hint') or ''}")
+        reset_at = found.group(0) if found else None
+    return Execution(False, message, rate_limited=True, retry_at=reset_at)
+
+
+def _executor_error_payload(stderr: str, stdout: str) -> dict[str, Any] | None:
+    """Return the failed child command's ``--json`` error object, if it wrote one.
 
     ``--json`` errors are one indented JSON document, possibly after other
     output, so the parse starts at every line that opens an object rather
@@ -413,10 +515,19 @@ def _executor_error(stderr: str, stdout: str) -> str:
             except json.JSONDecodeError:
                 continue
             error = payload.get("error") if isinstance(payload, dict) else None
-            message = error.get("message") if isinstance(error, dict) else None
-            if message:
-                hint = error.get("hint")
-                return f"{message} ({hint})" if hint else message
+            if isinstance(error, dict) and error.get("message"):
+                return error
+    return None
+
+
+def _executor_error(stderr: str, stdout: str) -> str:
+    """Return the failed child command's own error message."""
+
+    error = _executor_error_payload(stderr, stdout)
+    if error:
+        message = error["message"]
+        hint = error.get("hint")
+        return f"{message} ({hint})" if hint else message
     detail = (stderr.strip() or stdout.strip()).splitlines()
     return detail[-1] if detail else "failed without output"
 
