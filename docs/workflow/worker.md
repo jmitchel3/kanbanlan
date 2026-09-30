@@ -40,6 +40,41 @@ time is known, the cache uses a one-minute cooldown. Setting
 `rate_limit_floor = 0` disables the proactive reserve; it does not bypass a
 cooldown from GitHub refusing requests.
 
+## One refresh per repository and Project
+
+A repository registered from more than one clone (for example a live checkout
+and a forgotten copy) is refreshed once per cycle. The worker services the
+clone whose root is still a Git checkout and whose Git files (`HEAD`, `index`,
+`FETCH_HEAD`, reflog) changed most recently, and skips the others.
+
+Repository snapshots are repository-scoped: each refresh paginates the whole
+Project but keeps only its own repository's content, so one repository's
+refresh cannot stand in for another's. When several registered repositories
+share one Project, the worker refreshes that Project at most once per cycle
+and rotates through those repositories by oldest last run. A shared Project
+therefore costs one full read per interval rather than one per repository, at
+the price of each sharing repository being reconciled less often. A failed
+refresh does not count, so it never defers a sibling.
+
+`kanbanlan worker status` lists `problems`: duplicate registrations of one
+repository (with the root the worker services), and registrations whose root
+no longer exists or is not a Git checkout. `kanbanlan doctor` prints the same
+problems as warnings. Each repository entry also reports `root_state`,
+`last_activity_at`, `duplicate_skipped`, and `last_graphql_points`, the
+GraphQL points its last worker run reported spending (a mutation that reports
+no cost counts as one point).
+
+## One worker process
+
+Only the process holding `worker.lock` in the state directory runs cycles.
+`worker start` returns the live worker instead of launching another, and a
+`worker run` that finds a live holder exits at once. The running worker
+re-checks and touches its lock after every sleep; if another live worker has
+taken the lock it exits, and if the lock was swept it takes it back. Lock
+ownership checks read the owner's age with `ps -o etime=` where `etimes` is
+unavailable (macOS), so a long-running worker is never mistaken for a stale
+one.
+
 ## macOS LaunchAgent
 
 Create `/Users/YOU/Library/LaunchAgents/com.kanbanlan.worker.plist`, replacing

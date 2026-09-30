@@ -43,6 +43,8 @@ class Registration:
     consecutive_failures: int = 0
     next_retry_at: str | None = None
     interval_seconds: int = 300
+    # GraphQL points the last worker run reported spending (None before one).
+    last_graphql_points: int | None = None
 
     def __post_init__(self) -> None:
         if not self.registered_at:
@@ -54,6 +56,123 @@ class Registration:
     def from_dict(cls, value: dict[str, Any]) -> Registration:
         fields = {field: value[field] for field in cls.__dataclass_fields__ if field in value}
         return cls(**fields)
+
+
+def registration_repository_key(registration: Registration) -> str:
+    """Identify the repository a registration serves, independent of its clone."""
+
+    return f"{registration.hostname}/{registration.repository}".lower()
+
+
+def root_state(registration: Registration) -> str:
+    """Report whether a registration's root is still a usable Git checkout."""
+
+    root = Path(registration.root)
+    if not root.is_dir():
+        return "missing_root"
+    if not (root / ".git").exists():
+        return "not_a_git_checkout"
+    return "ok"
+
+
+# Files Git rewrites on checkout, commit, fetch, and staging, in the common
+# directory and in each linked worktree's private directory.
+_ACTIVITY_FILES = ("HEAD", "index", "FETCH_HEAD", "logs/HEAD")
+
+
+def last_activity(registration: Registration) -> float | None:
+    """Return the newest Git activity time for a registration's clone.
+
+    A clone someone works in touches these files constantly; a forgotten
+    clone does not, which is what tells the live checkout from a stale copy
+    when one repository is registered twice.
+    """
+
+    common = Path(registration.common_dir)
+    candidates = [common / name for name in _ACTIVITY_FILES]
+    try:
+        for worktree in (common / "worktrees").iterdir():
+            candidates.extend(worktree / name for name in _ACTIVITY_FILES)
+    except OSError:
+        pass
+    times: list[float] = []
+    for candidate in candidates:
+        try:
+            times.append(candidate.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times) if times else None
+
+
+def preferred_registration(group: list[Registration]) -> Registration:
+    """Pick the one registration of a repository the worker should service.
+
+    A usable checkout beats a missing or non-Git root, then the most recently
+    active clone wins, then the most recently successful one.
+    """
+
+    return max(
+        group,
+        key=lambda value: (
+            root_state(value) == "ok",
+            last_activity(value) or 0.0,
+            value.last_success_at or "",
+            value.registered_at,
+        ),
+    )
+
+
+def group_by_repository(registrations: list[Registration]) -> dict[str, list[Registration]]:
+    groups: dict[str, list[Registration]] = {}
+    for registration in registrations:
+        groups.setdefault(registration_repository_key(registration), []).append(registration)
+    return groups
+
+
+def registry_problems(registrations: list[Registration]) -> list[dict[str, Any]]:
+    """Describe registrations that waste refreshes or can no longer run."""
+
+    problems: list[dict[str, Any]] = []
+    for group in group_by_repository(registrations).values():
+        if len(group) < 2:
+            continue
+        active = [value for value in group if value.enabled and not value.disabled]
+        chosen = preferred_registration(active) if active else None
+        problems.append(
+            {
+                "kind": "duplicate_repository",
+                "repository": group[0].repository,
+                "roots": sorted(value.root for value in group),
+                "serviced_root": chosen.root if chosen else None,
+            }
+        )
+    for registration in registrations:
+        state = root_state(registration)
+        if state != "ok":
+            problems.append(
+                {
+                    "kind": state,
+                    "repository": registration.repository,
+                    "root": registration.root,
+                }
+            )
+    return problems
+
+
+def describe_problem(problem: dict[str, Any]) -> str:
+    kind = problem["kind"]
+    if kind == "duplicate_repository":
+        others = [root for root in problem["roots"] if root != problem.get("serviced_root")]
+        serviced = problem.get("serviced_root") or "none (all disabled)"
+        return (
+            f"{problem['repository']} is registered {len(problem['roots'])} times; "
+            f"the worker services {serviced} and skips {', '.join(others)}"
+        )
+    if kind == "missing_root":
+        return f"{problem['repository']} is registered at {problem['root']}, which no longer exists"
+    return (
+        f"{problem['repository']} is registered at {problem['root']}, which is not a Git checkout"
+    )
 
 
 class RegistryStore:

@@ -114,14 +114,28 @@ def pid_running(pid: int) -> bool:
 def process_elapsed_seconds(pid: int) -> float | None:
     """Return how long process ``pid`` has been running, or None when unknown.
 
-    ``ps -o etimes=`` is POSIX and reports whole seconds since the process
-    started, which is what distinguishes a lock's original owner from an
-    unrelated process that inherited its PID after a reboot.
+    Elapsed time is what distinguishes a lock's original owner from an
+    unrelated process that inherited its PID after a reboot. ``etimes``
+    (whole seconds) is a procps extension that macOS ``ps`` rejects, so the
+    POSIX ``etime`` form (``[[dd-]hh:]mm:ss``) is the fallback. Without it,
+    every long-lived owner on macOS looked unverifiable, and past the
+    unverifiable cap a live worker's lock was swept and a second worker
+    started beside it.
     """
 
+    seconds = _ps_field(pid, "etimes")
+    if seconds is not None:
+        try:
+            return float(seconds)
+        except ValueError:
+            pass
+    return parse_elapsed(_ps_field(pid, "etime"))
+
+
+def _ps_field(pid: int, keyword: str) -> str | None:
     try:
         result = subprocess.run(
-            ["ps", "-o", "etimes=", "-p", str(pid)],
+            ["ps", "-o", f"{keyword}=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -132,12 +146,29 @@ def process_elapsed_seconds(pid: int) -> float | None:
     if result.returncode != 0:
         return None
     fields = result.stdout.strip().split()
-    if not fields:
+    return fields[0] if fields else None
+
+
+def parse_elapsed(value: str | None) -> float | None:
+    """Parse ``ps`` ``etime`` output such as ``05:07``, ``1:02:03``, or ``3-04:05:06``."""
+
+    if not value:
         return None
-    try:
-        return float(fields[0])
-    except ValueError:
+    days = 0
+    clock = value
+    if "-" in value:
+        day_text, clock = value.split("-", 1)
+        if not day_text.isdigit():
+            return None
+        days = int(day_text)
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
         return None
+    numbers = [int(part) for part in parts]
+    if len(numbers) == 2:
+        numbers.insert(0, 0)
+    hours, minutes, seconds = numbers
+    return float(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
 
 
 def owner_predates_lock(path: Path, pid: int) -> bool:
