@@ -173,6 +173,107 @@ PROJECT_PROBE_QUERY = _PROJECT_PAGE_TEMPLATE.replace("ITEM_FIELDS", PROBE_ITEM_F
 # to search, which lags issue creation.
 RECENT_REQUEST_LIMIT = 30
 
+# One open pull request, selected exactly as the board read selects it so the
+# snapshot builder links it the same way.
+PULL_REQUEST_FIELDS = """
+            number
+            title
+            body
+            url
+            repository { nameWithOwner }
+            headRefName
+            baseRefName
+            isDraft
+            mergeStateStatus
+            createdAt
+            updatedAt
+            author { login }
+            labels(first: 50) { nodes { name color } }
+            closingIssuesReferences(first: 50) {
+              nodes { number url repository { nameWithOwner } }
+            }
+""".strip("\n")
+
+# One request with everything a lifecycle command decides on: its labels,
+# claim comments, state, and its own Project item and Status. The issue
+# selection matches PROJECT_ITEM_FIELDS, so the snapshot builder normalizes
+# this card exactly as it would from a board read, at a fixed cost however
+# large the board grows. Closing pull requests come with it; the Project's
+# repositories bound the search for pull requests that only declare the
+# request's Kanbanlan ID.
+REQUEST_CARD_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      id
+      number
+      title
+      body
+      url
+      state
+      stateReason
+      createdAt
+      updatedAt
+      closedAt
+      labels(first: 50) { nodes { name color } }
+      milestone { title }
+      assignees(first: 20) { nodes { login } }
+      comments(last: 100) {
+        totalCount
+        nodes { body createdAt author { login } }
+      }
+      repository { nameWithOwner }
+      projectItems(first: 10, includeArchived: false) {
+        nodes {
+          id
+          project {
+            id
+            number
+            owner {
+              ... on Organization { login }
+              ... on User { login }
+            }
+            repositories(first: 100) { nodes { nameWithOwner } }
+          }
+          fieldValues(first: 30) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                optionId
+                field { ... on ProjectV2SingleSelectField { id name } }
+              }
+            }
+          }
+        }
+      }
+      closedByPullRequestsReferences(first: 20, includeClosedPrs: false) {
+        nodes {
+PULL_REQUEST_FIELDS
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+""".replace("PULL_REQUEST_FIELDS", PULL_REQUEST_FIELDS)
+
+REQUEST_PULL_REQUEST_SEARCH = """
+query($query: String!) {
+  search(query: $query, type: ISSUE, first: 20) {
+    nodes {
+      ... on PullRequest {
+PULL_REQUEST_FIELDS
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+""".replace("PULL_REQUEST_FIELDS", PULL_REQUEST_FIELDS)
+
+# GitHub rejects longer search strings, so repository qualifiers are split
+# across as many searches as this allows.
+SEARCH_QUERY_LIMIT = 250
+
 # The Project's identity and fields without a single item: what one card's
 # Status write needs, at a fixed cost however large the board grows.
 PROJECT_METADATA_QUERY = _PROJECT_PAGE_TEMPLATE.replace(", $after: String", "").replace(
@@ -455,6 +556,7 @@ class GitHub:
         variables: dict[str, Any],
         *,
         retry: bool = False,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Run one GraphQL document.
 
@@ -467,6 +569,7 @@ class GitHub:
                 ["gh", "api", "graphql", "--input", "-"],
                 input_text=json.dumps({"query": query, "variables": variables}),
                 retry=retry,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         except CommandError as exc:
             if is_rate_limit_failure(exc.result):
@@ -1194,6 +1297,83 @@ class GitHub:
                     }
         return None
 
+    def read_request(
+        self,
+        reference: int | str,
+        *,
+        repository: str | None = None,
+        pull_requests: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Read one request live and return it as a one-card snapshot.
+
+        Only this card is read, never the board, so the cost and the wait
+        stay fixed however large the Project grows, and no refresh lock is
+        involved. ``pull_requests`` adds the open pull requests that deliver
+        it: the ones that close it, plus the ones that only declare its
+        Kanbanlan ID in a repository the Project references.
+        """
+
+        config = self._config()
+        target = self._repository(repository)
+        owner, repo = target.split("/", 1)
+        number = _issue_number(reference)
+        payload = self.graphql(
+            REQUEST_CARD_QUERY,
+            {"owner": owner, "repo": repo, "number": number},
+            retry=True,
+            timeout=timeout,
+        )
+        issue = (payload.get("repository") or {}).get("issue")
+        if not issue:
+            raise RuntimeError(f"request {qualified_reference(target, number)} was not found")
+        project_item = next(
+            (
+                value
+                for value in (issue.pop("projectItems", None) or {}).get("nodes", [])
+                if value and _is_configured_project(value.get("project") or {}, config)
+            ),
+            None,
+        )
+        closing = (issue.pop("closedByPullRequestsReferences", None) or {}).get("nodes", [])
+        project = (project_item or {}).get("project") or {}
+        found = [value for value in closing if value]
+        kanbanlan_id = extract_kanbanlan_id(issue.get("body"))
+        if pull_requests and kanbanlan_id:
+            repositories = sorted(
+                {
+                    target,
+                    *(
+                        value["nameWithOwner"]
+                        for value in (project.get("repositories") or {}).get("nodes", [])
+                        if value and value.get("nameWithOwner")
+                    ),
+                }
+            )
+            seen = {value.get("url") for value in found}
+            for query in _search_queries(f'"{kanbanlan_id}" is:pr is:open', repositories):
+                result = self.graphql(
+                    REQUEST_PULL_REQUEST_SEARCH, {"query": query}, retry=True, timeout=timeout
+                )
+                for value in (result.get("search") or {}).get("nodes", []):
+                    if value and value.get("url") and value["url"] not in seen:
+                        seen.add(value["url"])
+                        found.append(value)
+        raw_item = {
+            "id": (project_item or {}).get("id"),
+            "type": "ISSUE",
+            "isArchived": False,
+            "fieldValues": (project_item or {}).get("fieldValues") or {"nodes": []},
+            "content": issue,
+        }
+        return build_snapshot(
+            config,
+            {"id": project.get("id"), "number": project.get("number"), "items": [raw_item]},
+            found if pull_requests else [],
+            payload.get("rateLimit") or {},
+            generated_at=utc_now(),
+        )
+
     def set_project_status(self, item_id: str, project: dict[str, Any], status: str) -> None:
         field = _status_field(project)
         if not field:
@@ -1569,6 +1749,28 @@ def _status_field(project: dict[str, Any]) -> dict[str, Any] | None:
         if value and value.get("name") == "Status" and "options" in value:
             return value
     return None
+
+
+def _is_configured_project(project: dict[str, Any], config: Config) -> bool:
+    owner = ((project.get("owner") or {}).get("login") or "").casefold()
+    return project.get("number") == config.project_number and (
+        owner == config.project_owner.casefold()
+    )
+
+
+def _search_queries(base: str, repositories: list[str]) -> list[str]:
+    """Split repository qualifiers across searches GitHub will accept."""
+
+    queries: list[str] = []
+    current = base
+    for repository in repositories:
+        qualifier = f" repo:{repository}"
+        if current != base and len(current) + len(qualifier) > SEARCH_QUERY_LIMIT:
+            queries.append(current)
+            current = base
+        current += qualifier
+    queries.append(current)
+    return queries
 
 
 def _issue_number(reference: int | str) -> int:

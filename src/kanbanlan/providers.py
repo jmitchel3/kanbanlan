@@ -41,6 +41,15 @@ class CoordinationProvider(Protocol):
         repository: str | None = None,
     ) -> dict[str, Any] | None: ...
 
+    def read_request(
+        self,
+        reference: int | str,
+        *,
+        repository: str | None = None,
+        pull_requests: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]: ...
+
     def set_request_status(
         self,
         reference: int | str,

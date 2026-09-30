@@ -336,3 +336,122 @@ class GitHubTests(unittest.TestCase):
         )
         self.assertFalse(github.ensure_status_options())
         self.assertEqual([], github.mutations)
+
+
+class ReadRequestTests(unittest.TestCase):
+    """One card is read by number, never by paging the board."""
+
+    def issue(self) -> dict:
+        return {
+            "id": "issue-7",
+            "number": 7,
+            "title": "Request 7",
+            "body": "Body\n\n<!-- kanbanlan:id=KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA -->",
+            "url": "https://github.test/acme/widget/issues/7",
+            "state": "OPEN",
+            "repository": {"nameWithOwner": "acme/widget"},
+            "labels": {"nodes": [{"name": "status:in-progress", "color": ""}]},
+            "assignees": {"nodes": []},
+            "comments": {
+                "totalCount": 1,
+                "nodes": [
+                    {
+                        "body": "CLAIM: 2026-09-29T00:00:00Z\nSession: s1",
+                        "createdAt": "2026-09-29T00:00:01Z",
+                        "author": {"login": "agent"},
+                    }
+                ],
+            },
+            "projectItems": {
+                "nodes": [
+                    {
+                        "id": "other-item",
+                        "project": {"id": "p-9", "number": 9, "owner": {"login": "acme"}},
+                        "fieldValues": {"nodes": [{"name": "Done", "field": {"name": "Status"}}]},
+                    },
+                    {
+                        "id": "item-7",
+                        "project": {
+                            "id": "p-2",
+                            "number": 2,
+                            "owner": {"login": "Acme"},
+                            "repositories": {
+                                "nodes": [
+                                    {"nameWithOwner": "acme/widget"},
+                                    {"nameWithOwner": "acme/peer"},
+                                ]
+                            },
+                        },
+                        "fieldValues": {
+                            "nodes": [{}, {"name": "In progress", "field": {"name": "Status"}}]
+                        },
+                    },
+                ]
+            },
+            "closedByPullRequestsReferences": {"nodes": []},
+        }
+
+    def test_the_card_carries_its_own_project_item_status_and_claim(self) -> None:
+        github = GitHub(Path("/tmp"), config())
+        github.graphql = mock.Mock(return_value={"repository": {"issue": self.issue()}})
+
+        card = github.read_request(7)
+
+        (item,) = card["items"]
+        self.assertEqual(("item-7", "In progress"), (item["project_item_id"], item["status"]))
+        self.assertEqual("s1", item["active_claim"]["session"])
+        self.assertEqual("KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA", item["kanbanlan_id"])
+        self.assertEqual(1, github.graphql.call_count)
+        self.assertEqual(
+            {"owner": "acme", "repo": "widget", "number": 7}, github.graphql.call_args.args[1]
+        )
+
+    def test_pull_requests_declaring_the_identity_are_searched_in_project_repositories(
+        self,
+    ) -> None:
+        pull_request = {
+            "number": 11,
+            "title": "Delivery",
+            "body": "Kanbanlan: `KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA`",
+            "url": "https://github.test/acme/peer/pull/11",
+            "repository": {"nameWithOwner": "acme/peer"},
+            "closingIssuesReferences": {"nodes": []},
+        }
+        github = GitHub(Path("/tmp"), config())
+        github.graphql = mock.Mock(
+            side_effect=[
+                {"repository": {"issue": self.issue()}},
+                {"search": {"nodes": [pull_request]}},
+            ]
+        )
+
+        card = github.read_request(7, pull_requests=True)
+
+        (item,) = card["items"]
+        self.assertEqual(
+            ["github:acme/peer#11"],
+            [value["provider_ref"] for value in item["linked_open_pull_requests"]],
+        )
+        query = github.graphql.call_args.args[1]["query"]
+        self.assertIn('"KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA" is:pr is:open', query)
+        self.assertIn("repo:acme/peer", query)
+        self.assertIn("repo:acme/widget", query)
+
+    def test_a_missing_issue_is_reported(self) -> None:
+        github = GitHub(Path("/tmp"), config())
+        github.graphql = mock.Mock(return_value={"repository": {"issue": None}})
+
+        with self.assertRaisesRegex(RuntimeError, "was not found"):
+            github.read_request(7)
+
+    def test_search_qualifiers_are_split_to_fit_githubs_limit(self) -> None:
+        from kanbanlan.github import SEARCH_QUERY_LIMIT, _search_queries
+
+        repositories = [f"acme/repository-{index:03d}" for index in range(40)]
+
+        queries = _search_queries('"KBL-X" is:pr is:open', repositories)
+
+        self.assertGreater(len(queries), 1)
+        self.assertTrue(all(len(value) <= SEARCH_QUERY_LIMIT for value in queries))
+        joined = " ".join(queries)
+        self.assertTrue(all(f"repo:{value}" in joined for value in repositories))

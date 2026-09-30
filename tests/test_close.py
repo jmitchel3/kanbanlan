@@ -131,7 +131,8 @@ class CloseCommandTests(unittest.TestCase):
     ) -> tuple[int, str, mock.Mock, mock.Mock, mock.Mock]:
         provider = mock.Mock()
         store = mock.Mock()
-        store.refresh_for_write.return_value = value
+        store.snapshot.return_value = value
+        provider.read_request.return_value = value
         args = Namespace(
             command="close",
             issue=IDENTITY,
@@ -223,7 +224,8 @@ class CloseCommandTests(unittest.TestCase):
         provider.provider_name = "example"
         provider.capabilities.request_closing = False
         store = mock.Mock()
-        store.refresh_for_write.return_value = value
+        store.snapshot.return_value = value
+        provider.read_request.return_value = value
         args = Namespace(
             command="close",
             issue=IDENTITY,
@@ -257,6 +259,7 @@ class CloseCommandTests(unittest.TestCase):
             }
             store._write_json(store.snapshot_path, cached)
             provider = mock.Mock()
+            provider.read_request.return_value = cached
             args = Namespace(
                 command="close",
                 issue=IDENTITY,

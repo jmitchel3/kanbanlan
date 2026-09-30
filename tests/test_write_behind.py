@@ -25,6 +25,7 @@ from kanbanlan.outbox import (
     drain,
     overlay,
     pending_item,
+    settle,
     write_behind_enabled,
 )
 from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
@@ -194,10 +195,11 @@ class DrainTests(unittest.TestCase):
                 return Execution(False, "claimed first by claude:other")
             return Execution(True)
 
-        def refresh() -> None:
+        def refresh() -> dict[str, Any]:
             self.refreshes += 1
             if refresh_error:
                 raise refresh_error
+            return snapshot([])
 
         return drain(self.outbox, execute=execute, refresh=refresh)
 
@@ -273,6 +275,19 @@ class DrainTests(unittest.TestCase):
 
         self.assertEqual([first.id, late[0].id], self.executed)
 
+    def test_applied_changes_stay_until_a_snapshot_read_after_them_lands(self) -> None:
+        self.add("triage", ALPHA)
+
+        drain(self.outbox, execute=lambda value: Execution(True), refresh=lambda: None)
+        (value,) = self.outbox.intents()
+        self.assertEqual(APPLIED, value.state)
+        settle(self.outbox, snapshot([], age_seconds=60))
+        self.assertEqual([value.id], [other.id for other in self.outbox.intents()])
+
+        settle(self.outbox, snapshot([]))
+
+        self.assertEqual([], self.outbox.intents())
+
 
 class QuotaWaitTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -302,7 +317,7 @@ class QuotaWaitTests(unittest.TestCase):
         return Execution(True)
 
     def run_drain(self) -> bool:
-        return drain(self.outbox, execute=self.execute, refresh=lambda: None)
+        return drain(self.outbox, execute=self.execute, refresh=lambda: snapshot([]))
 
     def states(self) -> dict[str, Intent]:
         return {value.id: value for value in self.outbox.intents()}
@@ -487,38 +502,92 @@ class InstantCommandTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("failed to sync", payload["error"]["message"])
 
-    def test_review_without_a_known_pull_request_runs_live_after_draining(self) -> None:
+    def card(self, value: dict[str, Any]) -> dict[str, Any]:
+        return {**snapshot([value]), "items": [value]}
+
+    def test_review_reads_its_one_card_for_a_pull_request_opened_since_the_snapshot(
+        self,
+    ) -> None:
         self.write_snapshot([item(7, ALPHA, "In progress")])
-        order: list[str] = []
-        with (
-            mock.patch.object(cli, "_drain_inline", side_effect=lambda *a: order.append("drain")),
-            mock.patch.object(cli, "_review_live", side_effect=lambda a: order.append("live") or 0),
-        ):
-            code, _, _ = self.run_cli("review", ALPHA)
+        pull_request = {
+            "provider_ref": f"github:{REPOSITORY}#11",
+            "repository": REPOSITORY,
+            "url": "https://github.test/pull/11",
+            "linked_by": ["closing_reference"],
+        }
+        self.provider.read_request.return_value = self.card(
+            item(7, ALPHA, "In progress", pull_requests=[pull_request])
+        )
+
+        code, payload, _ = self.run_cli("review", ALPHA)
 
         self.assertEqual(0, code)
-        self.assertEqual(["drain", "live"], order)
+        self.assertEqual("In review", payload["result"]["status"])
+        self.assertTrue(self.provider.read_request.call_args.kwargs["pull_requests"])
+        (queued,) = self.outbox.intents()
+        self.assertEqual("review", queued.kind)
+
+    def test_review_with_no_pull_request_on_the_live_card_is_refused(self) -> None:
+        self.write_snapshot([item(7, ALPHA, "In progress")])
+        self.provider.read_request.return_value = self.card(item(7, ALPHA, "In progress"))
+
+        code, payload, _ = self.run_cli("review", ALPHA)
+
+        self.assertEqual(1, code)
+        self.assertIn("no linked open pull request", payload["error"]["message"])
         self.assertEqual([], self.outbox.intents())
 
-    def test_a_request_missing_from_the_snapshot_runs_live(self) -> None:
+    def test_a_request_newer_than_the_snapshot_is_read_as_one_card(self) -> None:
         self.write_snapshot([])
-        with (
-            mock.patch.object(cli, "_drain_inline"),
-            mock.patch.object(cli, "_triage_live", return_value=0) as live,
-        ):
-            self.run_cli("triage", ALPHA)
+        self.provider.find_request.return_value = {"number": 7, "repository": REPOSITORY}
+        self.provider.read_request.return_value = self.card(item(7, ALPHA, "Inbox"))
 
-        live.assert_called_once()
+        code, payload, _ = self.run_cli("triage", ALPHA)
 
-    def test_a_snapshot_too_old_to_trust_runs_live(self) -> None:
+        self.assertEqual(0, code)
+        self.assertEqual("Ready", payload["result"]["status"])
+        self.provider.read_request.assert_called_once()
+        self.assertEqual(7, self.provider.read_request.call_args.args[0])
+        self.provider.snapshot.assert_not_called()
+
+    def test_a_snapshot_past_its_serving_window_is_checked_against_the_card(self) -> None:
         self.write_snapshot([item(7, ALPHA, "Inbox")], age_seconds=180 * 11)
-        with (
-            mock.patch.object(cli, "_drain_inline"),
-            mock.patch.object(cli, "_triage_live", return_value=0) as live,
-        ):
-            self.run_cli("triage", ALPHA)
+        self.provider.read_request.return_value = self.card(item(7, ALPHA, "Ready"))
 
-        live.assert_called_once()
+        code, payload, _ = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(1, code)
+        self.assertIn("not Inbox", payload["error"]["message"])
+        self.provider.find_request.assert_not_called()
+
+    def test_an_unreadable_card_falls_back_to_the_stale_snapshot(self) -> None:
+        self.write_snapshot([item(7, ALPHA, "Inbox")], age_seconds=180 * 11)
+        self.provider.read_request.side_effect = RuntimeError("GitHub unavailable")
+
+        code, payload, _ = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(0, code)
+        self.assertEqual("Ready", payload["result"]["status"])
+
+    def test_no_snapshot_and_no_github_is_an_error_not_a_wait(self) -> None:
+        self.provider.find_request.side_effect = RuntimeError("GitHub unavailable")
+
+        code, payload, _ = self.run_cli("triage", ALPHA)
+
+        self.assertEqual(1, code)
+        self.assertIn("GitHub unavailable", payload["error"]["message"])
+        self.assertEqual([], self.outbox.intents())
+
+    def test_claim_without_a_worktree_queues_too(self) -> None:
+        self.write_snapshot([item(7, ALPHA, "Ready")])
+        with mock.patch.object(cli, "_claim_checkout", return_value=("work/a", "/tmp/a")):
+            code, payload, _ = self.run_cli(
+                "claim", ALPHA, "--touchpoints", "docs", "--session", "s1", "--no-worktree"
+            )
+
+        self.assertEqual(0, code)
+        self.assertEqual("write-behind", payload["result"]["sync"]["mode"])
+        self.assertEqual([], self.provider.method_calls)
 
     def test_capture_returns_its_kanbanlan_id_at_once(self) -> None:
         self.write_snapshot([])
