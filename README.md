@@ -196,6 +196,10 @@ remaining points than `rate_limit_floor` in `.kanbanlan.toml` (default 500,
 0 disables it), `ensure` defers refreshing until the quota resets. `status`
 and `doctor` report the remaining points. An explicit `kanbanlan refresh`
 always attempts the fetch and reports the rate limit plainly if it fails.
+Only full-board refreshes wait for the quota: `triage`, `review`, `release`,
+`close`, and `handoff` still make their few targeted writes during the
+cooldown from the cached snapshot, which is marked stale until a refresh runs.
+A write GitHub itself refuses fails with GitHub's reset time.
 
 Refreshes are also incremental: a cheap probe reads only item identity and
 `updatedAt` timestamps, and full item content (comments, labels, assignees) is

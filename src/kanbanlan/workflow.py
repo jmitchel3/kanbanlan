@@ -45,7 +45,10 @@ def read_board(
             limited = RateLimitError(str(exc))
             store.record_rate_limit(limited)
             raise limited from exc
-        store.record_rate_limit(exc)
+        # A local deferral already stands on its own record; re-recording it
+        # would only overwrite GitHub's refusal with the deferral message.
+        if not exc.deferred:
+            store.record_rate_limit(exc)
         raise
     # Kept beside the snapshot so a clean reconcile check can answer locally.
     try:

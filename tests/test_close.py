@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_close, build_parser
+from kanbanlan.cli import _close_live, _cmd_close, build_parser
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.github import CLOSE_REASONS, GitHub
 from kanbanlan.identity import attach_kanbanlan_id
-from kanbanlan.snapshot import build_snapshot
+from kanbanlan.snapshot import CacheStore, build_snapshot, isoformat
 from kanbanlan.workflow import expected_state
 
 REPOSITORY = "acme/widget"
@@ -130,7 +131,7 @@ class CloseCommandTests(unittest.TestCase):
     ) -> tuple[int, str, mock.Mock, mock.Mock, mock.Mock]:
         provider = mock.Mock()
         store = mock.Mock()
-        store.refresh.return_value = value
+        store.refresh_for_write.return_value = value
         args = Namespace(
             command="close",
             issue=IDENTITY,
@@ -222,7 +223,7 @@ class CloseCommandTests(unittest.TestCase):
         provider.provider_name = "example"
         provider.capabilities.request_closing = False
         store = mock.Mock()
-        store.refresh.return_value = value
+        store.refresh_for_write.return_value = value
         args = Namespace(
             command="close",
             issue=IDENTITY,
@@ -244,6 +245,46 @@ class CloseCommandTests(unittest.TestCase):
             _cmd_close(args)
 
         self.assertIn("does not support closing", str(raised.exception))
+
+    def test_close_proceeds_while_a_board_refresh_is_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            cached = snapshot([issue_item(7)])
+            cached["generated_at"] = isoformat(datetime.now(UTC))
+            cached["rate_limit"] = {
+                "remaining": 10,
+                "resetAt": isoformat(datetime.now(UTC) + timedelta(minutes=20)),
+            }
+            store._write_json(store.snapshot_path, cached)
+            provider = mock.Mock()
+            args = Namespace(
+                command="close",
+                issue=IDENTITY,
+                reason="delivered without a pull request",
+                not_planned=False,
+                force=False,
+                json_output=True,
+                repo_root=None,
+                actor_session=None,
+            )
+            with (
+                mock.patch(
+                    "kanbanlan.cli._context",
+                    return_value=(Path(directory), config(), provider, store),
+                ),
+                mock.patch("kanbanlan.cli._actor_session", return_value=None),
+                mock.patch("kanbanlan.cli._record_session_activity"),
+                mock.patch.dict("os.environ", {"KANBANLAN_BACKGROUND_REFRESH": "0"}),
+                redirect_stdout(StringIO()),
+            ):
+                code = _close_live(args)
+
+            self.assertEqual(0, code)
+            provider.snapshot.assert_not_called()
+            provider.fetch.assert_not_called()
+            provider.close_request.assert_called_once()
+            provider.set_projection_status.assert_called_once()
+            self.assertFalse(store.is_fresh())
 
     def test_a_closed_request_reconciles_to_done_without_a_status_label(self) -> None:
         value = snapshot([issue_item(7, status="In progress", state="CLOSED")])

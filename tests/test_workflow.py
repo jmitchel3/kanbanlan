@@ -51,6 +51,22 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([], provider.mock_calls)
             self.assertEqual(snapshot, store.snapshot())
 
+    def test_deferred_read_keeps_githubs_own_refusal_on_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(Config("acme/widget", "acme", "organization", 2), Path(directory))
+            reset_at = isoformat(datetime.now(UTC) + timedelta(minutes=5))
+            store.record_rate_limit(RateLimitError("secondary rate limit", reset_at=reset_at))
+            recorded = store.inspect()["error"]
+            provider = mock.Mock()
+
+            for _ in range(2):
+                with self.assertRaises(RateLimitError) as raised:
+                    read_board(store, provider)
+                self.assertTrue(raised.exception.deferred)
+
+            self.assertEqual(recorded, store.inspect()["error"])
+            self.assertEqual([], provider.mock_calls)
+
     def test_issue_list_rate_limit_is_classified_and_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CacheStore(Config("acme/widget", "acme", "organization", 2), Path(directory))

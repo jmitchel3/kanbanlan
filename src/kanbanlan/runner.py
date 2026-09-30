@@ -50,11 +50,16 @@ RATE_LIMIT_MARKERS = (
 
 
 class RateLimitError(RuntimeError):
-    """The remote refused a request because the caller is out of quota."""
+    """The remote refused a request because the caller is out of quota.
 
-    def __init__(self, message: str, reset_at: str | None = None):
+    ``deferred`` marks a full-board refresh Kanbanlan held back itself to
+    preserve quota; GitHub refused nothing, so a targeted write may proceed.
+    """
+
+    def __init__(self, message: str, reset_at: str | None = None, *, deferred: bool = False):
         super().__init__(message)
         self.reset_at = reset_at
+        self.deferred = deferred
 
 
 def is_rate_limit_failure(result: CommandResult) -> bool:

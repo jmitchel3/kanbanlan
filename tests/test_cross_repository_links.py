@@ -383,7 +383,7 @@ class ReviewCommandTests(unittest.TestCase):
     def run_review(self, value: dict[str, Any]) -> tuple[int, str, mock.Mock]:
         provider = mock.Mock()
         store = mock.Mock()
-        store.refresh.return_value = value
+        store.refresh_for_write.return_value = value
         args = Namespace(
             command="review",
             issue=IDENTITY,
@@ -441,7 +441,7 @@ class ReviewCommandTests(unittest.TestCase):
         )
         provider = mock.Mock()
         store = mock.Mock()
-        store.refresh.return_value = value
+        store.refresh_for_write.return_value = value
         args = Namespace(
             command="review",
             issue=f"{LOCAL}#7",
@@ -465,7 +465,7 @@ class ReviewCommandTests(unittest.TestCase):
         value = snapshot([issue_item(7)], [])
         provider = mock.Mock()
         store = mock.Mock()
-        store.refresh.return_value = value
+        store.refresh_for_write.return_value = value
         args = Namespace(
             command="review",
             issue=IDENTITY,
