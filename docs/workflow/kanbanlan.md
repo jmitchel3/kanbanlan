@@ -25,7 +25,9 @@ kanbanlan --json next
 in the background when stale. Lifecycle commands record their change locally
 and return; `kanbanlan sync` shows changes still being applied to GitHub and
 any that failed, which block further changes to that request until retried or
-dismissed.
+dismissed. A change GitHub refused for quota is not failed: it shows as
+waiting for GitHub quota until the reset time, holds later changes in order,
+and the first sync or worker drain after the reset applies it again.
 `reconcile` reports drift between request status, identity, active claims, pull
 requests, and projections. It also reports requests that need a Kanbanlan ID.
 Use `kanbanlan reconcile --apply` only after reviewing the plan. `--json`
