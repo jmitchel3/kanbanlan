@@ -53,7 +53,7 @@ from kanbanlan.outbox import (
 )
 from kanbanlan.providers import CoordinationProvider, create_provider
 from kanbanlan.records import create_record
-from kanbanlan.registry import RegistryStore
+from kanbanlan.registry import RegistryStore, describe_problem, registry_problems
 from kanbanlan.rehome import format_plan, plan_rehome, rehome_result
 from kanbanlan.runner import (
     CommandError,
@@ -1331,6 +1331,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 f"GraphQL points are below the configured floor of {config.rate_limit_floor}; "
                 "snapshot refreshes are deferred until the quota resets"
             )
+    # Worker registry problems are user-wide and never block this repository,
+    # so they warn without failing the check.
+    try:
+        problems = registry_problems(RegistryStore().registrations())
+    except RuntimeError as exc:
+        problems = []
+        warning(str(exc))
+    for problem in problems:
+        warning(f"worker registry: {describe_problem(problem)}")
     if failures:
         for failure in failures:
             warning(failure)

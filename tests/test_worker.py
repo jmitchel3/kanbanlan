@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,10 +12,12 @@ from unittest import mock
 
 from kanbanlan.accounts import AccountStore, repository_key
 from kanbanlan.config import Config
-from kanbanlan.registry import Registration, RegistryStore, utc_now
+from kanbanlan.locks import parse_elapsed, process_elapsed_seconds
+from kanbanlan.registry import Registration, RegistryStore, describe_problem, utc_now
 from kanbanlan.runner import CommandResult, RateLimitError
 from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
 from kanbanlan.worker import (
+    GraphQLPointMeter,
     Worker,
     WorkerAlreadyRunning,
     WorkerLock,
@@ -59,8 +62,16 @@ class WorkerTests(unittest.TestCase):
                         },
                     },
                 )
+            # Each repository has its own Project here, so this test isolates
+            # account cooldowns from the shared-Project rotation.
+            projects = {"a": 2, "b": 3, "c": 4, "d": 5}
             with (
-                mock.patch("kanbanlan.worker.Config.load", return_value=config),
+                mock.patch(
+                    "kanbanlan.worker.Config.load",
+                    side_effect=lambda path: Config(
+                        f"acme/{path.name}", "acme", "organization", projects[path.name]
+                    ),
+                ),
                 mock.patch("kanbanlan.worker.scoped_runner"),
                 mock.patch("kanbanlan.worker.GitHub"),
                 mock.patch("kanbanlan.worker.cache_dir", side_effect=lambda p: p / "cache"),
@@ -408,3 +419,301 @@ class WorkerTests(unittest.TestCase):
 
             kill.assert_called_once_with(123, signal.SIGTERM)
             self.assertEqual(stopped, payload)
+
+
+def _git_clone(path: Path, *, active_at: float) -> Path:
+    """Create a minimal checkout whose Git activity files carry ``active_at``."""
+
+    common = path / ".git"
+    common.mkdir(parents=True)
+    for name in ("HEAD", "index"):
+        (common / name).write_text("ref: refs/heads/main\n", encoding="utf-8")
+        os.utime(common / name, (active_at, active_at))
+    return common
+
+
+class CycleDeduplicationTests(unittest.TestCase):
+    def test_duplicate_registrations_of_one_repository_refresh_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = RegistryStore(base / "state")
+            now = time.time()
+            live = _git_clone(base / "live", active_at=now)
+            stale = _git_clone(base / "stale", active_at=now - 90 * 86400)
+            for common in (stale, live):
+                registry.register(
+                    common_dir=common,
+                    root=common.parent,
+                    repository="Acme/One",
+                    hostname="github.com",
+                    github_login="alice",
+                )
+            worker = Worker(registry)
+            with mock.patch.object(worker, "_run_registration") as run:
+                summary = worker.run_once()
+
+            run.assert_called_once()
+            self.assertEqual(str(live.parent.resolve()), run.call_args.args[0].root)
+            self.assertEqual(1, summary["succeeded"])
+            self.assertEqual(1, summary["skipped"])
+            duplicate = next(v for v in summary["repositories"] if v["status"] == "duplicate")
+            self.assertEqual(str(stale.parent.resolve()), duplicate["root"])
+            self.assertEqual(str(live.parent.resolve()), duplicate["serviced_root"])
+
+            status = worker_status(registry)
+            problems = [v for v in status["problems"] if v["kind"] == "duplicate_repository"]
+            self.assertEqual(1, len(problems))
+            self.assertEqual(str(live.parent.resolve()), problems[0]["serviced_root"])
+            skipped = {v["root"]: v["duplicate_skipped"] for v in status["repositories"]}
+            self.assertEqual(
+                {str(live.parent.resolve()): False, str(stale.parent.resolve()): True}, skipped
+            )
+            self.assertIn("registered 2 times", describe_problem(problems[0]))
+
+    def test_usable_checkout_wins_over_a_missing_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = RegistryStore(base / "state")
+            live = _git_clone(base / "live", active_at=time.time() - 86400)
+            registry.register(
+                common_dir=live,
+                root=live.parent,
+                repository="acme/one",
+                hostname="github.com",
+                github_login="alice",
+            )
+            registry.register(
+                common_dir=base / "gone" / ".git",
+                root=base / "gone",
+                repository="acme/one",
+                hostname="github.com",
+                github_login="alice",
+            )
+            (base / "plain").mkdir()
+            registry.register(
+                common_dir=base / "plain" / ".git",
+                root=base / "plain",
+                repository="acme/two",
+                hostname="github.com",
+                github_login="alice",
+            )
+            worker = Worker(registry)
+            with mock.patch.object(worker, "_run_registration") as run:
+                worker.run_once()
+
+            roots = sorted(call.args[0].root for call in run.call_args_list)
+            self.assertEqual(
+                sorted([str(live.parent.resolve()), str((base / "plain").resolve())]), roots
+            )
+            status = worker_status(registry)
+            states = {v["root"]: v["root_state"] for v in status["repositories"]}
+            self.assertEqual("ok", states[str(live.parent.resolve())])
+            self.assertEqual("missing_root", states[str((base / "gone").resolve())])
+            self.assertEqual("not_a_git_checkout", states[str((base / "plain").resolve())])
+            kinds = sorted(v["kind"] for v in status["problems"])
+            self.assertEqual(["duplicate_repository", "missing_root", "not_a_git_checkout"], kinds)
+            messages = [describe_problem(v) for v in status["problems"]]
+            self.assertTrue(any("no longer exists" in value for value in messages))
+            self.assertTrue(any("not a Git checkout" in value for value in messages))
+
+    def test_shared_project_is_refreshed_once_per_cycle_in_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = RegistryStore(base / "state")
+            for name in ("a", "b"):
+                registry.register(
+                    common_dir=base / name / ".git",
+                    root=base / name,
+                    repository=f"acme/{name}",
+                    hostname="github.com",
+                    github_login="alice",
+                    interval_seconds=60,
+                )
+            older = registry.get(str(base / "b" / ".git"))
+            older.last_run_at = isoformat(datetime.now(UTC) - timedelta(hours=1))
+            registry.update(older)
+            newer = registry.get(str(base / "a" / ".git"))
+            newer.last_run_at = isoformat(datetime.now(UTC) - timedelta(minutes=5))
+            registry.update(newer)
+            shared = Config("acme/a", "acme", "organization", 7)
+            worker = Worker(registry)
+
+            def serviced(registration: Registration) -> None:
+                registration.last_run_at = utc_now()
+                registry.update(registration)
+
+            with (
+                mock.patch("kanbanlan.worker.Config.load", return_value=shared),
+                mock.patch.object(worker, "_run_registration", side_effect=serviced) as run,
+            ):
+                first = worker.run_once()
+                self.assertEqual(["acme/b"], [c.args[0].repository for c in run.call_args_list])
+                deferred = next(
+                    v for v in first["repositories"] if v["status"] == "project_refreshed"
+                )
+                self.assertEqual(
+                    {"repository": "acme/a", "refreshed_by": "acme/b"},
+                    {key: deferred[key] for key in ("repository", "refreshed_by")},
+                )
+                run.reset_mock()
+                # b ran moments ago and is not due; a, deferred last cycle, runs now.
+                worker.run_once()
+                self.assertEqual(["acme/a"], [c.args[0].repository for c in run.call_args_list])
+
+    def test_failed_refresh_does_not_defer_a_repository_sharing_its_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = RegistryStore(base / "state")
+            for name in ("a", "b"):
+                registry.register(
+                    common_dir=base / name / ".git",
+                    root=base / name,
+                    repository=f"acme/{name}",
+                    hostname="github.com",
+                    github_login="alice",
+                )
+            shared = Config("acme/a", "acme", "organization", 7)
+            worker = Worker(registry)
+            with (
+                mock.patch("kanbanlan.worker.Config.load", return_value=shared),
+                mock.patch.object(
+                    worker, "_run_registration", side_effect=[RuntimeError("boom"), None]
+                ) as run,
+            ):
+                summary = worker.run_once()
+            self.assertEqual(2, run.call_count)
+            self.assertEqual((1, 1), (summary["failed"], summary["succeeded"]))
+
+
+class GraphQLPointTests(unittest.TestCase):
+    def test_meter_totals_reported_costs_and_counts_mutations(self) -> None:
+        inner = mock.Mock()
+        responses = {
+            "query": json.dumps({"data": {"rateLimit": {"cost": 3, "remaining": 10}}}),
+            "mutation": json.dumps({"data": {"updateItem": {}}}),
+        }
+        inner.run.side_effect = lambda args, **_: CommandResult(
+            tuple(args), 0, responses.get(args[-1], "[]"), ""
+        )
+        meter = GraphQLPointMeter(inner)
+        meter.run(["gh", "api", "graphql", "query"], retry=True)
+        meter.run(["gh", "api", "graphql", "query"])
+        meter.run(["gh", "api", "graphql", "mutation"])
+        meter.run(["gh", "issue", "list"])
+        self.assertEqual(7, meter.points)
+        self.assertIs(inner.env, meter.env)
+
+    def test_iteration_records_points_spent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            store.register(
+                common_dir=Path(directory) / "common",
+                root=Path(directory),
+                repository="acme/one",
+                hostname="github.com",
+                github_login="alice",
+            )
+            inner = mock.Mock()
+            inner.run.return_value = CommandResult(
+                ("gh",), 0, json.dumps({"data": {"rateLimit": {"cost": 4}}}), ""
+            )
+
+            def provider(_root, _config, *, runner):
+                runner.run(["gh", "api", "graphql", "--input", "-"])
+                runner.run(["gh", "api", "graphql", "--input", "-"])
+                value = mock.Mock()
+                value.list_open_requests.return_value = []
+                return value
+
+            cache = mock.Mock()
+            cache.refresh.return_value = {"items": []}
+            with (
+                mock.patch("kanbanlan.worker.Config.load"),
+                mock.patch("kanbanlan.worker.scoped_runner", return_value=inner),
+                mock.patch("kanbanlan.worker.GitHub", side_effect=provider),
+                mock.patch("kanbanlan.worker.cache_dir", return_value=Path(directory) / "cache"),
+                mock.patch("kanbanlan.worker.CacheStore", return_value=cache),
+                mock.patch("kanbanlan.worker.drain_outbox"),
+                mock.patch("kanbanlan.worker.plan_reconciliation", return_value=[]),
+            ):
+                Worker(store).run_once()
+
+            self.assertEqual(8, store.registrations()[0].last_graphql_points)
+            self.assertEqual(8, worker_status(store)["repositories"][0]["last_graphql_points"])
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_lock_owner_refreshes_its_lock_and_notices_a_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "worker.lock"
+            with WorkerLock(lock_path) as lock:
+                os.utime(lock_path, (1, 1))
+                self.assertTrue(lock.still_held())
+                self.assertGreater(lock_path.stat().st_mtime, 1)
+                lock_path.unlink()
+                lock_path.write_text(json.dumps({"pid": os.getpid(), "nonce": "other"}))
+                self.assertFalse(lock.still_held())
+            # The successor's lock is not ours to remove.
+            self.assertTrue(lock_path.exists())
+
+    def test_worker_exits_when_another_live_worker_owns_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            lock_path = Path(directory) / "worker.lock"
+            successor = {"pid": os.getppid(), "nonce": "successor"}
+
+            def taken_over(_seconds: float) -> None:
+                lock_path.unlink()
+                lock_path.write_text(json.dumps(successor), encoding="utf-8")
+
+            result = Worker(store, sleep=taken_over).run_forever()
+
+            self.assertTrue(result["stopped"])
+            self.assertEqual(successor, json.loads(lock_path.read_text(encoding="utf-8")))
+
+    def test_worker_reclaims_a_swept_lock_and_keeps_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            lock_path = Path(directory) / "worker.lock"
+            sleeps: list[float] = []
+
+            def sweep_then_stop(seconds: float) -> None:
+                sleeps.append(seconds)
+                if len(sleeps) == 1:
+                    lock_path.unlink()
+                    return
+                self.assertEqual(os.getpid(), json.loads(lock_path.read_text())["pid"])
+                raise StopIteration
+
+            with self.assertRaises(StopIteration):
+                Worker(store, sleep=sweep_then_stop).run_forever()
+            self.assertEqual(2, len(sleeps))
+            self.assertFalse(lock_path.exists())
+
+    def test_start_does_not_launch_beside_a_live_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistryStore(Path(directory))
+            with (
+                WorkerLock(Path(directory) / "worker.lock"),
+                mock.patch("kanbanlan.worker.subprocess") as launcher,
+            ):
+                payload = start_worker(store)
+            launcher.Popen.assert_not_called()
+            self.assertEqual(os.getpid(), payload["worker"]["pid"])
+
+    def test_long_lived_owner_is_verified_where_ps_lacks_etimes(self) -> None:
+        def fake_ps(args, **_kwargs):
+            keyword = args[2]
+            if keyword == "etimes=":
+                return CommandResult(tuple(args), 1, "", "ps: etimes: keyword not found")
+            return CommandResult(tuple(args), 0, " 1-02:03:04\n", "")
+
+        with mock.patch("kanbanlan.locks.subprocess.run", side_effect=fake_ps):
+            self.assertEqual(93784.0, process_elapsed_seconds(123))
+
+    def test_elapsed_time_parsing(self) -> None:
+        self.assertEqual(307.0, parse_elapsed("05:07"))
+        self.assertEqual(3723.0, parse_elapsed("1:02:03"))
+        self.assertEqual(273906.0, parse_elapsed("3-04:05:06"))
+        for value in (None, "", "abc", "1:2:3:4", "x-01:02"):
+            self.assertIsNone(parse_elapsed(value))
