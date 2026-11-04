@@ -19,6 +19,7 @@ from typing import Any
 
 from kanbanlan import __version__
 from kanbanlan.accounts import (
+    AccountRunner,
     AccountStore,
     logged_in_accounts,
     owner_key,
@@ -117,29 +118,30 @@ from kanbanlan.workflow import (
 )
 from kanbanlan.worktrees import (
     PRUNE,
-    REMOVE,
     CleanupAction,
+    checkout_identity,
     format_action,
     inspect_worktree,
     list_worktrees,
+    needs_inspection,
     plan_cleanup,
+    removals,
+    settled_requests,
 )
 
 PROJECT_URL_RE = re.compile(r"github\.com/(?:orgs|users)/(?P<owner>[^/]+)/projects/(?P<number>\d+)")
 DEFAULT_TEMPLATE_OWNER = "jmitchel3"
 DEFAULT_TEMPLATE_NUMBER = 6
 DEFAULT_TEMPLATE_URL = "https://github.com/users/jmitchel3/projects/6/views/5"
-COMMAND_NAMES = (
-    "init",
+# The commands top-level help lists; everything else lives under 'admin'.
+VISIBLE_COMMANDS = ("init", "start", "done", "drop", "status", "next", "doctor", "admin")
+ADMIN_COMMANDS = (
     "auth",
     "upgrade",
-    "doctor",
     "ensure",
     "refresh",
-    "status",
     "snapshot",
     "path",
-    "next",
     "overlap",
     "reconcile",
     "cleanup",
@@ -159,6 +161,7 @@ COMMAND_NAMES = (
     "sync",
     "account",
 )
+COMMAND_NAMES = (*VISIBLE_COMMANDS, *ADMIN_COMMANDS)
 
 
 @dataclass(frozen=True)
@@ -232,10 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Repository-native request coordination for humans and coding agents.",
         epilog=(
             "Common workflows:\n"
-            "  kanbanlan init                 Configure this repository\n"
-            "  kanbanlan doctor               Diagnose configuration and access\n"
-            "  kanbanlan next                 Find the next Ready request\n"
-            "  kanbanlan reconcile --apply    Repair board drift"
+            "  kanbanlan init                          Configure this repository\n"
+            "  kanbanlan start 'Fix login' --touchpoints auth.py\n"
+            "                                          Capture or pick up a request and claim it\n"
+            "  kanbanlan done                          Open the pull request and move to review\n"
+            "  kanbanlan drop                          Release this worktree's claim\n"
+            "  kanbanlan status                        Show the board summary\n"
+            "  kanbanlan admin --help                  Lower-level commands"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -257,7 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit stable JSON for agents and automation",
     )
     parser.add_argument("--version", action="version", version=f"kanbanlan {__version__}")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{" + ",".join(VISIBLE_COMMANDS) + "}",
+    )
 
     init = commands.add_parser(
         "init",
@@ -340,30 +350,118 @@ def build_parser() -> argparse.ArgumentParser:
         help="open the Project in a browser after setup",
     )
 
-    commands.add_parser("auth", help="repair GitHub login and Project scope")
-    commands.add_parser("upgrade", help="upgrade Kanbanlan to the latest release")
-    commands.add_parser("doctor", help="check local config, auth, fields, and labels")
-    commands.add_parser("ensure", help="ensure the shared snapshot is fresh")
-    refresh_command = commands.add_parser("refresh", help="refresh the shared snapshot now")
-    _add_project_scope_argument(refresh_command)
+    start = commands.add_parser(
+        "start",
+        help="capture or pick up a request, then claim it in a new worktree",
+        description=(
+            "Resolve a Kanbanlan ID or #number to its request, or capture a new request "
+            "with the given title; triage it to Ready, check the Project for other active "
+            "claims, prune orphaned request worktrees, and claim it. The worktree path is "
+            "printed last."
+        ),
+    )
+    start.add_argument("request", help="Kanbanlan ID, #number, or the title of a new request")
+    start.add_argument(
+        "--touchpoints",
+        default="unspecified",
+        help="expected files or systems to change",
+    )
+    start.add_argument("--session", help="claim owner; defaults to the detected agent session")
+    start.add_argument("--body", default="", help="body for a newly captured request")
+    start.add_argument(
+        "--priority",
+        choices=tuple(PRIORITY_LABELS),
+        default="priority:p2",
+        help="priority for a newly captured request (default: priority:p2)",
+    )
+    _add_actor_session_argument(start)
+
+    done = commands.add_parser(
+        "done",
+        help="open the pull request for this worktree's request and move it to review",
+        description=(
+            "Find the open pull request for the request's branch, creating one from the "
+            "repository's pull request template when none exists, then move the request "
+            "to In review."
+        ),
+    )
+    done.add_argument(
+        "request",
+        nargs="?",
+        help="Kanbanlan ID or #number; defaults to the request this worktree claims",
+    )
+    done.add_argument("--title", help="title for a new pull request; defaults to the request's")
+    done.add_argument("--draft", action="store_true", help="open a new pull request as a draft")
+    _add_actor_session_argument(done)
+
+    drop = commands.add_parser(
+        "drop",
+        help="release this worktree's claim, or close the request with --close",
+    )
+    drop.add_argument(
+        "request",
+        nargs="?",
+        help="Kanbanlan ID or #number; defaults to the request this worktree claims",
+    )
+    drop.add_argument("--reason", help="why the claim ends; required with --close")
+    drop.add_argument(
+        "--close", action="store_true", help="close the request instead of releasing it"
+    )
+    drop.add_argument(
+        "--not-planned",
+        action="store_true",
+        help="with --close, record the request as dropped rather than delivered",
+    )
+    drop.add_argument(
+        "--force",
+        action="store_true",
+        help="with --close, close even while a linked pull request is still open",
+    )
+    _add_actor_session_argument(drop)
+
     status_command = commands.add_parser("status", help="show local cache and board summary")
     _add_project_scope_argument(status_command)
-    snapshot_command = commands.add_parser("snapshot", help="print the current snapshot JSON")
-    _add_project_scope_argument(snapshot_command)
-    commands.add_parser("path", help="print the shared snapshot path")
     commands.add_parser("next", help="show the first unblocked Ready card")
-    commands.add_parser(
-        "overlap",
-        help="list open requests and pull requests across the whole Project",
-    )
+    commands.add_parser("doctor", help="check local config, auth, fields, and labels")
 
-    reconcile = commands.add_parser("reconcile", help="report label/claim/PR/Project drift")
+    admin = commands.add_parser(
+        "admin",
+        help="lower-level commands for snapshots, lifecycle steps, and maintenance",
+        description="Lower-level Kanbanlan commands. Each also runs without the 'admin' prefix.",
+    )
+    _add_admin_commands(
+        admin.add_subparsers(dest="admin_command", required=True, metavar="COMMAND"),
+        listed=True,
+    )
+    # The same commands stay reachable at the top level, unlisted, so existing
+    # scripts, hooks, queued sync changes, and generated instructions keep working.
+    _add_admin_commands(commands, listed=False)
+    return parser
+
+
+def _add_admin_commands(commands: Any, *, listed: bool) -> None:
+    """Register every admin command, listed in help only under 'admin'."""
+
+    def add(name: str, help_text: str) -> argparse.ArgumentParser:
+        if listed:
+            return commands.add_parser(name, help=help_text, description=help_text)
+        # A subparser added without help is left out of the command list.
+        return commands.add_parser(name, description=help_text)
+
+    add("auth", "repair GitHub login and Project scope")
+    add("upgrade", "upgrade Kanbanlan to the latest release")
+    add("ensure", "ensure the shared snapshot is fresh")
+    refresh_command = add("refresh", "refresh the shared snapshot now")
+    _add_project_scope_argument(refresh_command)
+    snapshot_command = add("snapshot", "print the current snapshot JSON")
+    _add_project_scope_argument(snapshot_command)
+    add("path", "print the shared snapshot path")
+    add("overlap", "list open requests and pull requests across the whole Project")
+
+    reconcile = add("reconcile", "report label/claim/PR/Project drift")
     reconcile.add_argument("--apply", action="store_true", help="apply the displayed repairs")
 
-    cleanup = commands.add_parser(
-        "cleanup",
-        help="remove worktrees left behind by requests that are no longer claimed",
-    )
+    cleanup = add("cleanup", "remove worktrees left behind by requests that are no longer claimed")
     cleanup.add_argument(
         "--apply",
         action="store_true",
@@ -375,7 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="also remove a worktree with uncommitted changes or unmerged commits",
     )
 
-    capture = commands.add_parser("capture", help="create an Inbox request card")
+    capture = add("capture", "create an Inbox request card")
     capture.add_argument("title", help="issue title")
     capture.add_argument("--body", default="", help="issue body; defaults to an outcome template")
     # Set by the sync drainer so a queued capture keeps the ID it was given.
@@ -395,11 +493,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_actor_session_argument(capture)
 
-    triage = commands.add_parser("triage", help="move one Inbox request to Ready")
+    triage = add("triage", "move one Inbox request to Ready")
     triage.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     _add_actor_session_argument(triage)
 
-    claim = commands.add_parser("claim", help="claim one Ready issue")
+    claim = add("claim", "claim one Ready issue")
     claim.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     claim.add_argument("--touchpoints", required=True, help="expected files or systems to change")
     claim.add_argument("--session", help="claim owner; generated when omitted")
@@ -412,16 +510,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_actor_session_argument(claim)
 
-    release = commands.add_parser("release", help="release an active claim")
+    release = add("release", "release an active claim")
     release.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     release.add_argument("--reason", required=True, help="why the claim is being released")
     release.add_argument("--blocked", action="store_true", help="move to Blocked instead of Ready")
     _add_actor_session_argument(release)
 
-    rehome = commands.add_parser(
-        "rehome",
-        help="move a request to another repository without changing its identity",
-    )
+    rehome = add("rehome", "move a request to another repository without changing its identity")
     rehome.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     rehome.add_argument(
         "--repository",
@@ -435,11 +530,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_actor_session_argument(rehome)
 
-    review = commands.add_parser("review", help="move an issue with an open PR to review")
+    review = add("review", "move an issue with an open PR to review")
     review.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     _add_actor_session_argument(review)
 
-    close = commands.add_parser("close", help="close a request and move it to Done")
+    close = add("close", "close a request and move it to Done")
     close.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     close.add_argument("--reason", required=True, help="why the request is closing")
     close.add_argument(
@@ -454,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_actor_session_argument(close)
 
-    handoff = commands.add_parser("handoff", help="transfer an active claim")
+    handoff = add("handoff", "transfer an active claim")
     handoff.add_argument("issue", help="Kanbanlan ID or canonical provider reference")
     handoff.add_argument("--session", required=True, help="new owner/session identifier")
     handoff.add_argument("--branch", required=True, help="branch the new owner should continue")
@@ -462,17 +557,13 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--reason", required=True, help="handoff context")
     _add_actor_session_argument(handoff)
 
-    sessions = commands.add_parser(
-        "sessions",
-        help="show agent sessions that performed lifecycle activity on one request",
+    sessions = add(
+        "sessions", "show agent sessions that performed lifecycle activity on one request"
     )
     sessions.add_argument("request", help="Kanbanlan ID or canonical provider reference")
     sessions.add_argument("--action", help="only show one lifecycle action")
 
-    resume = commands.add_parser(
-        "resume",
-        help="print or run the latest recorded agent resume command for one request",
-    )
+    resume = add("resume", "print or run the latest recorded agent resume command for one request")
     resume.add_argument("request", help="Kanbanlan ID or canonical provider reference")
     resume.add_argument("--action", help="select the latest session for one lifecycle action")
     resume.add_argument(
@@ -481,9 +572,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace Kanbanlan with the native agent resume command",
     )
 
-    session_hook = commands.add_parser(
-        "session-hook",
-        help="register provider-native session context from an agent lifecycle hook",
+    session_hook = add(
+        "session-hook", "register provider-native session context from an agent lifecycle hook"
     )
     session_hook.add_argument(
         "--agent",
@@ -491,10 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent harness supplying the hook payload (codex, claude, grok, or agy)",
     )
 
-    record = commands.add_parser(
-        "record",
-        help="create a durable repository record for one request",
-    )
+    record = add("record", "create a durable repository record for one request")
     record.add_argument("request", help="Kanbanlan ID or canonical provider reference")
     record.add_argument(
         "--from-pr",
@@ -505,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    worker = commands.add_parser("worker", help="manage the user-scoped background reconciler")
+    worker = add("worker", "manage the user-scoped background reconciler")
     worker.add_argument(
         "action",
         choices=("status", "enable", "disable", "start", "stop", "run"),
@@ -523,10 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     worker.add_argument("--once", action="store_true", help="run one worker iteration and exit")
 
-    sync = commands.add_parser(
-        "sync",
-        help="show, apply, retry, or dismiss lifecycle changes queued for GitHub",
-    )
+    sync = add("sync", "show, apply, retry, or dismiss lifecycle changes queued for GitHub")
     sync_action = sync.add_mutually_exclusive_group()
     sync_action.add_argument(
         "--drain", action="store_true", help="apply every queued change now and wait"
@@ -536,10 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dismiss", metavar="ID", help="drop one failed change, or 'all' failed changes"
     )
 
-    account = commands.add_parser(
-        "account",
-        help="show or bind the gh account Kanbanlan acts as for this repository",
-    )
+    account = add("account", "show or bind the gh account Kanbanlan acts as for this repository")
     account.add_argument(
         "action",
         nargs="?",
@@ -554,19 +635,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="bind every repository of this repository's owner, not just this one",
     )
 
-    return parser
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "admin":
+        # 'kanbanlan admin claim' and the unlisted 'kanbanlan claim' are one command.
+        args.command = args.admin_command
     configure_color(args.color)
     configure_progress(not args.json_output)
     if args.command not in {"upgrade", "session-hook"} and not args.json_output:
         notify_if_update_available(__version__)
     try:
-        handler = globals()[f"_cmd_{args.command.replace('-', '_')}"]
-        return int(handler(args) or 0)
+        return int(_handler(args.command)(args) or 0)
     except KeyboardInterrupt:
         _emit_error(args, "cancelled", kind="KeyboardInterrupt")
         return 130
@@ -598,7 +679,16 @@ def _write_json(value: dict[str, Any], *, stream: Any = None) -> None:
     target.write("\n")
 
 
+def _handler(command: str) -> Any:
+    return globals()[f"_cmd_{command.replace('-', '_')}"]
+
+
 def _emit_result(args: argparse.Namespace, value: dict[str, Any]) -> bool:
+    # A command run as one step of another hands its result to the caller.
+    sink = getattr(args, "result_sink", None)
+    if sink is not None:
+        sink.append(value)
+        return True
     if not args.json_output:
         return False
     _write_json({"ok": True, "result": value})
@@ -1835,30 +1925,10 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
     runner = Runner(root)
     with status("Loading worktrees and current claim state"):
         snapshot = store.refresh(provider)
-        entries = list_worktrees(runner)
-        main_path = str(primary_worktree(root))
-        current_path = runner.run(
-            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"]
-        ).stdout.strip()
-        # Merge state is only meaningful against a current default branch.
-        runner.run(["git", "fetch", "origin", config.default_branch])
-        statuses = {
-            entry.path: inspect_worktree(runner, entry, default_branch=config.default_branch)
-            for entry in entries
-            if entry.path not in {main_path, current_path} and not entry.prunable
-        }
-    plan = plan_cleanup(
-        entries,
-        snapshot,
-        statuses,
-        main_path=main_path,
-        current_path=current_path,
-        default_branch=config.default_branch,
-        force=args.force,
-    )
-    removals = [value for value in plan if value.action in {REMOVE, PRUNE}]
+        plan = _plan_worktree_cleanup(root, config, runner, snapshot, force=args.force)
+    pending_removals = removals(plan)
     payload = [value.to_dict() for value in plan]
-    if not removals:
+    if not pending_removals:
         if _emit_result(args, {"applied": False, "plan": payload, "removed": []}):
             return 0
         for value in plan:
@@ -1872,13 +1942,57 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
         for value in plan:
             print(format_action(value))
     if not args.apply:
-        warning(f"{len(removals)} worktree(s) to clean up; rerun with --apply to remove them.")
+        warning(
+            f"{len(pending_removals)} worktree(s) to clean up; rerun with --apply to remove them."
+        )
         return 2
-    removed = _apply_cleanup(runner, removals)
+    removed = _apply_cleanup(runner, pending_removals)
     if _emit_result(args, {"applied": True, "plan": payload, "removed": removed}):
         return 0
     success(f"Cleaned up {len(removed)} worktree(s).")
     return 0
+
+
+def _plan_worktree_cleanup(
+    root: Path,
+    config: Config,
+    runner: Runner,
+    snapshot: dict[str, Any],
+    *,
+    force: bool,
+    fetch: bool = True,
+) -> list[CleanupAction]:
+    """Plan what 'cleanup' does to each linked worktree against ``snapshot``."""
+
+    entries = list_worktrees(runner)
+    main_path = str(primary_worktree(root))
+    current_path = runner.run(
+        ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"]
+    ).stdout.strip()
+    if fetch:
+        # Merge state is only meaningful against a current default branch.
+        runner.run(["git", "fetch", "origin", config.default_branch])
+    settled = settled_requests(snapshot)
+    inspected = [
+        entry
+        for entry in entries
+        if entry.path not in {main_path, current_path} and needs_inspection(entry, settled)
+    ]
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(inspected)))) as pool:
+        results = pool.map(
+            lambda entry: inspect_worktree(runner, entry, default_branch=config.default_branch),
+            inspected,
+        )
+        statuses = {entry.path: value for entry, value in zip(inspected, results, strict=True)}
+    return plan_cleanup(
+        entries,
+        snapshot,
+        statuses,
+        main_path=main_path,
+        current_path=current_path,
+        default_branch=config.default_branch,
+        force=force,
+    )
 
 
 def _apply_cleanup(runner: Runner, removals: list[CleanupAction]) -> list[dict[str, Any]]:
@@ -2896,6 +3010,495 @@ def _record_from_pull_request(
         if missing:
             print(f"missing from the pull request: {', '.join(missing)}", file=sys.stderr)
     return 1 if missing else 0
+
+
+# ---------------------------------------------------------------------------
+# start, done, and drop
+#
+# Each verb composes the existing commands in-process: it runs them as steps
+# whose JSON results come back to it, so every rule (local-first planning,
+# arbitration, live re-validation on sync) is the one those commands apply.
+# ---------------------------------------------------------------------------
+
+# Commands that take --actor-session, so a verb's own one passes through.
+ACTOR_STEP_COMMANDS = frozenset({"capture", "triage", "claim", "release", "review", "close"})
+
+# Pauses before each review attempt after 'done' opens a pull request, while
+# GitHub links its closing reference to the request.
+DONE_LINK_DELAYS = (0.0, 2.0, 3.0, 5.0)
+
+DEFAULT_DROP_REASON = "dropped by its owner"
+
+
+def _step_args(
+    args: argparse.Namespace,
+    argv: list[str],
+    *,
+    capture: bool = True,
+) -> argparse.Namespace:
+    """Parse ``argv`` as a command that runs as one step of ``args``.
+
+    A captured step hands its result back through ``result_sink`` instead of
+    printing it; an uncaptured one prints exactly as that command would.
+    """
+
+    prefix = ["--color", args.color]
+    if args.repo_root:
+        prefix.extend(["-C", args.repo_root])
+    if capture or args.json_output:
+        prefix.append("--json")
+    command = list(argv)
+    if getattr(args, "actor_session", None) and command[0] in ACTOR_STEP_COMMANDS:
+        command.append(f"--actor-session={args.actor_session}")
+    step = build_parser().parse_args([*prefix, *command])
+    if capture:
+        step.result_sink = []
+    return step
+
+
+def _run_step(args: argparse.Namespace, argv: list[str]) -> dict[str, Any]:
+    step = _step_args(args, argv)
+    _handler(step.command)(step)
+    if not step.result_sink:
+        raise RuntimeError(f"kanbanlan {argv[0]} reported no result")
+    return step.result_sink[-1]
+
+
+def _looks_like_reference(value: str) -> bool:
+    text = value.strip()
+    return bool(normalize_kanbanlan_id(text) or CARD_REFERENCE_RE.fullmatch(text))
+
+
+def _session_claims(
+    requests: list[dict[str, Any]],
+    session: str | None,
+) -> list[dict[str, Any]]:
+    if not session:
+        return []
+    return [
+        request
+        for request in requests
+        if request.get("state", "OPEN") == "OPEN"
+        and (request.get("active_claim") or {}).get("session") == session
+    ]
+
+
+def _same_request(left: dict[str, Any], right: dict[str, Any] | None) -> bool:
+    if right is None:
+        return False
+    if left.get("kanbanlan_id") and left.get("kanbanlan_id") == right.get("kanbanlan_id"):
+        return True
+    return bool(left.get("provider_ref")) and left.get("provider_ref") == right.get("provider_ref")
+
+
+def _start_target(
+    provider: CoordinationProvider,
+    store: CacheStore,
+    config: Config,
+    view: dict[str, Any],
+    reference: str,
+) -> dict[str, Any]:
+    try:
+        return _issue(view, reference)
+    except RuntimeError:
+        pass
+    # Newer than the local view: GitHub decides, within a few seconds.
+    with status(f"Checking request {reference}"):
+        card = _read_card(provider, store, config, reference, timeout=PLAN_READ_TIMEOUT_SECONDS)
+    return _issue(card, reference)
+
+
+def _prune_orphaned_worktrees(
+    root: Path,
+    config: Config,
+    provider: CoordinationProvider,
+    store: CacheStore,
+    view: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Remove only what 'cleanup --apply' would remove, and report it.
+
+    The local view finds candidates without touching GitHub. Any candidate
+    is then decided exactly as cleanup decides, against a fresh board read and
+    a current default branch, with changes still queued for GitHub laid over
+    it so a claim made moments ago keeps its worktree.
+    """
+
+    runner = Runner(root)
+    with status("Checking for orphaned request worktrees"):
+        candidates = removals(
+            _plan_worktree_cleanup(root, config, runner, view, force=False, fetch=False)
+        )
+    if not candidates:
+        return []
+    with status("Confirming orphaned worktrees against GitHub"):
+        snapshot = overlay(store.refresh(provider), Outbox(store.directory).pending())
+        confirmed = removals(_plan_worktree_cleanup(root, config, runner, snapshot, force=False))
+    if not confirmed:
+        return []
+    return _apply_cleanup(runner, confirmed)
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    root, config, provider, store = _context(args)
+    actor = _actor_session(args, root, config)
+    session = args.session or (actor.reference if actor else None)
+    view = _local_view(root, store, provider, label="Loading the local board")
+    reference = args.request.strip()
+    target: dict[str, Any] | None = None
+    if _looks_like_reference(reference):
+        target = _start_target(provider, store, config, view, reference)
+        label = request_label(target)
+        if target.get("state") != "OPEN":
+            raise RuntimeError(f"request {label} is not open")
+        claim = target.get("active_claim") or {}
+        if claim and session and claim.get("session") == session:
+            return _emit_start(
+                args,
+                started,
+                target,
+                {
+                    "kanbanlan_id": target.get("kanbanlan_id"),
+                    "provider_ref": target.get("provider_ref"),
+                    "session": session,
+                    "branch": claim.get("branch"),
+                    "worktree": claim.get("worktree"),
+                },
+                resumed=True,
+            )
+        if claim:
+            owner = claim.get("session") or claim.get("author") or "another session"
+            raise RuntimeError(f"request {label} is already claimed by {owner}")
+        if target.get("status") not in {"Inbox", "Ready"}:
+            raise RuntimeError(
+                f"request {label} is {target.get('status')!r}; only Inbox or Ready "
+                "requests can be started"
+            )
+
+    overlap = _run_step(args, ["overlap"])
+    requests = overlap.get("open_requests", [])
+    for owned in [
+        *_session_claims(
+            [item for item in view.get("items", []) if item.get("type") == "ISSUE"], session
+        ),
+        *_session_claims(requests, session),
+    ]:
+        if not _same_request(owned, target):
+            raise RuntimeError(
+                f"session {session} already owns {request_label(owned)}; finish it with "
+                "'kanbanlan done' or release it with 'kanbanlan drop' first"
+            )
+    others = [
+        {
+            "kanbanlan_id": request.get("kanbanlan_id"),
+            "provider_ref": request.get("provider_ref"),
+            "repository": request.get("repository"),
+            "title": request.get("title"),
+            "status": request.get("status"),
+            "session": request["active_claim"].get("session"),
+            "touchpoints": request["active_claim"].get("touchpoints"),
+            "linked_open_pull_requests": [
+                pull_request.get("url")
+                for pull_request in request.get("linked_open_pull_requests", [])
+            ],
+        }
+        for request in requests
+        if request.get("active_claim") and not _same_request(request, target)
+    ]
+
+    pruned = _prune_orphaned_worktrees(root, config, provider, store, view)
+
+    captured = None
+    if target is None:
+        captured = _run_step(
+            args,
+            [
+                "capture",
+                f"--priority={args.priority}",
+                f"--body={args.body}",
+                "--",
+                reference,
+            ],
+        )
+        reference = captured["kanbanlan_id"]
+        status_name = "Inbox"
+    else:
+        reference = _sync_reference(target)
+        status_name = target.get("status")
+    triaged = status_name == "Inbox"
+    if triaged:
+        _run_step(args, ["triage", reference])
+    claim_argv = ["claim", reference, f"--touchpoints={args.touchpoints}"]
+    if args.session:
+        claim_argv.append(f"--session={args.session}")
+    claimed = _run_step(args, claim_argv)
+    request = target or {
+        "kanbanlan_id": captured["kanbanlan_id"] if captured else None,
+        "provider_ref": (captured or {}).get("provider_ref"),
+        "title": args.request.strip(),
+    }
+    return _emit_start(
+        args,
+        started,
+        request,
+        claimed,
+        captured=captured is not None,
+        triaged=triaged,
+        others=others,
+        unlinked=[
+            {
+                "provider_ref": pull_request.get("provider_ref"),
+                "title": pull_request.get("title"),
+                "url": pull_request.get("url"),
+            }
+            for pull_request in overlap.get("unlinked_open_pull_requests", [])
+        ],
+        pruned=pruned,
+    )
+
+
+def _emit_start(
+    args: argparse.Namespace,
+    started: float,
+    request: dict[str, Any],
+    claimed: dict[str, Any],
+    *,
+    resumed: bool = False,
+    captured: bool = False,
+    triaged: bool = False,
+    others: list[dict[str, Any]] | None = None,
+    unlinked: list[dict[str, Any]] | None = None,
+    pruned: list[dict[str, Any]] | None = None,
+) -> int:
+    others = others or []
+    result = {
+        "request": {
+            "kanbanlan_id": request.get("kanbanlan_id"),
+            "provider_ref": claimed.get("provider_ref") or request.get("provider_ref"),
+            "title": request.get("title"),
+        },
+        "captured": captured,
+        "triaged": triaged,
+        "resumed": resumed,
+        "pruned": pruned or [],
+        "overlap": {
+            "active_claims": others,
+            "unlinked_open_pull_requests": unlinked or [],
+        },
+        "claim": claimed,
+        "session": claimed.get("session"),
+        "branch": claimed.get("branch"),
+        "worktree": claimed.get("worktree"),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+    if _emit_result(args, result):
+        return 0
+    label = request.get("kanbanlan_id") or request.get("provider_ref") or ""
+    if captured:
+        success(f"Captured {label} {request.get('title')}")
+    if triaged:
+        success(f"Moved {label} to Ready")
+    for value in pruned or []:
+        success(f"Pruned orphaned worktree {value['path']} ({value['reason']})")
+    if others:
+        warning(
+            f"{len(others)} other active claim(s) on the Project; "
+            "check them for semantic overlap before you build"
+        )
+        for other in others:
+            section(f"{other['provider_ref']} {other['title']}")
+            field("Session", other.get("session") or "unknown")
+            field("Touchpoints", other.get("touchpoints") or "not declared")
+    if resumed:
+        success(f"{label} is already claimed by {claimed.get('session')}; continuing it")
+    else:
+        success(f"Claimed {label} as {claimed.get('session')}")
+    if claimed.get("branch"):
+        print(f"branch: {claimed['branch']}")
+    # Last, so an agent can cd into it.
+    print(claimed.get("worktree") or "")
+    return 0
+
+
+def _checkout_request(
+    root: Path,
+    store: CacheStore,
+    provider: CoordinationProvider,
+) -> str:
+    """Return the request the current worktree or branch was claimed for."""
+
+    branch = Runner(root).run(["git", "branch", "--show-current"]).stdout.strip()
+    identity = checkout_identity(root, branch)
+    if identity:
+        return identity
+    view = _local_view(root, store, provider, label="Finding the request for this worktree")
+    matches = [
+        item
+        for item in view.get("items", [])
+        if item.get("type") == "ISSUE"
+        and item.get("active_claim")
+        and (
+            (branch and item["active_claim"].get("branch") == branch)
+            or item["active_claim"].get("worktree") == str(root)
+        )
+    ]
+    if len(matches) == 1:
+        return _sync_reference(matches[0])
+    raise RuntimeError(
+        "this checkout is not claimed for a request; pass its Kanbanlan ID or #number"
+    )
+
+
+def _cmd_drop(args: argparse.Namespace) -> int:
+    if not args.close and (args.not_planned or args.force):
+        raise RuntimeError("--not-planned and --force only apply with --close")
+    if args.close and not args.reason:
+        raise RuntimeError("--close requires --reason")
+    reference = args.request
+    if not reference:
+        root, _, provider, store = _context(args)
+        reference = _checkout_request(root, store, provider)
+    if args.close:
+        argv = ["close", reference, f"--reason={args.reason}"]
+        if args.not_planned:
+            argv.append("--not-planned")
+        if args.force:
+            argv.append("--force")
+    else:
+        argv = ["release", reference, f"--reason={args.reason or DEFAULT_DROP_REASON}"]
+    step = _step_args(args, argv, capture=False)
+    return int(_handler(step.command)(step) or 0)
+
+
+def _gh_runner(root: Path, config: Config) -> Runner:
+    return AccountRunner(root, config)
+
+
+def _open_pull_request(gh: Runner, config: Config, branch: str) -> dict[str, Any] | None:
+    output = gh.run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            config.repository,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url,isDraft",
+            "--limit",
+            "1",
+        ]
+    ).stdout
+    values = json.loads(output or "[]")
+    return values[0] if values else None
+
+
+def _pull_request_body(root: Path, config: Config, item: dict[str, Any]) -> str:
+    """Fill the repository's pull request template with the request's identity."""
+
+    kanbanlan_line = f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}"
+    repository = item.get("repository") or config.repository
+    number = item["number"]
+    target = f"#{number}" if repository == config.repository else f"{repository}#{number}"
+    closes_line = f"Closes {target}"
+    template = root / ".github" / "pull_request_template.md"
+    try:
+        body = template.read_text(encoding="utf-8")
+    except OSError:
+        body = f"## Summary\n\n{item.get('title') or ''}\n"
+    body, kanbanlan_found = re.subn(r"(?m)^Kanbanlan:.*$", kanbanlan_line, body, count=1)
+    body, closes_found = re.subn(r"(?m)^Closes\b.*$", closes_line, body, count=1)
+    missing = [
+        line
+        for line, found in ((kanbanlan_line, kanbanlan_found), (closes_line, closes_found))
+        if not found
+    ]
+    if missing:
+        body = body.rstrip("\n") + "\n\n" + "\n".join(missing) + "\n"
+    return body
+
+
+def _review_step(args: argparse.Namespace, reference: str, *, wait: bool) -> dict[str, Any]:
+    delays = DONE_LINK_DELAYS if wait else (0.0,)
+    for attempt, delay in enumerate(delays, start=1):
+        time.sleep(delay)
+        try:
+            return _run_step(args, ["review", reference])
+        except RuntimeError as exc:
+            if attempt == len(delays) or "no linked open pull request" not in str(exc):
+                raise
+    raise AssertionError("unreachable")
+
+
+def _cmd_done(args: argparse.Namespace) -> int:
+    root, config, provider, store = _context(args)
+    reference = args.request or _checkout_request(root, store, provider)
+    view = _local_view(root, store, provider, label=f"Loading request {reference}")
+    try:
+        item = _issue(view, reference)
+    except RuntimeError:
+        item = {}
+    if item.get("number") is None:
+        # A pull request names the canonical issue, which a queued capture lacks.
+        _drain_inline(root, config, store, provider)
+        with status(f"Loading request {reference}"):
+            item = _issue(_read_card(provider, store, config, reference), reference)
+    label = request_label(item)
+    if item.get("state") != "OPEN":
+        raise RuntimeError(f"request {label} is not open")
+    runner = Runner(root)
+    branch = (item.get("active_claim") or {}).get("branch") or runner.run(
+        ["git", "branch", "--show-current"]
+    ).stdout.strip()
+    if not branch or branch == config.default_branch:
+        raise RuntimeError(
+            f"request {label} has no work branch; run 'kanbanlan done' from its worktree"
+        )
+    gh = _gh_runner(root, config)
+    with status(f"Looking for the open pull request from {branch}"):
+        pull_request = _open_pull_request(gh, config, branch)
+    created = pull_request is None
+    if pull_request is None:
+        with status(f"Pushing {branch}"):
+            runner.run(["git", "push", "--set-upstream", "origin", branch])
+        command = [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            config.repository,
+            "--base",
+            config.default_branch,
+            "--head",
+            branch,
+            "--title",
+            args.title or item.get("title") or label,
+            "--body",
+            _pull_request_body(root, config, item),
+        ]
+        if args.draft:
+            command.append("--draft")
+        with status(f"Opening a pull request for {label}"):
+            output = gh.run(command).stdout.strip()
+        pull_request = {"url": output.splitlines()[-1] if output else None}
+    review = _review_step(args, _sync_reference(item), wait=created)
+    result = {
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "provider_ref": item.get("provider_ref"),
+        "branch": branch,
+        "pull_request": pull_request,
+        "created_pull_request": created,
+        "review": review,
+    }
+    if _emit_result(args, result):
+        return 0
+    verb = "Opened" if created else "Found"
+    success(f"{verb} pull request {pull_request.get('url')}")
+    success(f"Moved {label} to In review")
+    return 0
 
 
 # ---------------------------------------------------------------------------
