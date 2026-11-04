@@ -36,7 +36,7 @@ def read_board(
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             open_requests = executor.submit(provider.list_open_requests)
-            snapshot = store.refresh(provider)
+            snapshot = store.refresh(provider, projection=True)
             requests = open_requests.result()
     except (CommandError, RateLimitError) as exc:
         if isinstance(exc, CommandError):
@@ -209,14 +209,14 @@ def apply_reconciliation(
         assert action.issue_url
         provider.add_to_projection(action.issue_url)
     if additions:
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh(provider, projection=True)
         planned = plan_reconciliation(snapshot, open_issues)
 
     identities = [value for value in planned if value.kind == "assign_kanbanlan_id"]
     for action in identities:
         provider.ensure_request_identity(action.issue_number, new_kanbanlan_id())
     if identities:
-        snapshot = store.refresh(provider)
+        snapshot = store.refresh(provider, projection=True)
         planned = plan_reconciliation(snapshot, open_issues)
 
     for action in planned:
