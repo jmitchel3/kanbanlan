@@ -122,8 +122,12 @@ class ParserTests(unittest.TestCase):
         admin = parser._subparsers._group_actions[0].choices["admin"]  # noqa: SLF001
         listed = admin.format_help()
 
-        for name in cli.ADMIN_COMMANDS:
-            self.assertIn(f"    {name} ", listed)
+        names = [
+            line.split()[0]
+            for line in listed.split("positional arguments:")[1].splitlines()
+            if line.startswith("    ") and not line.startswith("     ")
+        ]
+        self.assertEqual(sorted(cli.ADMIN_COMMANDS), sorted(names))
 
     def test_every_admin_command_still_parses_at_the_top_level(self) -> None:
         parser = cli.build_parser()
