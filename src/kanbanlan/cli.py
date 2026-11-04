@@ -1449,7 +1449,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     if queued:
         warning(
             f"{queued} change(s) an older Kanbanlan queued for GitHub are still waiting; "
-            "the next lifecycle command applies them"
+            "the next lifecycle command applies them or reports how to retry them"
         )
     if failures:
         for failure in failures:

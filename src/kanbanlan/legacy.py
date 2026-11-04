@@ -35,7 +35,14 @@ LAUNCHD_LABEL = "com.kanbanlan.worker"
 SYSTEMD_UNIT = "kanbanlan-worker.service"
 # Everything the worker kept in the user state directory. Account bindings
 # (accounts.json) live there too and are kept.
-WORKER_STATE_FILES = ("registry.json", "registry.lock", "worker.lock", "worker.lock.steal")
+# 'worker start' also wrote the detached worker's output to worker.log.
+WORKER_STATE_FILES = (
+    "registry.json",
+    "registry.lock",
+    "worker.lock",
+    "worker.lock.steal",
+    "worker.log",
+)
 
 # Set for the child command that replays one legacy change, so it does not
 # try to migrate the outbox its parent is already migrating.
@@ -209,7 +216,8 @@ def apply_legacy_outbox(
                 "command": ["kanbanlan", *argv] if argv else None,
                 "error": value.get("error"),
             }
-            request = value.get("kanbanlan_id")
+            # A change queued before its request had an ID names it by provider ref.
+            request = value.get("kanbanlan_id") or value.get("reference")
             if state in (QUEUED, WAITING) and argv and request not in failed_requests:
                 ok, message = execute(argv)
                 entry["outcome"] = "applied" if ok else "failed"

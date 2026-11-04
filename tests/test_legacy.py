@@ -121,6 +121,18 @@ class LegacyOutboxTests(unittest.TestCase):
         )
         self.assertIn("triage refused", legacy.describe_change(report[0]))
 
+    def test_a_failure_blocks_later_changes_named_only_by_provider_ref(self) -> None:
+        for seq, kind in ((1, "triage"), (2, "claim")):
+            path = write_intent(self.cache, seq, kind, "queued")
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value.update(kanbanlan_id=None, reference="jmitchel3/example#5", argv=[kind, "5"])
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        report = self.migrate(failing={"triage"})
+
+        self.assertEqual([["triage", "5"]], self.ran)
+        self.assertEqual(["failed", "not applied"], [entry["outcome"] for entry in report])
+
     def test_the_replay_child_never_migrates_again(self) -> None:
         write_intent(self.cache, 1, "triage", "queued")
         with mock.patch.dict(os.environ, {legacy.SKIP_ENV: "1"}):
@@ -193,7 +205,7 @@ class WorkerUninstallTests(unittest.TestCase):
         for unit in (plist, service):
             unit.parent.mkdir(parents=True)
             unit.write_text("unit", encoding="utf-8")
-        for name in ("registry.json", "worker.lock", "accounts.json"):
+        for name in ("registry.json", "worker.lock", "worker.log", "accounts.json"):
             (self.state / name).write_text("{}", encoding="utf-8")
         return plist, service
 
@@ -211,6 +223,7 @@ class WorkerUninstallTests(unittest.TestCase):
         self.assertEqual(sorted([str(plist), str(service)]), sorted(result["units_removed"]))
         self.assertFalse((self.state / "registry.json").exists())
         self.assertFalse((self.state / "worker.lock").exists())
+        self.assertFalse((self.state / "worker.log").exists())
         # Account bindings are not worker state.
         self.assertTrue((self.state / "accounts.json").exists())
 
@@ -256,7 +269,7 @@ class WorkerUninstallTests(unittest.TestCase):
         leftovers = legacy.worker_leftovers(self.state)
 
         self.assertEqual(sorted([str(plist), str(service)]), sorted(leftovers["units"]))
-        self.assertEqual(2, len(leftovers["state_files"]))
+        self.assertEqual(3, len(leftovers["state_files"]))
 
 
 class ReplayedCaptureTests(unittest.TestCase):
