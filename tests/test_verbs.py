@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,10 +11,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from test_write_behind import ALPHA, BETA, REPOSITORY, config, item, snapshot
+from board_fixtures import ALPHA, BETA, REPOSITORY, config, item, snapshot
 
 from kanbanlan import cli
-from kanbanlan.outbox import Outbox
 from kanbanlan.runner import CommandResult
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.worktrees import (
@@ -27,6 +25,7 @@ from kanbanlan.worktrees import (
     settled_requests,
 )
 
+NEW = "KBL-CCCCCCCCCCCCCCCCCCCCCCCCCC"
 WORKTREE = "/repo/.worktrees/kbl-aaaaaaaaaaaaaaaaaaaaaaaaaa-request-7"
 BRANCH = "work/kbl-aaaaaaaaaaaaaaaaaaaaaaaaaa-request-7"
 PULL_REQUEST = {
@@ -64,13 +63,10 @@ class VerbTestCase(unittest.TestCase):
         self.provider = mock.Mock()
         self.provider.capabilities.project_scope = True
         patches = [
-            mock.patch.dict(os.environ, {"KANBANLAN_WRITE_BEHIND": "1"}),
             mock.patch.object(
                 cli, "_context", return_value=(self.root, config(), self.provider, self.store)
             ),
             mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "_start_sync"),
-            mock.patch.object(cli, "_spawn_refresh"),
             mock.patch.object(cli, "notify_if_update_available"),
         ]
         for patcher in patches:
@@ -85,8 +81,8 @@ class VerbTestCase(unittest.TestCase):
         self.store._write_json(self.store.snapshot_path, snapshot(items))
 
     def write_project(self, items: list[dict[str, Any]]) -> None:
-        self.store._prepare_directory()
-        self.store.write_project_snapshot(snapshot(items))
+        # The overlap check reads the whole Project live.
+        self.provider.snapshot.return_value = snapshot(items)
 
     def run_cli(self, *argv: str, json_output: bool = True) -> tuple[int, Any, str]:
         stdout, stderr = StringIO(), StringIO()
@@ -98,9 +94,46 @@ class VerbTestCase(unittest.TestCase):
         except json.JSONDecodeError:
             return code, None, text
 
+    def record_steps(self, *names: str) -> None:
+        """Stand in for lifecycle commands, recording each step a verb runs."""
+
+        self.steps: list[tuple[str, Any]] = []
+        for name in names:
+            patcher = mock.patch.object(cli, f"_cmd_{name}", side_effect=self._recorder(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _recorder(self, name: str) -> Any:
+        def run(args: Any) -> int:
+            self.steps.append((name, args))
+            reference = getattr(args, "issue", None) or NEW
+            results = {
+                "capture": {"kanbanlan_id": NEW, "provider_ref": f"github:{REPOSITORY}#9"},
+                "triage": {"kanbanlan_id": reference, "status": "Ready"},
+                "claim": {
+                    "kanbanlan_id": reference,
+                    "provider_ref": f"github:{REPOSITORY}#9",
+                    "session": getattr(args, "session", None),
+                    "branch": BRANCH,
+                    "worktree": WORKTREE,
+                },
+                "release": {"kanbanlan_id": reference, "status": "Ready"},
+                "close": {
+                    "kanbanlan_id": reference,
+                    "status": "Done",
+                    "close_reason": "not_planned"
+                    if getattr(args, "not_planned", False)
+                    else "completed",
+                },
+            }
+            cli._emit_result(args, results[name])
+            return 0
+
+        return run
+
     @property
-    def intents(self) -> list[Any]:
-        return Outbox(self.store.directory).intents()
+    def kinds(self) -> list[str]:
+        return [name for name, _ in self.steps]
 
 
 class ParserTests(unittest.TestCase):
@@ -162,9 +195,7 @@ class StartTests(VerbTestCase):
             patcher = mock.patch.object(cli, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(cli, "_create_worktree")
-        self.create_worktree = patcher.start()
-        self.addCleanup(patcher.stop)
+        self.record_steps("capture", "triage", "claim")
 
     def test_a_title_is_captured_triaged_and_claimed_in_one_call(self) -> None:
         self.write_snapshot([])
@@ -179,12 +210,10 @@ class StartTests(VerbTestCase):
         self.assertTrue(value["triaged"])
         self.assertEqual(WORKTREE, value["worktree"])
         self.assertEqual("s1", value["session"])
-        self.assertEqual(["capture", "triage", "claim"], [intent.kind for intent in self.intents])
-        claim = self.intents[-1]
-        self.assertEqual("cli.py", claim.argv[claim.argv.index("--touchpoints") + 1])
-        self.assertEqual(value["request"]["kanbanlan_id"], claim.argv[1])
-        self.create_worktree.assert_called_once()
-        self.assertEqual([], self.provider.method_calls)
+        self.assertEqual(["capture", "triage", "claim"], self.kinds)
+        claim = self.steps[-1][1]
+        self.assertEqual("cli.py", claim.touchpoints)
+        self.assertEqual(value["request"]["kanbanlan_id"], claim.issue)
 
     def test_a_ready_reference_is_claimed_without_capture_or_triage(self) -> None:
         self.write_snapshot([item(7, ALPHA, "Ready")])
@@ -194,8 +223,8 @@ class StartTests(VerbTestCase):
         self.assertEqual(0, code)
         self.assertFalse(payload["result"]["captured"])
         self.assertFalse(payload["result"]["triaged"])
-        self.assertEqual(["claim"], [intent.kind for intent in self.intents])
-        self.assertEqual(ALPHA, self.intents[0].argv[1])
+        self.assertEqual(["claim"], self.kinds)
+        self.assertEqual(ALPHA, self.steps[0][1].issue)
 
     def test_an_inbox_reference_is_triaged_first(self) -> None:
         self.write_snapshot([item(7, ALPHA, "Inbox")])
@@ -204,7 +233,7 @@ class StartTests(VerbTestCase):
 
         self.assertEqual(0, code)
         self.assertTrue(payload["result"]["triaged"])
-        self.assertEqual(["triage", "claim"], [intent.kind for intent in self.intents])
+        self.assertEqual(["triage", "claim"], self.kinds)
 
     def test_a_card_claimed_by_someone_else_is_refused(self) -> None:
         self.write_snapshot([item(7, ALPHA, "In progress", claim={"session": "other"})])
@@ -213,7 +242,7 @@ class StartTests(VerbTestCase):
 
         self.assertEqual(1, code)
         self.assertIn("already claimed by other", payload["error"]["message"])
-        self.assertEqual([], self.intents)
+        self.assertEqual([], self.steps)
 
     def test_a_session_that_already_owns_a_card_is_refused(self) -> None:
         self.write_snapshot(
@@ -227,7 +256,7 @@ class StartTests(VerbTestCase):
 
         self.assertEqual(1, code)
         self.assertIn("already owns", payload["error"]["message"])
-        self.assertEqual([], self.intents)
+        self.assertEqual([], self.steps)
 
     def test_a_new_title_is_refused_before_capture_when_the_session_owns_a_card(self) -> None:
         self.write_snapshot([])
@@ -237,7 +266,7 @@ class StartTests(VerbTestCase):
 
         self.assertEqual(1, code)
         self.assertIn("already owns", payload["error"]["message"])
-        self.assertEqual([], self.intents)
+        self.assertEqual([], self.steps)
 
     def test_starting_the_card_this_session_owns_continues_it(self) -> None:
         claim = {"session": "s1", "branch": BRANCH, "worktree": WORKTREE}
@@ -248,7 +277,7 @@ class StartTests(VerbTestCase):
         self.assertEqual(0, code)
         self.assertTrue(payload["result"]["resumed"])
         self.assertEqual(WORKTREE, payload["result"]["worktree"])
-        self.assertEqual([], self.intents)
+        self.assertEqual([], self.steps)
 
     def test_other_active_claims_are_reported_with_their_touchpoints(self) -> None:
         self.write_snapshot([item(8, BETA, "Ready")])
@@ -411,7 +440,7 @@ class DoneTests(VerbTestCase):
         self.assertIn("Closes #7", body)
         self.assertEqual(BRANCH, create[create.index("--head") + 1])
         self.assertIn(["git", "push", "--set-upstream", "origin", BRANCH], self.git.calls)
-        self.assertEqual(["review"], [intent.kind for intent in self.intents])
+        self.provider.set_request_status.assert_called_once_with(7, "status:review")
 
     def test_done_reuses_an_open_pull_request(self) -> None:
         self.gh.answers = {("gh", "pr", "list"): json.dumps([{"url": PULL_REQUEST["url"]}])}
@@ -455,15 +484,16 @@ class DropTests(VerbTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.write_snapshot([item(7, ALPHA, "In progress", claim={"session": "s1"})])
+        self.record_steps("release", "close")
 
     def test_drop_releases_this_worktrees_claim(self) -> None:
         code, payload, _ = self.run_cli("drop")
 
         self.assertEqual(0, code)
         self.assertEqual("Ready", payload["result"]["status"])
-        (queued,) = self.intents
-        self.assertEqual("release", queued.kind)
-        self.assertEqual(cli.DEFAULT_DROP_REASON, queued.argv[queued.argv.index("--reason") + 1])
+        ((kind, step),) = self.steps
+        self.assertEqual("release", kind)
+        self.assertEqual(cli.DEFAULT_DROP_REASON, step.reason)
 
     def test_drop_close_closes_the_request(self) -> None:
         code, payload, _ = self.run_cli(
@@ -472,16 +502,16 @@ class DropTests(VerbTestCase):
 
         self.assertEqual(0, code)
         self.assertEqual("not_planned", payload["result"]["close_reason"])
-        (queued,) = self.intents
-        self.assertEqual("close", queued.kind)
-        self.assertIn("--not-planned", queued.argv)
+        ((kind, step),) = self.steps
+        self.assertEqual("close", kind)
+        self.assertTrue(step.not_planned)
 
     def test_drop_close_needs_a_reason(self) -> None:
         code, payload, _ = self.run_cli("drop", "--close")
 
         self.assertEqual(1, code)
         self.assertIn("--close requires --reason", payload["error"]["message"])
-        self.assertEqual([], self.intents)
+        self.assertEqual([], self.steps)
 
     def test_close_only_flags_need_close(self) -> None:
         code, payload, _ = self.run_cli("drop", "--not-planned")

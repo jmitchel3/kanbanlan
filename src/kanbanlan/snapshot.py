@@ -510,11 +510,6 @@ def read_from(snapshot: dict[str, Any] | None) -> str:
     return source.get("read_from") or READ_FROM_PROJECT
 
 
-# How many staleness windows a snapshot may serve local reads for while a
-# background refresh replaces it.
-SERVE_STALE_FACTOR = 10
-
-
 def _future_reset(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -560,50 +555,6 @@ class CacheStore:
                 assert snapshot is not None
                 return snapshot
             return self._refresh_locked(client, projection=projection)
-
-    def refresh_for_write(self, client: Any) -> dict[str, Any]:
-        """Return a snapshot a lifecycle write can act on.
-
-        This is ``refresh``, except while a full-board refresh is deferred
-        to preserve quota: then the last usable snapshot answers and is
-        marked stale, so the first read after the cooldown fetches the board
-        again. Only the board read is deferred; the write itself still goes
-        to GitHub, and a write GitHub refuses fails with its own reset time.
-        """
-
-        try:
-            return self.refresh(client)
-        except RateLimitError as exc:
-            snapshot = self.snapshot()
-            if not exc.deferred or not self._usable(snapshot):
-                raise
-            assert snapshot is not None
-            self.invalidate()
-            return snapshot
-
-    def serveable(self, snapshot: dict[str, Any] | None) -> bool:
-        """Report whether a snapshot may answer a local read without GitHub.
-
-        A stale snapshot still serves while a background refresh replaces
-        it, but only within ``SERVE_STALE_FACTOR`` staleness windows: past
-        that it is too old to decide anything, and the caller waits.
-        """
-
-        if not self._usable(snapshot):
-            return False
-        age = self._snapshot_age(snapshot)
-        return age is not None and age <= self.config.stale_seconds * SERVE_STALE_FACTOR
-
-    def usable(self, snapshot: dict[str, Any] | None) -> bool:
-        """Report whether a snapshot of any age can answer a local read."""
-
-        return self._usable(snapshot)
-
-    def needs_revalidation(self, snapshot: dict[str, Any] | None) -> bool:
-        # The revalidating refresh repeats the read that produced the snapshot.
-        return self._snapshot_state(snapshot) != "fresh" and not self.rate_limit_deferral(
-            snapshot, graphql=read_from(snapshot) != READ_FROM_ISSUES
-        )
 
     def write_open_requests(self, open_requests: list[dict[str, Any]]) -> None:
         self._prepare_directory()

@@ -504,44 +504,6 @@ class RateLimitBehaviorTests(unittest.TestCase):
             with self.assertRaises(RateLimitError):
                 store.ensure(client)
 
-    def test_write_proceeds_from_the_cached_snapshot_while_refresh_is_deferred(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = CacheStore(config(), Path(directory))
-            low = _stale_snapshot(10, 1800)
-            low["generated_at"] = isoformat(datetime.now(UTC))
-            store._write_json(store.snapshot_path, low)
-            client = _CountingClient()
-
-            served = store.refresh_for_write(client)
-
-            self.assertEqual(0, client.fetches)
-            self.assertEqual(low, served)
-            # Marked stale, so the first read after the reset fetches the board.
-            self.assertFalse(store.is_fresh())
-            with mock.patch(
-                "kanbanlan.snapshot.utc_now",
-                return_value=datetime.now(UTC) + timedelta(seconds=1801),
-            ):
-                self.assertTrue(store.needs_revalidation(store.snapshot()))
-                store.ensure(client)
-            self.assertEqual(1, client.fetches)
-
-    def test_write_path_still_fails_when_github_refuses_the_read(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = CacheStore(config(), Path(directory))
-            store._write_json(store.snapshot_path, _stale_snapshot(4000, 1800))
-            upstream_reset = isoformat(datetime.now(UTC) + timedelta(seconds=900))
-            client = _CountingClient(
-                error=RateLimitError("API rate limit exceeded", reset_at=upstream_reset)
-            )
-
-            with self.assertRaises(RateLimitError) as raised:
-                store.refresh_for_write(client)
-
-            self.assertFalse(raised.exception.deferred)
-            self.assertEqual(upstream_reset, raised.exception.reset_at)
-            self.assertEqual(1, client.fetches)
-
     def test_deferred_refresh_without_a_usable_snapshot_still_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CacheStore(config(), Path(directory))
@@ -549,7 +511,7 @@ class RateLimitBehaviorTests(unittest.TestCase):
             client = _CountingClient()
 
             with self.assertRaises(RateLimitError) as raised:
-                store.refresh_for_write(client)
+                store.refresh(client)
 
             self.assertTrue(raised.exception.deferred)
             self.assertEqual(0, client.fetches)
@@ -570,7 +532,7 @@ class RateLimitBehaviorTests(unittest.TestCase):
                     "kanbanlan.snapshot.utc_now",
                     return_value=datetime.now(UTC) + timedelta(seconds=offset),
                 ):
-                    store.refresh_for_write(client)
+                    self.assertEqual(store.snapshot(), store.ensure(client))
                     with self.assertRaises(RateLimitError):
                         store.check_refresh_allowed()
 

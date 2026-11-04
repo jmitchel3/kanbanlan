@@ -1017,7 +1017,7 @@ class GitHub:
         rate_limit = reader.stats.rate_limit()
         if isinstance(metadata.get("graphql_rate_limit"), dict):
             # The GraphQL quota the last Project read saw, so the rate-limit
-            # floor still holds back Project reads (reconcile, the worker).
+            # floor still holds back Project reads (reconcile, project scope).
             rate_limit["graphql"] = metadata["graphql_rate_limit"]
         return build_snapshot(
             config,

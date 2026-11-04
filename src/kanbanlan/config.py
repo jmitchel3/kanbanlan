@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import tomllib
 from collections.abc import Mapping
@@ -236,6 +237,17 @@ def normalize_repository_target(value: str, *, hostname: str) -> str:
             f"but this repository is configured for {hostname}"
         )
     return url.group("repo")
+
+
+def state_dir() -> Path:
+    """Return the user-level directory for account bindings and legacy state."""
+
+    override = os.environ.get("KANBANLAN_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "Kanbanlan"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "kanbanlan"
 
 
 def cache_dir(root: Path) -> Path:

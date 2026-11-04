@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _close_live, _cmd_close, build_parser
+from kanbanlan.cli import _cmd_close, build_parser
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.github import CLOSE_REASONS, GitHub
@@ -277,10 +277,9 @@ class CloseCommandTests(unittest.TestCase):
                 ),
                 mock.patch("kanbanlan.cli._actor_session", return_value=None),
                 mock.patch("kanbanlan.cli._record_session_activity"),
-                mock.patch.dict("os.environ", {"KANBANLAN_BACKGROUND_REFRESH": "0"}),
                 redirect_stdout(StringIO()),
             ):
-                code = _close_live(args)
+                code = _cmd_close(args)
 
             self.assertEqual(0, code)
             provider.snapshot.assert_not_called()

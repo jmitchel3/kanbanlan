@@ -30,9 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kanbanlan.config import Config
+from kanbanlan.config import Config, state_dir
 from kanbanlan.locks import FileLock
-from kanbanlan.registry import state_dir
 from kanbanlan.runner import CommandResult, Runner
 
 ACCOUNT_ENV = "KANBANLAN_GITHUB_ACCOUNT"
