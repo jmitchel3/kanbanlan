@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import COMMAND_NAMES, _cmd_rehome, build_parser
+from cli_patch import patch_cli
+
+from kanbanlan.cli.lifecycle import _cmd_rehome
+from kanbanlan.cli.parser import COMMAND_NAMES, build_parser
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.identity import attach_kanbanlan_id
@@ -251,11 +254,11 @@ class RehomeCommandTests(unittest.TestCase):
         args = build_parser().parse_args(argv)
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
+            patch_cli("_actor_session", return_value=None),
             redirect_stdout(stream),
         ):
             code = _cmd_rehome(args)

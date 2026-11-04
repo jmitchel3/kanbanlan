@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_capture, _place_captured_request, build_parser
+from cli_patch import patch_cli
+
+from kanbanlan.cli.lifecycle import _cmd_capture, _place_captured_request
+from kanbanlan.cli.parser import build_parser
 from kanbanlan.config import Config, normalize_repository_target
 from kanbanlan.github import GitHub
 from kanbanlan.identity import attach_kanbanlan_id
@@ -282,16 +285,16 @@ class CaptureRoutingTests(unittest.TestCase):
         args = build_parser().parse_args((["--json"] if json_output else []) + argv)
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
-            mock.patch(
-                "kanbanlan.cli.new_kanbanlan_id",
+            patch_cli("_actor_session", return_value=None),
+            patch_cli(
+                "new_kanbanlan_id",
                 return_value="KBL-AAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
-            mock.patch("kanbanlan.cli._refresh_after_mutation") as refresh,
+            patch_cli("_refresh_after_mutation") as refresh,
             redirect_stdout(stream),
         ):
             code = _cmd_capture(args)
@@ -445,11 +448,11 @@ class CaptureRoutingTests(unittest.TestCase):
         provider.capabilities.repository_routing = False
         args = build_parser().parse_args(["capture", "Add a page", "--repository", PEER])
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, mock.Mock()),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
+            patch_cli("_actor_session", return_value=None),
             self.assertRaises(RuntimeError) as raised,
         ):
             _cmd_capture(args)
@@ -465,11 +468,11 @@ class CaptureRoutingTests(unittest.TestCase):
             ["capture", "Add a page", "--repository", f"https://github.enterprise.test/{PEER}"]
         )
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, mock.Mock()),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
+            patch_cli("_actor_session", return_value=None),
             self.assertRaises(RuntimeError),
         ):
             _cmd_capture(args)

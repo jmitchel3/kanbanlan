@@ -10,25 +10,25 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from cli_patch import patch_cli
+
 from kanbanlan import __version__
-from kanbanlan.cli import (
+from kanbanlan.cli.app import main
+from kanbanlan.cli.context import _record_session_activity
+from kanbanlan.cli.parser import build_parser
+from kanbanlan.cli.sessions import _cmd_resume, _cmd_session_hook, _cmd_sessions
+from kanbanlan.cli.setup import (
     DEFAULT_TEMPLATE_NUMBER,
     DEFAULT_TEMPLATE_OWNER,
     ProjectChoice,
     _choose_project,
     _cmd_init,
-    _cmd_resume,
-    _cmd_session_hook,
-    _cmd_sessions,
     _cmd_upgrade,
     _materialize_project,
     _parse_template,
     _project_number,
     _project_reference,
     _prompt_bool,
-    _record_session_activity,
-    build_parser,
-    main,
 )
 from kanbanlan.config import Config
 from kanbanlan.runner import CommandError, CommandResult
@@ -55,9 +55,7 @@ class CliTests(unittest.TestCase):
                 provider = mock.Mock()
                 stderr = StringIO()
                 with (
-                    mock.patch(
-                        "kanbanlan.cli._context", return_value=(root, config, provider, store)
-                    ),
+                    patch_cli("_context", return_value=(root, config, provider, store)),
                     redirect_stderr(stderr),
                 ):
                     result = main(["--json", "reconcile", *options])
@@ -95,8 +93,8 @@ class CliTests(unittest.TestCase):
         output = StringIO()
 
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/repo"), mock.Mock(), mock.Mock(), store),
             ),
             redirect_stdout(output),
@@ -128,8 +126,8 @@ class CliTests(unittest.TestCase):
         output = StringIO()
 
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/repo"), mock.Mock(), mock.Mock(), store),
             ),
             redirect_stdout(output),
@@ -152,10 +150,10 @@ class CliTests(unittest.TestCase):
         output = StringIO()
 
         with (
-            mock.patch("kanbanlan.cli._root", return_value=root),
-            mock.patch("kanbanlan.cli.Config.load", return_value=config),
-            mock.patch("kanbanlan.cli.cache_dir", return_value=Path("/cache")),
-            mock.patch("kanbanlan.cli.SessionContextStore", return_value=context),
+            patch_cli("_root", return_value=root),
+            mock.patch("kanbanlan.config.Config.load", return_value=config),
+            patch_cli("cache_dir", return_value=Path("/cache")),
+            patch_cli("SessionContextStore", return_value=context),
             mock.patch("sys.stdin", StringIO('{"conversationId":"agy-test","cwd":"/repo"}')),
             redirect_stdout(output),
         ):
@@ -262,7 +260,7 @@ class CliTests(unittest.TestCase):
         runner = mock.Mock()
         args = build_parser().parse_args(["upgrade"])
 
-        with mock.patch("kanbanlan.cli.Runner", return_value=runner):
+        with patch_cli("Runner", return_value=runner):
             self.assertEqual(0, _cmd_upgrade(args))
 
         runner.run.assert_called_once_with(
@@ -277,7 +275,7 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["upgrade"])
 
         with (
-            mock.patch("kanbanlan.cli.Runner", return_value=runner),
+            patch_cli("Runner", return_value=runner),
             self.assertRaisesRegex(RuntimeError, "uv is required"),
         ):
             _cmd_upgrade(args)
@@ -286,15 +284,15 @@ class CliTests(unittest.TestCase):
         args = build_parser().parse_args(["upgrade"])
 
         with (
-            mock.patch("kanbanlan.cli.shutil.which", return_value=None),
+            mock.patch("shutil.which", return_value=None),
             self.assertRaisesRegex(RuntimeError, "uv is required"),
         ):
             _cmd_upgrade(args)
 
     def test_normal_commands_check_for_a_new_release(self) -> None:
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
-            mock.patch("kanbanlan.cli._cmd_status", return_value=0),
+            patch_cli("notify_if_update_available") as notify,
+            patch_cli("_cmd_status", return_value=0),
         ):
             self.assertEqual(0, main(["status"]))
 
@@ -302,8 +300,8 @@ class CliTests(unittest.TestCase):
 
     def test_upgrade_does_not_check_before_upgrading(self) -> None:
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
-            mock.patch("kanbanlan.cli._cmd_upgrade", return_value=0),
+            patch_cli("notify_if_update_available") as notify,
+            patch_cli("_cmd_upgrade", return_value=0),
         ):
             self.assertEqual(0, main(["upgrade"]))
 
@@ -311,8 +309,8 @@ class CliTests(unittest.TestCase):
 
     def test_json_mode_does_not_check_for_updates(self) -> None:
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available") as notify,
-            mock.patch("kanbanlan.cli._cmd_status", return_value=0),
+            patch_cli("notify_if_update_available") as notify,
+            patch_cli("_cmd_status", return_value=0),
         ):
             self.assertEqual(0, main(["--json", "status"]))
 
@@ -494,8 +492,8 @@ class CliTests(unittest.TestCase):
         stderr = StringIO()
         failure = RuntimeError("network is unavailable")
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=failure),
             redirect_stderr(stderr),
         ):
             self.assertEqual(1, main(["status"]))
@@ -508,8 +506,8 @@ class CliTests(unittest.TestCase):
             CommandResult(("gh", "api", "graphql"), 1, "", "authentication token expired")
         )
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=failure),
             redirect_stderr(stderr),
         ):
             self.assertEqual(1, main(["status"]))
@@ -527,8 +525,8 @@ class CliTests(unittest.TestCase):
             )
         )
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=failure),
             redirect_stderr(stderr),
         ):
             self.assertEqual(1, main(["status"]))
@@ -544,8 +542,8 @@ class CliTests(unittest.TestCase):
             CommandResult(("gh", "project", "copy", "6"), 1, "", "unknown owner type")
         )
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=failure),
             redirect_stderr(stderr),
         ):
             self.assertEqual(1, main(["status"]))
@@ -572,8 +570,8 @@ class CliTests(unittest.TestCase):
             )
         )
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=failure),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=failure),
             redirect_stderr(stderr),
         ):
             self.assertEqual(1, main(["status"]))
@@ -594,8 +592,8 @@ class CliTests(unittest.TestCase):
     def test_keyboard_interrupt_has_shell_standard_exit_code(self) -> None:
         stderr = StringIO()
         with (
-            mock.patch("kanbanlan.cli.notify_if_update_available"),
-            mock.patch("kanbanlan.cli._cmd_status", side_effect=KeyboardInterrupt),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=KeyboardInterrupt),
             redirect_stderr(stderr),
         ):
             self.assertEqual(130, main(["status"]))
@@ -628,10 +626,10 @@ class CliTests(unittest.TestCase):
             args = build_parser().parse_args(["init", "--session-tracking", "--non-interactive"])
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
-                mock.patch("kanbanlan.cli.discover_repository") as discover_repository,
-                mock.patch("kanbanlan.cli.discover_default_branch") as discover_default_branch,
-                mock.patch("kanbanlan.cli.GitHub") as github,
+                patch_cli("_root", return_value=root),
+                patch_cli("discover_repository") as discover_repository,
+                patch_cli("discover_default_branch") as discover_default_branch,
+                patch_cli("GitHub") as github,
             ):
                 self.assertEqual(0, _cmd_init(args))
 
@@ -663,7 +661,7 @@ class CliTests(unittest.TestCase):
             custom_hook.write_text('{"custom": true}\n', encoding="utf-8")
             args = build_parser().parse_args(["init", "--no-session-tracking", "--non-interactive"])
 
-            with mock.patch("kanbanlan.cli._root", return_value=root):
+            with patch_cli("_root", return_value=root):
                 self.assertEqual(0, _cmd_init(args))
 
             self.assertFalse(Config.load(root).session_tracking)
@@ -699,8 +697,8 @@ class CliTests(unittest.TestCase):
             )
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
-                mock.patch("kanbanlan.cli.GitHub") as github,
+                patch_cli("_root", return_value=root),
+                patch_cli("GitHub") as github,
             ):
                 self.assertEqual(0, _cmd_init(args))
 
@@ -728,8 +726,8 @@ class CliTests(unittest.TestCase):
             output = StringIO()
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
-                mock.patch("kanbanlan.cli.GitHub") as github,
+                patch_cli("_root", return_value=root),
+                patch_cli("GitHub") as github,
                 redirect_stdout(output),
             ):
                 self.assertEqual(0, _cmd_init(args))
@@ -753,8 +751,8 @@ class CliTests(unittest.TestCase):
             output = StringIO()
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
-                mock.patch("kanbanlan.cli.scaffold_repository") as scaffold,
+                patch_cli("_root", return_value=root),
+                patch_cli("scaffold_repository") as scaffold,
                 mock.patch("builtins.input", return_value="no"),
                 redirect_stdout(output),
             ):
@@ -778,7 +776,7 @@ class CliTests(unittest.TestCase):
             args = build_parser().parse_args(["init", "--project-number", "9", "--non-interactive"])
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
+                patch_cli("_root", return_value=root),
                 self.assertRaisesRegex(RuntimeError, "--reconfigure"),
             ):
                 _cmd_init(args)
@@ -811,8 +809,8 @@ class CliTests(unittest.TestCase):
             )
 
             with (
-                mock.patch("kanbanlan.cli._root", return_value=root),
-                mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
+                patch_cli("_root", return_value=root),
+                patch_cli("discover_default_branch", return_value="main"),
             ):
                 self.assertEqual(0, _cmd_init(args))
 
@@ -840,9 +838,9 @@ class CliTests(unittest.TestCase):
         ]
 
         with (
-            mock.patch("kanbanlan.cli._root", return_value=root),
-            mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
-            mock.patch("kanbanlan.cli.GitHub", return_value=github),
+            patch_cli("_root", return_value=root),
+            patch_cli("discover_default_branch", return_value="main"),
+            patch_cli("GitHub", return_value=github),
             mock.patch("builtins.input", side_effect=responses),
         ):
             self.assertEqual(0, _cmd_init(args))
@@ -875,12 +873,12 @@ class CliTests(unittest.TestCase):
         )
 
         with (
-            mock.patch("kanbanlan.cli._root", return_value=root),
-            mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
-            mock.patch("kanbanlan.cli.GitHub", return_value=github),
-            mock.patch("kanbanlan.cli.scaffold_repository", return_value=[]),
-            mock.patch("kanbanlan.cli.cache_dir", return_value=root / ".cache"),
-            mock.patch("kanbanlan.cli.CacheStore", return_value=store),
+            patch_cli("_root", return_value=root),
+            patch_cli("discover_default_branch", return_value="main"),
+            patch_cli("GitHub", return_value=github),
+            patch_cli("scaffold_repository", return_value=[]),
+            patch_cli("cache_dir", return_value=root / ".cache"),
+            patch_cli("CacheStore", return_value=store),
         ):
             self.assertEqual(0, _cmd_init(args))
 
@@ -917,13 +915,13 @@ class CliTests(unittest.TestCase):
         )
 
         with (
-            mock.patch("kanbanlan.cli._root", return_value=root),
-            mock.patch("kanbanlan.cli.discover_default_branch", return_value="main"),
-            mock.patch("kanbanlan.cli.GitHub", return_value=github),
-            mock.patch("kanbanlan.cli.scaffold_repository", return_value=[]),
-            mock.patch("kanbanlan.cli.cache_dir", return_value=root / ".cache"),
-            mock.patch("kanbanlan.cli.CacheStore", return_value=store),
-            mock.patch("kanbanlan.cli.plan_reconciliation", return_value=[]),
+            patch_cli("_root", return_value=root),
+            patch_cli("discover_default_branch", return_value="main"),
+            patch_cli("GitHub", return_value=github),
+            patch_cli("scaffold_repository", return_value=[]),
+            patch_cli("cache_dir", return_value=root / ".cache"),
+            patch_cli("CacheStore", return_value=store),
+            patch_cli("plan_reconciliation", return_value=[]),
         ):
             self.assertEqual(0, _cmd_init(args))
 

@@ -546,7 +546,7 @@ class CacheStoreRoutingTests(unittest.TestCase):
             self.assertEqual([READ_FROM_ISSUES], client.calls)
 
     def test_rate_limit_text_names_the_quota_it_reports(self) -> None:
-        from kanbanlan.cli import _rate_limit_text
+        from kanbanlan.cli.output import _rate_limit_text
 
         self.assertEqual(
             "4990 REST requests remaining, 4 of 4 reads unchanged",

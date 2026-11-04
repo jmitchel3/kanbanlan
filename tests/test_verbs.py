@@ -12,8 +12,12 @@ from typing import Any
 from unittest import mock
 
 from board_fixtures import ALPHA, BETA, REPOSITORY, config, item, snapshot
+from cli_patch import patch_cli
 
-from kanbanlan import cli
+from kanbanlan.cli.app import main
+from kanbanlan.cli.output import _emit_result
+from kanbanlan.cli.parser import ADMIN_COMMANDS, VISIBLE_COMMANDS, build_parser
+from kanbanlan.cli.verbs import DEFAULT_DROP_REASON, _prune_orphaned_worktrees, _pull_request_body
 from kanbanlan.runner import CommandResult
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.worktrees import (
@@ -63,11 +67,9 @@ class VerbTestCase(unittest.TestCase):
         self.provider = mock.Mock()
         self.provider.capabilities.project_scope = True
         patches = [
-            mock.patch.object(
-                cli, "_context", return_value=(self.root, config(), self.provider, self.store)
-            ),
-            mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "notify_if_update_available"),
+            patch_cli("_context", return_value=(self.root, config(), self.provider, self.store)),
+            patch_cli("_actor_session", return_value=None),
+            patch_cli("notify_if_update_available"),
         ]
         for patcher in patches:
             patcher.start()
@@ -87,7 +89,7 @@ class VerbTestCase(unittest.TestCase):
     def run_cli(self, *argv: str, json_output: bool = True) -> tuple[int, Any, str]:
         stdout, stderr = StringIO(), StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = cli.main([*(["--json"] if json_output else []), *argv])
+            code = main([*(["--json"] if json_output else []), *argv])
         text = stdout.getvalue() or stderr.getvalue()
         try:
             return code, json.loads(text), text
@@ -99,7 +101,7 @@ class VerbTestCase(unittest.TestCase):
 
         self.steps: list[tuple[str, Any]] = []
         for name in names:
-            patcher = mock.patch.object(cli, f"_cmd_{name}", side_effect=self._recorder(name))
+            patcher = patch_cli(f"_cmd_{name}", side_effect=self._recorder(name))
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -126,7 +128,7 @@ class VerbTestCase(unittest.TestCase):
                     else "completed",
                 },
             }
-            cli._emit_result(args, results[name])
+            _emit_result(args, results[name])
             return 0
 
         return run
@@ -138,7 +140,7 @@ class VerbTestCase(unittest.TestCase):
 
 class ParserTests(unittest.TestCase):
     def test_top_level_help_lists_only_the_everyday_commands(self) -> None:
-        text = cli.build_parser().format_help()
+        text = build_parser().format_help()
 
         listed = text.split("positional arguments:")[1].split("options:")[0]
         names = [
@@ -146,12 +148,12 @@ class ParserTests(unittest.TestCase):
             for line in listed.splitlines()
             if line.startswith("    ") and not line.startswith("     ")
         ]
-        self.assertEqual(list(cli.VISIBLE_COMMANDS), names)
+        self.assertEqual(list(VISIBLE_COMMANDS), names)
         self.assertIn("{init,start,done,drop,status,next,doctor,admin}", text)
         self.assertIn("kanbanlan start", text)
 
     def test_admin_help_lists_every_other_command(self) -> None:
-        parser = cli.build_parser()
+        parser = build_parser()
         admin = parser._subparsers._group_actions[0].choices["admin"]  # noqa: SLF001
         listed = admin.format_help()
 
@@ -160,11 +162,11 @@ class ParserTests(unittest.TestCase):
             for line in listed.split("positional arguments:")[1].splitlines()
             if line.startswith("    ") and not line.startswith("     ")
         ]
-        self.assertEqual(sorted(cli.ADMIN_COMMANDS), sorted(names))
+        self.assertEqual(sorted(ADMIN_COMMANDS), sorted(names))
 
     def test_every_admin_command_still_parses_at_the_top_level(self) -> None:
-        parser = cli.build_parser()
-        for name in cli.ADMIN_COMMANDS:
+        parser = build_parser()
+        for name in ADMIN_COMMANDS:
             with self.subTest(name=name):
                 hidden = parser._subparsers._group_actions[0].choices[name]  # noqa: SLF001
                 self.assertIsNotNone(hidden)
@@ -173,10 +175,10 @@ class ParserTests(unittest.TestCase):
         for argv in (["admin", "path"], ["path"]):
             with (
                 self.subTest(argv=argv),
-                mock.patch.object(cli, "_cmd_path", return_value=0) as handler,
-                mock.patch.object(cli, "notify_if_update_available"),
+                patch_cli("_cmd_path", return_value=0) as handler,
+                patch_cli("notify_if_update_available"),
             ):
-                self.assertEqual(0, cli.main(argv))
+                self.assertEqual(0, main(argv))
                 (args,) = handler.call_args.args
                 self.assertEqual("path", args.command)
 
@@ -185,14 +187,11 @@ class StartTests(VerbTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.write_project([])
-        self.cleanup_plan = mock.patch.object(cli, "_plan_worktree_cleanup", return_value=[])
+        self.cleanup_plan = patch_cli("_plan_worktree_cleanup", return_value=[])
         self.cleanup_plan.start()
         self.addCleanup(self.cleanup_plan.stop)
-        for name, value in (
-            ("_claim_checkout", (BRANCH, WORKTREE)),
-            ("_fetch_is_stale", False),
-        ):
-            patcher = mock.patch.object(cli, name, return_value=value)
+        for name, value in (("_claim_checkout", (BRANCH, WORKTREE)),):
+            patcher = patch_cli(name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.record_steps("capture", "triage", "claim")
@@ -310,7 +309,7 @@ class StartTests(VerbTestCase):
     def test_pruned_worktrees_are_reported(self) -> None:
         self.write_snapshot([item(8, BETA, "Ready")])
         removed = [{"path": "/repo/.worktrees/old", "action": REMOVE, "reason": "claim released"}]
-        with mock.patch.object(cli, "_prune_orphaned_worktrees", return_value=removed):
+        with patch_cli("_prune_orphaned_worktrees", return_value=removed):
             code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
 
         self.assertEqual(0, code)
@@ -322,10 +321,8 @@ class PruneTests(VerbTestCase):
         return CleanupAction(path="/repo/.worktrees/old", action=kind, reason="claim was released")
 
     def test_nothing_orphaned_costs_no_github_read(self) -> None:
-        with mock.patch.object(
-            cli, "_plan_worktree_cleanup", return_value=[self.action("keep")]
-        ) as plan:
-            pruned = cli._prune_orphaned_worktrees(
+        with patch_cli("_plan_worktree_cleanup", return_value=[self.action("keep")]) as plan:
+            pruned = _prune_orphaned_worktrees(
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
@@ -339,14 +336,13 @@ class PruneTests(VerbTestCase):
         self.store.refresh = mock.Mock(return_value=refreshed)  # type: ignore[method-assign]
         confirmed = [self.action(PRUNE)]
         with (
-            mock.patch.object(
-                cli,
+            patch_cli(
                 "_plan_worktree_cleanup",
                 side_effect=[[self.action(REMOVE)], confirmed],
             ) as plan,
-            mock.patch.object(cli, "_apply_cleanup", return_value=["done"]) as apply,
+            patch_cli("_apply_cleanup", return_value=["done"]) as apply,
         ):
-            pruned = cli._prune_orphaned_worktrees(
+            pruned = _prune_orphaned_worktrees(
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
@@ -359,14 +355,13 @@ class PruneTests(VerbTestCase):
     def test_a_candidate_the_live_board_keeps_is_left_alone(self) -> None:
         self.store.refresh = mock.Mock(return_value=snapshot([]))  # type: ignore[method-assign]
         with (
-            mock.patch.object(
-                cli,
+            patch_cli(
                 "_plan_worktree_cleanup",
                 side_effect=[[self.action(REMOVE)], [self.action("keep")]],
             ),
-            mock.patch.object(cli, "_apply_cleanup") as apply,
+            patch_cli("_apply_cleanup") as apply,
         ):
-            pruned = cli._prune_orphaned_worktrees(
+            pruned = _prune_orphaned_worktrees(
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
@@ -401,13 +396,13 @@ class DoneTests(VerbTestCase):
         self.git = FakeRunner({("git", "branch", "--show-current"): f"{BRANCH}\n"})
         self.gh = FakeRunner()
         for name, value in (("Runner", lambda *_args, **_kwargs: self.git),):
-            patcher = mock.patch.object(cli, name, side_effect=value)
+            patcher = patch_cli(name, side_effect=value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(cli, "_gh_runner", return_value=self.gh)
+        patcher = patch_cli("_gh_runner", return_value=self.gh)
         patcher.start()
         self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(cli, "DONE_LINK_DELAYS", (0.0, 0.0))
+        patcher = patch_cli("DONE_LINK_DELAYS", (0.0, 0.0))
         patcher.start()
         self.addCleanup(patcher.stop)
         claim = {"session": "s1", "branch": BRANCH, "worktree": WORKTREE}
@@ -480,7 +475,7 @@ class DropTests(VerbTestCase):
     def setUp(self) -> None:
         super().setUp()
         git = FakeRunner({("git", "branch", "--show-current"): f"{BRANCH}\n"})
-        patcher = mock.patch.object(cli, "Runner", return_value=git)
+        patcher = patch_cli("Runner", return_value=git)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.write_snapshot([item(7, ALPHA, "In progress", claim={"session": "s1"})])
@@ -493,7 +488,7 @@ class DropTests(VerbTestCase):
         self.assertEqual("Ready", payload["result"]["status"])
         ((kind, step),) = self.steps
         self.assertEqual("release", kind)
-        self.assertEqual(cli.DEFAULT_DROP_REASON, step.reason)
+        self.assertEqual(DEFAULT_DROP_REASON, step.reason)
 
     def test_drop_close_closes_the_request(self) -> None:
         code, payload, _ = self.run_cli(
@@ -528,7 +523,7 @@ class PullRequestBodyTests(unittest.TestCase):
             (root / ".github" / "pull_request_template.md").write_text(
                 "## Summary\n\nKanbanlan: KBL-\n\nCloses #\n\n## Changes\n", encoding="utf-8"
             )
-            body = cli._pull_request_body(root, config(), item(7, ALPHA, "In progress"))
+            body = _pull_request_body(root, config(), item(7, ALPHA, "In progress"))
 
         self.assertIn(f"Kanbanlan: {ALPHA}\n", body)
         self.assertIn("Closes #7\n", body)
@@ -537,7 +532,7 @@ class PullRequestBodyTests(unittest.TestCase):
     def test_a_request_in_another_repository_is_closed_by_its_qualified_reference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = {**item(7, ALPHA, "In progress"), "repository": "acme/other"}
-            body = cli._pull_request_body(Path(directory), config(), value)
+            body = _pull_request_body(Path(directory), config(), value)
 
         self.assertIn("Closes acme/other#7", body)
         self.assertIn(f"Kanbanlan: {ALPHA}", body)

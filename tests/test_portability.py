@@ -6,7 +6,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kanbanlan.cli import build_parser
+from kanbanlan.cli.parser import build_parser
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.identity import (
