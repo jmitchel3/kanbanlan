@@ -275,7 +275,7 @@ class WorkerTests(unittest.TestCase):
             self.assertIsNotNone(updated.last_success_at)
             # A clean cycle pays for exactly one refresh and one issue sweep;
             # verification only re-reads live state after a repair.
-            self.assertEqual([mock.call(provider)], cache.refresh.call_args_list)
+            self.assertEqual([mock.call(provider, projection=True)], cache.refresh.call_args_list)
             provider.list_open_requests.assert_called_once()
 
     def test_applied_repair_is_verified_with_a_second_refresh(self) -> None:
@@ -314,7 +314,8 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(1, result["succeeded"])
             apply_mock.assert_called_once()
             self.assertEqual(
-                [mock.call(provider), mock.call(provider)], cache.refresh.call_args_list
+                [mock.call(provider, projection=True), mock.call(provider, projection=True)],
+                cache.refresh.call_args_list,
             )
             self.assertEqual(2, provider.list_open_requests.call_count)
 

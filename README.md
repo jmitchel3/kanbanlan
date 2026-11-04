@@ -201,7 +201,25 @@ Only full-board refreshes wait for the quota: `triage`, `review`, `release`,
 cooldown from the cached snapshot, which is marked stale until a refresh runs.
 A write GitHub itself refuses fails with GitHub's reset time.
 
-Refreshes are also incremental: a cheap probe reads only item identity and
+Repository-scope reads (`ensure`, `next`, `status`, `refresh`, and the
+background refresh after a lifecycle change) read the request queue over the
+REST API instead of GraphQL. Status labels are the canonical request status,
+so this repository's issues, their claim comments, and the open pull requests
+of every repository the Project references answer every queue question. Each
+page is sent with the ETag of the copy kept in `rest_cache.json`, and GitHub
+does not count an unchanged page's `304 Not Modified` against any rate limit,
+so a stable queue revalidates for free and spends no GraphQL points. The
+Project's fields and linked repositories come from `project_metadata.json`,
+renewed by any Project read or, at most every six hours, by one metadata-only
+read. Such a snapshot reports `source.read_from: "issues"`, derives Status from
+labels (`Done` once closed), takes `project_item_id` from the last Project
+read, and reports the REST quota as `rate_limit` with `resource: "core"`;
+pull requests link by closing keywords in their body and report no
+`merge_state`. Lifecycle commands still read only their own card.
+
+Reconcile, project scope (`overlap`, `--project-scope`), and Project Status
+writes keep the GraphQL Project read, because only they need Project fields.
+Project reads are also incremental: a cheap probe reads only item identity and
 `updatedAt` timestamps, and full item content (comments, labels, assignees) is
 re-fetched only for cards that changed since the last refresh, using an
 advisory raw-node cache in the same cache directory. Any doubt about the cache

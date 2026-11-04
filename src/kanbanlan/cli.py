@@ -79,11 +79,14 @@ from kanbanlan.sessions import (
     session_from_hook_payload,
 )
 from kanbanlan.snapshot import (
+    READ_FROM_ISSUES,
+    READ_FROM_PROJECT,
     SCHEMA_VERSION,
     SCOPE_PROJECT,
     CacheStore,
     parse_time,
     qualified_reference,
+    read_from,
     utc_now,
 )
 from kanbanlan.ui import (
@@ -896,7 +899,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     store = CacheStore(config, cache_dir(root))
     with status("Refreshing the shared board snapshot"):
-        snapshot = store.refresh(github)
+        snapshot = store.refresh(github, projection=True)
     reconciled_successfully = False
     if plan.reconcile:
         with status("Checking existing issue and Project state"):
@@ -1340,9 +1343,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     field("Cache", f"{status_value(inspection['snapshot_state'])} ({store.snapshot_path})")
     rate = inspection.get("rate_limit") or {}
     if rate.get("remaining") is not None:
-        reset = f", resets {rate['resetAt']}" if rate.get("resetAt") else ""
-        field("Rate limit", f"{rate['remaining']} GraphQL points remaining{reset}")
-        if rate["remaining"] < config.rate_limit_floor:
+        field("Rate limit", _rate_limit_text(rate))
+        if rate.get("resource") != "core" and rate["remaining"] < config.rate_limit_floor:
             warning(
                 f"GraphQL points are below the configured floor of {config.rate_limit_floor}; "
                 "snapshot refreshes are deferred until the quota resets"
@@ -1363,6 +1365,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         return 1
     success("All checks passed")
     return 0
+
+
+def _rate_limit_text(rate: dict[str, Any]) -> str:
+    """Describe the quota the last snapshot read reported."""
+
+    reset = f", resets {rate['resetAt']}" if rate.get("resetAt") else ""
+    if rate.get("resource") == "core":
+        # The queue read spends REST requests, and none while nothing changed.
+        unchanged = rate.get("not_modified")
+        detail = f", {unchanged} of {rate.get('requests')} reads unchanged" if unchanged else ""
+        return f"{rate['remaining']} REST requests remaining{reset}{detail}"
+    return f"{rate['remaining']} GraphQL points remaining{reset}"
 
 
 def _cmd_ensure(args: argparse.Namespace) -> int:
@@ -1409,7 +1423,7 @@ def _warn_stale_service(
     if write_behind_enabled() and store.serveable(snapshot):
         # Served locally while a background refresh replaces it; not a fault.
         return
-    deferral = store.rate_limit_deferral(snapshot)
+    deferral = store.rate_limit_deferral(snapshot, graphql=read_from(snapshot) != READ_FROM_ISSUES)
     if write_behind_enabled() and not deferral:
         warning(
             f"serving the snapshot from {snapshot.get('generated_at')} while a background "
@@ -1442,8 +1456,10 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
             return 0
         print(f"refreshed {store.project_snapshot_path} at {snapshot['generated_at']}")
         return 0
+    # The queue read answers ensure, next, and status, and costs no GraphQL
+    # points while nothing changed; reconcile does its own Project read.
     with status("Refreshing the shared board snapshot"):
-        snapshot, _ = read_board(store, provider)
+        snapshot = store.refresh(provider)
     settle(Outbox(store.directory), snapshot)
     if _emit_result(
         args,
@@ -1571,8 +1587,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         field("Next", f"{request_label(next_ready)} {next_ready['title']}")
     rate = inspection.get("rate_limit") or {}
     if rate.get("remaining") is not None:
-        reset = f", resets {rate['resetAt']}" if rate.get("resetAt") else ""
-        field("Rate limit", f"{rate['remaining']} GraphQL points remaining{reset}")
+        field("Rate limit", _rate_limit_text(rate))
     if inspection.get("refresh_status") == "throttled":
         warning("the last refresh was rate limited; the snapshot may lag the live board")
     if sync["pending"]:
@@ -1743,6 +1758,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         cached = store.open_requests()
         if (
             store.serveable(snapshot)
+            and read_from(snapshot) == READ_FROM_PROJECT
             and cached
             and cached.get("schema_version") == SCHEMA_VERSION
             and isinstance(cached.get("requests"), list)
