@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_review
+from cli_patch import patch_cli
+
+from kanbanlan.cli.lifecycle import _cmd_review
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.identity import attach_kanbanlan_id
@@ -394,13 +396,13 @@ class ReviewCommandTests(unittest.TestCase):
         )
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
-            mock.patch("kanbanlan.cli._set_state"),
-            mock.patch("kanbanlan.cli._record_session_activity") as activity,
+            patch_cli("_actor_session", return_value=None),
+            patch_cli("_set_state"),
+            patch_cli("_record_session_activity") as activity,
             redirect_stdout(stream),
         ):
             code = _cmd_review(args)
@@ -452,11 +454,11 @@ class ReviewCommandTests(unittest.TestCase):
             actor_session=None,
         )
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
+            patch_cli("_actor_session", return_value=None),
             self.assertRaises(RuntimeError) as raised,
         ):
             _cmd_review(args)
@@ -477,11 +479,11 @@ class ReviewCommandTests(unittest.TestCase):
             actor_session=None,
         )
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli._actor_session", return_value=None),
+            patch_cli("_actor_session", return_value=None),
             self.assertRaises(RuntimeError) as raised,
         ):
             _cmd_review(args)

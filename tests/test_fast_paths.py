@@ -20,7 +20,7 @@ from test_project_scope import (
 )
 from test_snapshot import _CountingClient, config
 
-from kanbanlan.cli import _refresh_after_mutation, _set_state
+from kanbanlan.cli.cards import _refresh_after_mutation, _set_state
 from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, isoformat
 from kanbanlan.workflow import read_board
 

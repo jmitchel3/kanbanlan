@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_overlap, _cmd_snapshot, _cmd_status, build_parser
+from cli_patch import patch_cli
+
+from kanbanlan.cli.parser import build_parser
+from kanbanlan.cli.queue import _cmd_overlap, _cmd_snapshot, _cmd_status
 from kanbanlan.config import Config
 from kanbanlan.domain import resolve_request_item
 from kanbanlan.github import GitHub, project_repositories
@@ -511,8 +514,8 @@ class ProjectScopeCommandTests(unittest.TestCase):
         args = build_parser().parse_args(argv)
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, store),
             ),
             redirect_stdout(stream),
@@ -564,8 +567,8 @@ class ProjectScopeCommandTests(unittest.TestCase):
         args = build_parser().parse_args(["--json", "overlap"])
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, mock.Mock()),
             ),
             redirect_stdout(stream),
@@ -586,8 +589,8 @@ class ProjectScopeCommandTests(unittest.TestCase):
         provider.capabilities.project_scope = False
         args = build_parser().parse_args(["overlap"])
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, mock.Mock()),
             ),
             self.assertRaises(RuntimeError) as raised,
@@ -611,8 +614,8 @@ class ProjectScopeCommandTests(unittest.TestCase):
         args = build_parser().parse_args(["overlap"])
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path("/tmp"), config(), provider, mock.Mock()),
             ),
             redirect_stdout(stream),

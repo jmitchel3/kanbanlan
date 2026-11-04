@@ -13,8 +13,12 @@ from typing import Any
 from unittest import mock
 
 from board_fixtures import ALPHA, BETA, REPOSITORY, config, item, snapshot
+from cli_patch import patch_cli
 
-from kanbanlan import cli, legacy
+from kanbanlan import legacy
+from kanbanlan.cli.app import main
+from kanbanlan.cli.lifecycle import _cmd_capture, _existing_request
+from kanbanlan.cli.parser import build_parser
 from kanbanlan.snapshot import CacheStore
 
 
@@ -151,17 +155,16 @@ class LegacyOutboxTests(unittest.TestCase):
         provider = mock.Mock()
         stdout, stderr = StringIO(), StringIO()
         with (
-            mock.patch.object(
-                cli,
+            patch_cli(
                 "_context",
                 return_value=(Path(self.directory.name), config(), provider, store),
             ),
-            mock.patch.object(cli, "_cmd_triage", return_value=0) as triage,
-            mock.patch.object(cli, "notify_if_update_available"),
+            patch_cli("_cmd_triage", return_value=0) as triage,
+            patch_cli("notify_if_update_available"),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
-            self.assertEqual(0, cli.main(["--json", "triage", ALPHA]))
+            self.assertEqual(0, main(["--json", "triage", ALPHA]))
 
         triage.assert_called_once()
         self.assertEqual("", stdout.getvalue())
@@ -252,15 +255,14 @@ class WorkerUninstallTests(unittest.TestCase):
         )
         stdout = StringIO()
         with (
-            mock.patch.object(
-                cli,
+            patch_cli(
                 "uninstall_worker",
                 return_value=legacy.uninstall_worker(run=mock.Mock(), directory=self.state),
             ),
-            mock.patch.object(cli, "notify_if_update_available"),
+            patch_cli("notify_if_update_available"),
             redirect_stdout(stdout),
         ):
-            self.assertEqual(0, cli.main(["admin", "worker", "uninstall"]))
+            self.assertEqual(0, main(["admin", "worker", "uninstall"]))
         self.assertIn("No background worker is installed", stdout.getvalue())
 
     def test_leftovers_name_installed_units(self) -> None:
@@ -276,19 +278,15 @@ class ReplayedCaptureTests(unittest.TestCase):
     def test_a_replayed_capture_with_an_existing_id_opens_no_second_issue(self) -> None:
         provider = mock.Mock()
         existing = item(7, ALPHA, "Inbox")
-        args = cli.build_parser().parse_args(
-            ["--json", "capture", "Title", "--kanbanlan-id", ALPHA]
-        )
+        args = build_parser().parse_args(["--json", "capture", "Title", "--kanbanlan-id", ALPHA])
         with (
-            mock.patch.object(
-                cli, "_context", return_value=(Path("/tmp"), config(), provider, mock.Mock())
-            ),
-            mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "_capture_target", return_value=(REPOSITORY, None)),
-            mock.patch.object(cli, "_existing_request", return_value=existing),
+            patch_cli("_context", return_value=(Path("/tmp"), config(), provider, mock.Mock())),
+            patch_cli("_actor_session", return_value=None),
+            patch_cli("_capture_target", return_value=(REPOSITORY, None)),
+            patch_cli("_existing_request", return_value=existing),
             redirect_stdout(StringIO()) as stdout,
         ):
-            self.assertEqual(0, cli._cmd_capture(args))
+            self.assertEqual(0, _cmd_capture(args))
 
         provider.create_request.assert_not_called()
         self.assertEqual(ALPHA, json.loads(stdout.getvalue())["result"]["kanbanlan_id"])
@@ -303,21 +301,21 @@ class RateLimitKindTests(unittest.TestCase):
         )
         stderr = StringIO()
         with (
-            mock.patch.object(cli, "_cmd_status", side_effect=refused),
-            mock.patch.object(cli, "notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=refused),
+            patch_cli("notify_if_update_available"),
             redirect_stderr(stderr),
         ):
-            self.assertEqual(1, cli.main(["--json", "status"]))
+            self.assertEqual(1, main(["--json", "status"]))
         self.assertEqual("RateLimitError", json.loads(stderr.getvalue())["error"]["kind"])
 
         limited = RateLimitError("limit", reset_at="2026-09-29T12:00:00Z")
         stderr = StringIO()
         with (
-            mock.patch.object(cli, "_cmd_status", side_effect=limited),
-            mock.patch.object(cli, "notify_if_update_available"),
+            patch_cli("_cmd_status", side_effect=limited),
+            patch_cli("notify_if_update_available"),
             redirect_stderr(stderr),
         ):
-            cli.main(["--json", "status"])
+            main(["--json", "status"])
         self.assertEqual("2026-09-29T12:00:00Z", json.loads(stderr.getvalue())["error"]["reset_at"])
 
 
@@ -327,7 +325,7 @@ class ReplayLookupTests(unittest.TestCase):
         provider.find_request.return_value = found
         store = mock.Mock()
         store.snapshot.return_value = cached
-        value = cli._existing_request(provider, store, ALPHA, REPOSITORY, config())
+        value = _existing_request(provider, store, ALPHA, REPOSITORY, config())
         store.refresh.assert_not_called()
         provider.snapshot.assert_not_called()
         return value, provider
@@ -357,19 +355,15 @@ class ReplayRepairTests(unittest.TestCase):
         provider.add_to_projection.return_value = {"id": "PVTI_7"}
         store = mock.Mock()
         store.snapshot.return_value = None
-        args = cli.build_parser().parse_args(
-            ["--json", "capture", "Title", "--kanbanlan-id", ALPHA]
-        )
+        args = build_parser().parse_args(["--json", "capture", "Title", "--kanbanlan-id", ALPHA])
         with (
-            mock.patch.object(
-                cli, "_context", return_value=(Path("/tmp"), config(), provider, store)
-            ),
-            mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "_capture_target", return_value=(REPOSITORY, None)),
-            mock.patch.object(cli, "_existing_request", return_value=existing),
+            patch_cli("_context", return_value=(Path("/tmp"), config(), provider, store)),
+            patch_cli("_actor_session", return_value=None),
+            patch_cli("_capture_target", return_value=(REPOSITORY, None)),
+            patch_cli("_existing_request", return_value=existing),
             redirect_stdout(StringIO()),
         ):
-            self.assertEqual(0, cli._cmd_capture(args))
+            self.assertEqual(0, _cmd_capture(args))
         provider.create_request.assert_not_called()
         return provider
 

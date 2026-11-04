@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan import cli, locks
+from cli_patch import patch_cli
+
+from kanbanlan import locks
+from kanbanlan.cli.app import main
 from kanbanlan.config import Config
 from kanbanlan.identity import attach_kanbanlan_id
 from kanbanlan.runner import RateLimitError
@@ -269,25 +272,22 @@ class NoBoardReadTests(unittest.TestCase):
         stdout, stderr = StringIO(), StringIO()
         with (
             mock.patch.dict(os.environ, environment or {}),
-            mock.patch.object(cli, "_context", return_value=(self.root, config(), github, store)),
-            mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "notify_if_update_available"),
-            mock.patch.object(cli, "_create_worktree"),
-            mock.patch.object(cli, "_fetch_is_stale", return_value=False),
-            mock.patch.object(
-                cli, "_claim_checkout", return_value=("work/a", str(self.root / "wt"))
-            ),
-            mock.patch.object(cli, "read_board", side_effect=refuse),
+            patch_cli("_context", return_value=(self.root, config(), github, store)),
+            patch_cli("_actor_session", return_value=None),
+            patch_cli("notify_if_update_available"),
+            patch_cli("_create_worktree"),
+            patch_cli("_claim_checkout", return_value=("work/a", str(self.root / "wt"))),
+            patch_cli("read_board", side_effect=refuse),
             mock.patch.object(CacheStore, "refresh", refuse),
             mock.patch.object(CacheStore, "ensure", refuse),
             mock.patch("subprocess.Popen"),
-            mock.patch.object(cli, "CLAIM_VERIFY_DELAYS", (0.0, 0.0, 0.0)),
-            mock.patch.object(cli, "CLAIM_CONFIRM_DELAY", 0.0),
+            patch_cli("CLAIM_VERIFY_DELAYS", (0.0, 0.0, 0.0)),
+            patch_cli("CLAIM_CONFIRM_DELAY", 0.0),
             guard_refresh_lock(),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
-            code = cli.main(["--json", *argv])
+            code = main(["--json", *argv])
         text = stdout.getvalue() or stderr.getvalue()
         self.assertNotIn("BoardRead", text)
         return code, json.loads(text)

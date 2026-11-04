@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan.cli import _cmd_cleanup, build_parser
+from cli_patch import patch_cli
+
+from kanbanlan.cli.cleanup import _cmd_cleanup
+from kanbanlan.cli.parser import build_parser
 from kanbanlan.config import Config
 from kanbanlan.runner import CommandResult
 from kanbanlan.worktrees import (
@@ -378,15 +381,15 @@ class CleanupCommandTests(unittest.TestCase):
         )
         stream = StringIO()
         with (
-            mock.patch(
-                "kanbanlan.cli._context",
+            patch_cli(
+                "_context",
                 return_value=(Path(MAIN), config(), provider, store),
             ),
-            mock.patch("kanbanlan.cli.Runner", return_value=runner),
-            mock.patch("kanbanlan.cli.primary_worktree", return_value=Path(MAIN)),
-            mock.patch("kanbanlan.cli.list_worktrees", return_value=entries),
-            mock.patch(
-                "kanbanlan.cli.inspect_worktree",
+            patch_cli("Runner", return_value=runner),
+            patch_cli("primary_worktree", return_value=Path(MAIN)),
+            patch_cli("list_worktrees", return_value=entries),
+            patch_cli(
+                "inspect_worktree",
                 side_effect=lambda _runner, value, **_kwargs: (statuses or {}).get(
                     value.path, WorktreeStatus()
                 ),

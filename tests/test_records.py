@@ -9,7 +9,10 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from kanbanlan.cli import _cmd_record, build_parser
+from cli_patch import patch_cli
+
+from kanbanlan.cli.parser import build_parser
+from kanbanlan.cli.records import _cmd_record
 from kanbanlan.config import Config
 from kanbanlan.identity import attach_kanbanlan_id
 from kanbanlan.records import (
@@ -273,14 +276,14 @@ class RecordCommandTests(unittest.TestCase):
         args = build_parser().parse_args([*argv, "record", "#7", "--from-pr"])
         stdout, stderr = StringIO(), StringIO()
         with (
-            mock.patch("kanbanlan.cli._root", return_value=root),
-            mock.patch("kanbanlan.cli.Config.load", return_value=config()),
-            mock.patch("kanbanlan.cli.create_provider"),
-            mock.patch("kanbanlan.cli.cache_dir", return_value=root / "cache"),
-            mock.patch("kanbanlan.cli._read_card", return_value={"items": [card]}) as read,
-            mock.patch("kanbanlan.cli._issue", return_value=card),
-            mock.patch("kanbanlan.cli.current_branch", return_value="work/x"),
-            mock.patch("kanbanlan.cli._local_view") as local_view,
+            patch_cli("_root", return_value=root),
+            mock.patch("kanbanlan.config.Config.load", return_value=config()),
+            patch_cli("create_provider"),
+            patch_cli("cache_dir", return_value=root / "cache"),
+            patch_cli("_read_card", return_value={"items": [card]}) as read,
+            patch_cli("_issue", return_value=card),
+            patch_cli("current_branch", return_value="work/x"),
+            patch_cli("_local_view") as local_view,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
