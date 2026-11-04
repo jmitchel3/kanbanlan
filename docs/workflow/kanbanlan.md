@@ -249,15 +249,20 @@ responsible session, so a handoff targets its recipient.
 
 ## Durable request records
 
-After claiming a request, create its repository record:
+Write durable decisions, verification evidence, and the delivered result in
+the pull request body's Decisions, Verification, and Result sections, then
+generate the repository record from it in the implementation worktree:
 
 ```sh
-kanbanlan record KBL-...
+kanbanlan record KBL-... --from-pr
 ```
 
-This creates `docs/kanbanlan/requests/KBL-....md` once and never overwrites
-manual edits. Record durable decisions, verification evidence, and the delivered
-result there. Do not commit routine status movements or claim heartbeats.
+This writes or updates `docs/kanbanlan/requests/KBL-....md` from the pull
+request on the current branch (or the one pull request linked to the request)
+and reports any section the body lacks instead of inventing it. Commit the
+record in the same pull request. Plain `kanbanlan record KBL-...` still creates
+an empty record once and never overwrites manual edits. Do not commit routine
+status movements or claim heartbeats.
 
 ## Delivery
 

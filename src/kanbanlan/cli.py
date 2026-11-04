@@ -54,7 +54,12 @@ from kanbanlan.outbox import (
     write_behind_enabled,
 )
 from kanbanlan.providers import CoordinationProvider, create_provider
-from kanbanlan.records import create_record
+from kanbanlan.records import (
+    create_record,
+    current_branch,
+    select_pull_request,
+    write_record_from_pull_request,
+)
 from kanbanlan.registry import RegistryStore, describe_problem, registry_problems
 from kanbanlan.rehome import format_plan, plan_rehome, rehome_result
 from kanbanlan.runner import (
@@ -488,6 +493,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a durable repository record for one request",
     )
     record.add_argument("request", help="Kanbanlan ID or canonical provider reference")
+    record.add_argument(
+        "--from-pr",
+        action="store_true",
+        help=(
+            "write or update the record from the linked pull request's Decisions, "
+            "Verification, and Result sections"
+        ),
+    )
 
     worker = commands.add_parser("worker", help="manage the user-scoped background reconciler")
     worker.add_argument(
@@ -2820,6 +2833,8 @@ def _session_activity(
 
 def _cmd_record(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
+    if args.from_pr:
+        return _record_from_pull_request(args, root, provider, store, config)
     snapshot = _local_view(root, store, provider, label=f"Loading request {args.request}")
     item = _issue(snapshot, args.request)
     if item.get("number") is None:
@@ -2837,6 +2852,34 @@ def _cmd_record(args: argparse.Namespace) -> int:
         return 0
     print(f"{result.action}: {result.path.relative_to(root)}")
     return 0
+
+
+def _record_from_pull_request(
+    args: argparse.Namespace,
+    root: Path,
+    provider: CoordinationProvider,
+    store: CacheStore,
+    config: Config,
+) -> int:
+    with status(f"Loading pull requests for {args.request}"):
+        item = _issue(
+            _read_card(provider, store, config, args.request, pull_requests=True),
+            args.request,
+        )
+    pull_request = select_pull_request(item, current_branch(root))
+    result, missing = write_record_from_pull_request(root, item, pull_request)
+    payload = {
+        "action": result.action,
+        "kanbanlan_id": item.get("kanbanlan_id"),
+        "path": str(result.path),
+        "pull_request": pull_request.get("url"),
+        "missing_sections": list(missing),
+    }
+    if not _emit_result(args, payload):
+        print(f"{result.action}: {result.path.relative_to(root)} from {pull_request.get('url')}")
+        if missing:
+            print(f"missing from the pull request: {', '.join(missing)}", file=sys.stderr)
+    return 1 if missing else 0
 
 
 # ---------------------------------------------------------------------------
