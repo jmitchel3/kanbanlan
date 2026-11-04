@@ -338,7 +338,7 @@ issue number.
 kanbanlan capture "Add export audit log" --priority priority:p1
 kanbanlan triage KBL-...
 kanbanlan claim KBL-... --touchpoints "audit API; exports UI; migrations"
-kanbanlan record KBL-...
+kanbanlan record KBL-... --from-pr
 kanbanlan rehome KBL-... --repository other-owner/other-repo
 kanbanlan review KBL-...
 kanbanlan release KBL-... --reason "Waiting for product decision" --blocked
@@ -380,10 +380,16 @@ is still on the remote and on the pull request that carried it. `--force`
 removes a worktree despite any of that, and still never deletes a branch with
 unpushed commits.
 
-`record` creates `docs/kanbanlan/requests/<Kanbanlan ID>.md` once. Complete its
-decisions, verification, and delivered-result sections in the implementation
-PR. Kanbanlan never overwrites manual changes to an existing record. Volatile
-status and claim movements remain in the live canonical home rather than Git.
+The pull request body is the single place to write a request's decisions,
+verification, and delivered result: the template's Decisions, Verification,
+and Result sections. `record --from-pr` reads them from the pull request on the
+current branch (or the one pull request linked to the request) and writes or
+updates `docs/kanbanlan/requests/<Kanbanlan ID>.md`, so the record is committed
+in the same pull request. A missing or empty section is reported and the
+command exits non-zero; nothing is invented. Plain `record` keeps its original
+behavior: it creates an empty record once and never overwrites manual changes.
+Volatile status and claim movements remain in the live canonical home rather
+than Git.
 
 ### Optional agent session tracking
 

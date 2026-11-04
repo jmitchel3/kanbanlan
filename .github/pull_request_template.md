@@ -1,14 +1,18 @@
-## Summary
+<!--
+The Decisions, Verification, and Result sections are the single place to write
+them. `kanbanlan record <Kanbanlan ID> --from-pr` generates the durable request
+record from this body; commit that record in this pull request.
+-->
 
-<!-- What problem does this pull request solve? -->
+## Request
 
 Kanbanlan: KBL-
 
 Closes #
 
-## Changes
+## Decisions
 
-<!-- List the important user-visible or implementation changes. -->
+<!-- Durable implementation decisions that are not obvious from the code. -->
 
 ## Verification
 
@@ -18,8 +22,15 @@ Closes #
 - [ ] `uv run ruff check .`
 - [ ] `uv run ruff format --check .`
 - [ ] `uv build`
+
+## Result
+
+<!-- What this pull request delivers, and any follow-up work that remains. -->
+
+## Checklist
+
 - [ ] Tests and documentation were updated where needed.
-- [ ] The durable `docs/kanbanlan/requests/<Kanbanlan ID>.md` record is complete.
+- [ ] `docs/kanbanlan/requests/<Kanbanlan ID>.md` was generated with `kanbanlan record --from-pr`.
 
 ## Security and compatibility
 
