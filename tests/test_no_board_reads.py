@@ -1,8 +1,8 @@
 """Lifecycle commands never read the whole board or wait on the refresh lock.
 
 A full read of a large Project takes minutes and serializes every session
-on one lock, so neither a lifecycle command nor the drainer's replay of it
-may start one. Each test below runs a command against a fake GitHub that
+on one lock, so a lifecycle command never starts one: it reads and writes
+only its own card. Each test below runs a command against a fake GitHub that
 holds one card and fails the moment anything reads the board, refreshes the
 shared snapshot, or takes ``refresh.lock``.
 """
@@ -20,10 +20,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kanbanlan import cli, locks, outbox
+from kanbanlan import cli, locks
 from kanbanlan.config import Config
 from kanbanlan.identity import attach_kanbanlan_id
-from kanbanlan.outbox import QUEUED, Intent, Outbox, drain_outbox
 from kanbanlan.runner import RateLimitError
 from kanbanlan.snapshot import SCHEMA_VERSION, CacheStore, build_snapshot, isoformat
 
@@ -257,8 +256,8 @@ class NoBoardReadTests(unittest.TestCase):
         argv: list[str],
         github: OneCardGitHub,
         *,
-        environment: dict[str, str],
         snapshot: dict[str, Any] | None,
+        environment: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         store = CacheStore(config(), self.root / "cache")
         if snapshot is not None:
@@ -269,11 +268,9 @@ class NoBoardReadTests(unittest.TestCase):
 
         stdout, stderr = StringIO(), StringIO()
         with (
-            mock.patch.dict(os.environ, environment),
+            mock.patch.dict(os.environ, environment or {}),
             mock.patch.object(cli, "_context", return_value=(self.root, config(), github, store)),
             mock.patch.object(cli, "_actor_session", return_value=None),
-            mock.patch.object(cli, "_start_sync"),
-            mock.patch.object(cli, "_spawn_refresh"),
             mock.patch.object(cli, "notify_if_update_available"),
             mock.patch.object(cli, "_create_worktree"),
             mock.patch.object(cli, "_fetch_is_stale", return_value=False),
@@ -286,9 +283,7 @@ class NoBoardReadTests(unittest.TestCase):
             mock.patch("subprocess.Popen"),
             mock.patch.object(cli, "CLAIM_VERIFY_DELAYS", (0.0, 0.0, 0.0)),
             mock.patch.object(cli, "CLAIM_CONFIRM_DELAY", 0.0),
-            # A session never waits for a drainer: it neither drains nor
-            # takes the drain lock itself.
-            guard_refresh_lock("drain.lock"),
+            guard_refresh_lock(),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -297,39 +292,8 @@ class NoBoardReadTests(unittest.TestCase):
         self.assertNotIn("BoardRead", text)
         return code, json.loads(text)
 
-    def test_the_drainers_replay_of_each_command_reads_only_its_card(self) -> None:
-        # Exactly how execute_intent runs a queued change.
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
-        for name, argv, needs in COMMANDS:
-            with self.subTest(command=name):
-                github = self.github_for(needs)
-                snapshot = cached_snapshot(github, age_seconds=0)
-
-                code, payload = self.run_command(
-                    argv, github, environment=environment, snapshot=snapshot
-                )
-
-                self.assertEqual(0, code, payload)
-                self.assertIn("read_request", github.calls)
-
-    def test_a_replayed_capture_reads_nothing_board_wide(self) -> None:
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
-        github = OneCardGitHub("Inbox")
-        github.find_request = lambda *_a, **_k: None  # type: ignore[method-assign]
-
-        code, payload = self.run_command(
-            ["capture", "New", "--kanbanlan-id", IDENTITY],
-            github,
-            environment=environment,
-            snapshot=None,
-        )
-
-        self.assertEqual(0, code, payload)
-        self.assertIn("create", github.calls)
-
-    def test_each_command_decides_without_the_board_whatever_the_snapshot(self) -> None:
-        environment = {"KANBANLAN_WRITE_BEHIND": "1"}
-        ages = {"fresh": 0.0, "too old to serve": 180.0 * 11, "missing": None}
+    def test_each_command_reads_and_writes_only_its_card_whatever_the_snapshot(self) -> None:
+        ages = {"fresh": 0.0, "old": 180.0 * 11, "missing": None}
         for name, argv, needs in COMMANDS:
             for label, age in ages.items():
                 with self.subTest(command=name, snapshot=label):
@@ -337,83 +301,59 @@ class NoBoardReadTests(unittest.TestCase):
                     github = self.github_for(needs)
                     snapshot = None if age is None else cached_snapshot(github, age_seconds=age)
 
-                    code, payload = self.run_command(
-                        argv, github, environment=environment, snapshot=snapshot
-                    )
+                    code, payload = self.run_command(argv, github, snapshot=snapshot)
 
                     self.assertEqual(0, code, payload)
-                    self.assertEqual("write-behind", payload["result"]["sync"]["mode"])
-                    # Only the card itself may be read, and nothing written.
-                    self.assertTrue(
-                        set(github.calls) <= {"read_request", "find_request"}, github.calls
-                    )
+                    self.assertIn("read_request", github.calls)
+                    self.assertNotIn("sync", payload["result"])
 
-    def test_a_queued_capture_reads_and_writes_nothing(self) -> None:
-        environment = {"KANBANLAN_WRITE_BEHIND": "1"}
-        for label, snapshot in (
-            ("fresh", cached_snapshot(OneCardGitHub("Inbox"), age_seconds=0)),
-            ("missing", None),
-        ):
-            with self.subTest(snapshot=label):
+    def test_capture_reads_nothing_board_wide(self) -> None:
+        for argv in (["capture", "New"], ["capture", "New", "--kanbanlan-id", IDENTITY]):
+            with self.subTest(argv=argv):
                 self.root = Path(tempfile.mkdtemp(dir=self.directory.name))
                 github = OneCardGitHub("Inbox")
+                github.find_request = lambda *_a, **_k: None  # type: ignore[method-assign]
 
-                code, payload = self.run_command(
-                    ["capture", "New thing"], github, environment=environment, snapshot=snapshot
-                )
+                code, payload = self.run_command(argv, github, snapshot=None)
 
                 self.assertEqual(0, code, payload)
-                self.assertEqual("write-behind", payload["result"]["sync"]["mode"])
-                self.assertEqual([], github.calls)
+                self.assertIn("create", github.calls)
+                self.assertIsNotNone(payload["result"]["url"])
 
-    def test_a_running_drainer_never_holds_up_a_session(self) -> None:
-        store = CacheStore(config(), self.root / "cache")
-        box = Outbox(store.directory)
-        box._prepare()
+    def test_a_mutation_marks_the_snapshot_stale_without_reading_the_board(self) -> None:
         github = OneCardGitHub("Inbox")
-        # Another session's drainer is mid-batch and holds the drain lock.
-        with locks.FileLock(box.drain_lock_path):
-            code, payload = self.run_command(
-                ["triage", IDENTITY],
-                github,
-                environment={"KANBANLAN_WRITE_BEHIND": "1"},
-                snapshot=cached_snapshot(github, age_seconds=0),
-            )
+        store = CacheStore(config(), self.root / "cache")
+
+        code, payload = self.run_command(
+            ["triage", IDENTITY], github, snapshot=cached_snapshot(github, age_seconds=0)
+        )
 
         self.assertEqual(0, code, payload)
-        self.assertEqual("Ready", payload["result"]["status"])
+        self.assertFalse(store.is_fresh())
 
     def test_an_issue_off_the_configured_project_is_refused_not_added(self) -> None:
-        for name, environment, argv in (
-            (
-                "replay",
-                {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"},
-                ["close", "7", "--reason", "x", "--force"],
-            ),
-            ("replay review", {"KANBANLAN_SYNC_EXECUTOR": "1"}, ["review", "7"]),
-            ("typed", {"KANBANLAN_WRITE_BEHIND": "1"}, ["close", "7", "--reason", "x"]),
+        for argv in (
+            ["close", "7", "--reason", "x", "--force"],
+            ["review", "7"],
+            ["close", "7", "--reason", "x"],
         ):
-            with self.subTest(path=name):
+            with self.subTest(argv=argv):
                 self.root = Path(tempfile.mkdtemp(dir=self.directory.name))
                 github = OneCardGitHub("Inbox", on_board=False, pull_request=True)
 
-                code, payload = self.run_command(
-                    argv, github, environment=environment, snapshot=None
-                )
+                code, payload = self.run_command(argv, github, snapshot=None)
 
                 self.assertEqual(1, code)
                 self.assertIn("not on the configured kanban home", payload["error"]["message"])
                 self.assertEqual(["read_request"], github.calls)
 
     def test_a_claim_that_never_becomes_visible_fails_closed(self) -> None:
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
         github = OneCardGitHub("Ready")
         github.hidden_prefix = "CLAIM:"
 
         code, payload = self.run_command(
             ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
             github,
-            environment=environment,
             snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
         )
 
@@ -423,7 +363,6 @@ class NoBoardReadTests(unittest.TestCase):
         self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
 
     def test_a_claim_is_confirmed_by_a_second_read_before_it_moves_the_card(self) -> None:
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
         github = OneCardGitHub("Ready")
         read = github.read_request
         reads: list[int] = []
@@ -447,7 +386,6 @@ class NoBoardReadTests(unittest.TestCase):
         code, payload = self.run_command(
             ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
             github,
-            environment=environment,
             snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
         )
 
@@ -458,7 +396,6 @@ class NoBoardReadTests(unittest.TestCase):
 
     def test_a_claim_proceeds_during_a_refresh_cooldown(self) -> None:
         # The board refresh is deferred for quota; a claim needs only its card.
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
         github = OneCardGitHub("Ready")
         reset = isoformat(datetime.now(UTC) + timedelta(minutes=20))
         cached = cached_snapshot(OneCardGitHub("Ready"), age_seconds=0)
@@ -471,7 +408,6 @@ class NoBoardReadTests(unittest.TestCase):
         code, payload = self.run_command(
             ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
             github,
-            environment=environment,
             snapshot=cached,
         )
 
@@ -479,8 +415,7 @@ class NoBoardReadTests(unittest.TestCase):
         self.assertEqual("s1", payload["result"]["session"])
         self.assertIn("status:In progress", github.calls)
 
-    def test_a_claim_lost_to_another_machine_fails_its_change_without_waiting(self) -> None:
-        environment = {"KANBANLAN_SYNC_EXECUTOR": "1", "KANBANLAN_BACKGROUND_REFRESH": "skip"}
+    def test_a_claim_lost_to_another_machine_fails_without_waiting(self) -> None:
         github = OneCardGitHub("Ready")
         comment = github.comment_request
 
@@ -495,45 +430,12 @@ class NoBoardReadTests(unittest.TestCase):
         code, payload = self.run_command(
             ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
             github,
-            environment=environment,
             snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
         )
 
         self.assertEqual(1, code)
         self.assertIn("claimed first by elsewhere", payload["error"]["message"])
         self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
-
-    def test_the_drainer_never_refreshes_the_board_itself(self) -> None:
-        store = CacheStore(config(), self.root / "cache")
-        box = Outbox(store.directory)
-        box.write(
-            Intent.create(
-                kind="triage",
-                reference=IDENTITY,
-                label=IDENTITY,
-                argv=["triage", IDENTITY],
-                effect={"status": "Ready"},
-                kanbanlan_id=IDENTITY,
-            )
-        )
-        executed: list[str] = []
-
-        def execute(value: Intent) -> outbox.Execution:
-            executed.append(value.kind)
-            return outbox.Execution(True)
-
-        with (
-            mock.patch.object(outbox, "execute_intent", return_value=execute),
-            mock.patch.object(CacheStore, "refresh", side_effect=BoardRead("refreshed")),
-            mock.patch("subprocess.Popen") as spawned,
-            guard_refresh_lock(),
-        ):
-            drain_outbox(self.root, store, OneCardGitHub("Inbox"))
-
-        self.assertEqual(["triage"], executed)
-        # The refresh runs detached, and the change overlays until it lands.
-        self.assertIn("refresh", spawned.call_args.args[0])
-        self.assertNotIn(QUEUED, [value.state for value in box.intents()])
 
 
 if __name__ == "__main__":

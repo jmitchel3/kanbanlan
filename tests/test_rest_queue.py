@@ -538,8 +538,6 @@ class CacheStoreRoutingTests(unittest.TestCase):
 
             self.assertEqual(10, store.rate_limit_deferral(stale)["remaining"])
             self.assertIsNone(store.rate_limit_deferral(stale, graphql=False))
-            # The background refresh is a queue read, so it still runs.
-            self.assertTrue(store.needs_revalidation(stale))
             with self.assertRaises(RateLimitError) as caught:
                 store.refresh(client, projection=True)
             self.assertTrue(caught.exception.deferred)

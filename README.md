@@ -148,28 +148,22 @@ start. With `--create-project`, `--open` opens the empty Project so a Board view
 can be added manually. Kanbanlan's own `reconcile --apply` keeps item states
 correct even when GitHub Project workflows are not configured.
 
-### Optional background reconciliation
+### Upgrading from a version with the background worker
 
-Successful live initialization and reconciliation register the repository with
-one user-scoped worker. It deduplicates worktrees through Git's common
-directory, refreshes enabled repositories on a bounded schedule, applies only
-safe repairs, and records last-good snapshot and retry health without storing
-credentials.
+Kanbanlan no longer runs a background worker or queues lifecycle changes.
+If an older version installed the worker, remove it once:
 
 ```sh
-kanbanlan worker status
-kanbanlan worker enable --github-login YOUR_GITHUB_ACCOUNT
-kanbanlan worker start
-kanbanlan worker stop
-kanbanlan worker disable
+kanbanlan admin worker uninstall
 ```
 
-The worker resolves the selected account's credential at runtime with
-`gh auth token --user`; it never runs `gh auth switch` and never writes a token
-to the registry. It also drains any lifecycle changes a session queued but did
-not finish syncing (see "Instant commands" below). See [`docs/workflow/worker.md`](docs/workflow/worker.md) for
-macOS LaunchAgent and Linux systemd user-service examples. The worker is
-opt-in, has no Docker requirement, and explicit disablement persists.
+It unloads and deletes the `com.kanbanlan.worker` LaunchAgent or the
+`kanbanlan-worker.service` systemd user unit, stops a worker process that is
+still running, and deletes the worker's registry; account bindings are kept.
+`kanbanlan doctor` warns while a unit is installed or the worker still runs.
+Changes an older version left queued are applied by the next lifecycle
+command, once and in order; any it cannot apply are reported on stderr with
+the command that would retry them, and the old outbox is then removed.
 
 ## Daily use
 
@@ -193,7 +187,6 @@ Lower-level commands live under `kanbanlan admin`:
 kanbanlan admin capture "Title"     # "remember this": an Inbox card
 kanbanlan admin reconcile           # report drift, without mutations
 kanbanlan admin reconcile --apply   # apply and verify the displayed repairs
-kanbanlan admin sync                # show lifecycle changes still syncing to GitHub
 kanbanlan --json next               # stable output for agents and automation
 ```
 
@@ -210,13 +203,11 @@ remaining points than `rate_limit_floor` in `.kanbanlan.toml` (default 500,
 0 disables it), `ensure` defers refreshing until the quota resets. `status`
 and `doctor` report the remaining points. An explicit `kanbanlan refresh`
 always attempts the fetch and reports the rate limit plainly if it fails.
-Only full-board refreshes wait for the quota: `triage`, `review`, `release`,
-`close`, and `handoff` still make their few targeted writes during the
-cooldown from the cached snapshot, which is marked stale until a refresh runs.
-A write GitHub itself refuses fails with GitHub's reset time.
+Only full-board refreshes wait for the quota: lifecycle commands still make
+their few targeted reads and writes during the cooldown. A write GitHub itself
+refuses fails with GitHub's reset time.
 
-Repository-scope reads (`ensure`, `next`, `status`, `refresh`, and the
-background refresh after a lifecycle change) read the request queue over the
+Repository-scope reads (`ensure`, `next`, `status`, and `refresh`) read the request queue over the
 REST API instead of GraphQL. Status labels are the canonical request status,
 so this repository's issues, their claim comments, and the open pull requests
 of every repository the Project references answer every queue question. Each
@@ -260,39 +251,21 @@ the logged-in accounts. An explicit `GH_TOKEN` or `GITHUB_TOKEN` is used as is
 when nothing is bound. Bindings live in the user state directory, never in the
 repository.
 
-### Instant commands
+### Lifecycle commands
 
-Lifecycle commands (`capture`, `triage`, `claim`, `release`, `review`,
-`close`, `handoff`) and reads (`ensure`, `next`, `overlap`, `status`,
-`reconcile`, `sessions`, `resume`, `record`) answer from local state in a
-fraction of a second:
+Lifecycle commands (`start`, `done`, `drop`, and the admin `capture`,
+`triage`, `claim`, `release`, `review`, `close`, `handoff`, `rehome`) write
+GitHub directly and return once GitHub has accepted the change:
 
-- A lifecycle command validates against the local snapshot with every pending
-  change laid over it, records its change in the cache directory's outbox, and
-  returns. A detached `kanbanlan sync --drain` then replays each change, in
-  order, as the ordinary live command, which re-validates against that one
-  card on GitHub. A queued `capture` returns its Kanbanlan ID at once; the
-  issue number follows.
-- Neither a lifecycle command nor its replay reads the whole board or waits
-  on the refresh lock or on another session's queue. Each reads and writes
-  only its own card (labels, claim comments, Project item and Status), so it
-  costs the same on any board size.
-- Sessions on the same machine arbitrate claims instantly under a local lock.
-  The replayed claim still posts to GitHub and verifies it against the card's
-  claim comments afterwards, so a claim lost to another machine is reported
-  as a failed change on the next command instead of blocking anyone.
-- Reads serve the local snapshot and refresh it in the background when it is
-  stale; only a missing snapshot makes a read wait. When the local view cannot
-  decide a lifecycle command (a request the snapshot does not know, a snapshot
-  older than ten staleness windows, a `review` whose pull request is newer than
-  the snapshot), the command reads that one card and decides again. A
-  reconcile that finds drift in the local copies confirms it live.
-- A change that fails to sync is never retried on its own. It is reported on
-  later commands, blocks further changes to the same request, and is managed
-  with `kanbanlan sync`, `kanbanlan sync --retry ID`, and
-  `kanbanlan sync --dismiss ID|all`.
-
-Set `KANBANLAN_WRITE_BEHIND=0` to run every command live.
+- Each reads and writes only its own card (labels, claim comments, Project
+  item and Status), never the whole board, so it costs the same on any board
+  size and never waits on the refresh lock.
+- A claim posts its claim comment and then re-reads the card to verify it, so
+  a claim lost to another session or machine fails at once instead of later.
+- Transient GitHub errors are retried; a rate-limit refusal fails with
+  GitHub's reset time.
+- A change marks the shared snapshot stale, so the next read refreshes it
+  rather than serving the pre-change state. Nothing runs in the background.
 
 ## Shared Projects across repositories
 

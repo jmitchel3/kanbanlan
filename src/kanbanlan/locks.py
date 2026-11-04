@@ -119,8 +119,7 @@ def process_elapsed_seconds(pid: int) -> float | None:
     (whole seconds) is a procps extension that macOS ``ps`` rejects, so the
     POSIX ``etime`` form (``[[dd-]hh:]mm:ss``) is the fallback. Without it,
     every long-lived owner on macOS looked unverifiable, and past the
-    unverifiable cap a live worker's lock was swept and a second worker
-    started beside it.
+    unverifiable cap a live owner's lock could be swept from under it.
     """
 
     seconds = _ps_field(pid, "etimes")

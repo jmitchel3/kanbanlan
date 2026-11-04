@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import threading
 import time
@@ -131,36 +130,18 @@ class InvalidationTests(unittest.TestCase):
 
 
 class BackgroundRefreshTests(unittest.TestCase):
-    def test_mutation_invalidates_and_refreshes_in_a_detached_process(self) -> None:
+    def test_mutation_marks_the_snapshot_stale_without_any_read_or_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CacheStore(config(), Path(directory))
             client = _CountingClient()
             store.refresh(client)
-            root = Path(directory)
 
-            with (
-                mock.patch.dict(os.environ, {"KANBANLAN_BACKGROUND_REFRESH": "1"}),
-                mock.patch("kanbanlan.cli.subprocess.Popen") as popen,
-            ):
-                _refresh_after_mutation(root, store, client)
-
-            self.assertEqual(1, client.fetches)
-            self.assertFalse(store.is_fresh())
-            command = popen.call_args.args[0]
-            self.assertEqual(["-m", "kanbanlan", "-C", str(root), "--json", "refresh"], command[1:])
-            self.assertTrue(popen.call_args.kwargs["start_new_session"])
-
-    def test_foreground_refresh_is_kept_when_background_is_disabled(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = CacheStore(config(), Path(directory))
-            client = _CountingClient()
-
-            with mock.patch("kanbanlan.cli.subprocess.Popen") as popen:
+            with mock.patch("subprocess.Popen") as popen:
                 _refresh_after_mutation(Path(directory), store, client)
 
             popen.assert_not_called()
             self.assertEqual(1, client.fetches)
-            self.assertTrue(store.is_fresh())
+            self.assertFalse(store.is_fresh())
 
 
 class ConcurrentCollectionTests(unittest.TestCase):
