@@ -130,6 +130,12 @@ def worktree_identity(entry: WorktreeEntry) -> str | None:
     return None
 
 
+def checkout_identity(path: str | Path, branch: str | None) -> str | None:
+    """Return the Kanbanlan ID a checkout's branch or directory names."""
+
+    return worktree_identity(WorktreeEntry(path=str(path), branch=branch or None))
+
+
 def list_worktrees(runner: Runner) -> list[WorktreeEntry]:
     return parse_worktree_list(runner.run(["git", "worktree", "list", "--porcelain"]).stdout)
 
@@ -178,6 +184,29 @@ def inspect_worktree(
         unpushed=unpushed,
         upstream=upstream,
     )
+
+
+def settled_requests(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map each Kanbanlan ID on the board to its request, when nothing claims it."""
+
+    return {
+        item["kanbanlan_id"]: item
+        for item in snapshot.get("items", [])
+        if item.get("type") == "ISSUE" and item.get("kanbanlan_id") and not item.get("active_claim")
+    }
+
+
+def needs_inspection(entry: WorktreeEntry, settled: dict[str, dict[str, Any]]) -> bool:
+    """Report whether `plan_cleanup` could remove ``entry``, so its status matters.
+
+    Only a worktree linked to a request nothing claims can be removed; every
+    other one is kept whatever its working tree holds.
+    """
+
+    if entry.prunable or entry.locked:
+        return False
+    identity = worktree_identity(entry)
+    return bool(identity and identity in settled)
 
 
 def plan_cleanup(
@@ -276,6 +305,12 @@ def plan_cleanup(
             )
         )
     return actions
+
+
+def removals(plan: list[CleanupAction]) -> list[CleanupAction]:
+    """Return the planned actions that change anything on disk."""
+
+    return [value for value in plan if value.action in {REMOVE, PRUNE}]
 
 
 def format_action(value: CleanupAction) -> str:

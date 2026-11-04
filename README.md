@@ -334,6 +334,37 @@ issue number.
 
 ## Request lifecycle
 
+Four verbs cover a session:
+
+```sh
+cd "$(kanbanlan start "Add export audit log" --touchpoints "audit API; exports UI" | tail -1)"
+kanbanlan done               # open (or find) the pull request, move the request to In review
+kanbanlan drop               # release this worktree's claim
+kanbanlan drop --close --reason "Duplicate of KBL-..." --not-planned
+kanbanlan status
+```
+
+`start` takes a Kanbanlan ID or `#number` for an existing request, or a title
+for a new one. In one call it captures the request when needed, triages it
+from Inbox to Ready, reads the Project for other active claims, prunes
+orphaned request worktrees (only what `cleanup --apply` would remove), and
+claims the request in a new worktree. It refuses a request another session
+claims and a session that already owns a different request; starting the
+request the session already owns prints its worktree again. Other active
+claims and their touchpoints are printed, and returned under `overlap` with
+`--json`, so the agent can judge semantic conflict. The worktree path is the
+last line of output.
+
+`done` and `drop` default to the request the current worktree or branch was
+claimed for. `done` pushes the branch and opens a pull request from
+`.github/pull_request_template.md` with the Kanbanlan ID and `Closes #N` filled
+in when none is open, then runs `review`. `drop` runs `release`, or `close`
+with `--close`.
+
+Every other command lives under `kanbanlan admin` (`kanbanlan admin --help`
+lists them). Each still runs without the prefix, so `kanbanlan claim` and
+`kanbanlan admin claim` are the same command:
+
 ```sh
 kanbanlan capture "Add export audit log" --priority priority:p1
 kanbanlan triage KBL-...
