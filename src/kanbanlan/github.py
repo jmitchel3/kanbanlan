@@ -886,7 +886,6 @@ class GitHub:
                 target: executor.submit(self._fetch_pull_requests, target) for target in predicted
             }
             project, project_rate_limit = project_future.result()
-            self._store_project_metadata(project)
             targets = sorted({config.repository, *project_repositories(project)})
             for target in targets:
                 if target not in pull_futures:
@@ -911,10 +910,12 @@ class GitHub:
                 rate_limits.append(rate_limit)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
+        rate_limit = min(rate_limits, key=lambda value: value.get("remaining", 10**12))
+        self._store_project_metadata(project, graphql_rate_limit=rate_limit)
         return ProjectRead(
             project=project,
             pull_requests=pull_requests,
-            rate_limit=min(rate_limits, key=lambda value: value.get("remaining", 10**12)),
+            rate_limit=rate_limit,
             unavailable_repositories=unavailable,
         )
 
@@ -1013,11 +1014,16 @@ class GitHub:
             **metadata["project"],
             "items": queue_items(repository, issues, comments, self._cached_item_ids()),
         }
+        rate_limit = reader.stats.rate_limit()
+        if isinstance(metadata.get("graphql_rate_limit"), dict):
+            # The GraphQL quota the last Project read saw, so the rate-limit
+            # floor still holds back Project reads (reconcile, the worker).
+            rate_limit["graphql"] = metadata["graphql_rate_limit"]
         return build_snapshot(
             config,
             project,
             pull_requests,
-            reader.stats.rate_limit(),
+            rate_limit,
             generated_at=generated_at,
             unavailable_repositories=unavailable,
             read_from=READ_FROM_ISSUES,
@@ -1087,9 +1093,16 @@ class GitHub:
             return None
         return data
 
-    def _store_project_metadata(self, project: dict[str, Any]) -> dict[str, Any]:
-        """Keep a Project read's metadata for later queue reads."""
+    def _store_project_metadata(
+        self,
+        project: dict[str, Any],
+        *,
+        graphql_rate_limit: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Keep a Project read's metadata, and the GraphQL quota it saw."""
 
+        if graphql_rate_limit is None:
+            graphql_rate_limit = (self._load_project_metadata() or {}).get("graphql_rate_limit")
         value = {
             "schema_version": PROJECT_METADATA_SCHEMA_VERSION,
             "key": self._item_cache_key(),
@@ -1101,6 +1114,8 @@ class GitHub:
                 else project_repositories(project)
             ),
         }
+        if isinstance(graphql_rate_limit, dict):
+            value["graphql_rate_limit"] = graphql_rate_limit
         path = self._cache_file(PROJECT_METADATA_FILENAME)
         if path is not None:
             try:

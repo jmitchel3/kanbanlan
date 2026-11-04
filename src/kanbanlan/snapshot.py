@@ -600,7 +600,10 @@ class CacheStore:
         return self._usable(snapshot)
 
     def needs_revalidation(self, snapshot: dict[str, Any] | None) -> bool:
-        return self._snapshot_state(snapshot) != "fresh" and not self.rate_limit_deferral(snapshot)
+        # The revalidating refresh repeats the read that produced the snapshot.
+        return self._snapshot_state(snapshot) != "fresh" and not self.rate_limit_deferral(
+            snapshot, graphql=read_from(snapshot) != READ_FROM_ISSUES
+        )
 
     def write_open_requests(self, open_requests: list[dict[str, Any]]) -> None:
         self._prepare_directory()
@@ -768,13 +771,20 @@ class CacheStore:
         configured floor and the reset is still ahead.
 
         The floor guards GraphQL points only. A read that spends none
-        (``graphql=False``) is never held back by it, and a snapshot whose
-        rate limit is the REST quota says nothing about GraphQL points.
+        (``graphql=False``) is never held back by it. A snapshot whose rate
+        limit is the REST quota is judged by the GraphQL quota the last
+        Project read saw (``rate_limit.graphql``), when it carries one.
         """
 
         health = self._read_json(self.health_path) or {}
-        reset_at = (health.get("error") or {}).get("reset_at")
-        if health.get("refresh_status") == "throttled" and _future_reset(reset_at):
+        error = health.get("error") or {}
+        reset_at = error.get("reset_at")
+        if (
+            health.get("refresh_status") == "throttled"
+            and _future_reset(reset_at)
+            # A floor deferral held back GraphQL points; GitHub refused nothing.
+            and (graphql or not error.get("deferred"))
+        ):
             return {"remaining": None, "reset_at": reset_at, "reason": "cooldown"}
 
         floor = self.config.rate_limit_floor
@@ -783,7 +793,9 @@ class CacheStore:
         assert snapshot is not None
         rate = snapshot.get("rate_limit") or {}
         if rate.get("resource") == "core":
-            return None
+            rate = rate.get("graphql")
+            if not isinstance(rate, dict):
+                return None
         remaining = rate.get("remaining")
         reset_at = rate.get("resetAt")
         if isinstance(remaining, bool) or not isinstance(remaining, int):
@@ -863,6 +875,11 @@ class CacheStore:
                     "kind": error.__class__.__name__,
                     "message": str(error),
                     **({"reset_at": error.reset_at} if isinstance(error, RateLimitError) else {}),
+                    **(
+                        {"deferred": True}
+                        if isinstance(error, RateLimitError) and error.deferred
+                        else {}
+                    ),
                 },
             },
         )

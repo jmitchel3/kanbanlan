@@ -79,6 +79,7 @@ from kanbanlan.sessions import (
     session_from_hook_payload,
 )
 from kanbanlan.snapshot import (
+    READ_FROM_ISSUES,
     READ_FROM_PROJECT,
     SCHEMA_VERSION,
     SCOPE_PROJECT,
@@ -1422,7 +1423,7 @@ def _warn_stale_service(
     if write_behind_enabled() and store.serveable(snapshot):
         # Served locally while a background refresh replaces it; not a fault.
         return
-    deferral = store.rate_limit_deferral(snapshot)
+    deferral = store.rate_limit_deferral(snapshot, graphql=read_from(snapshot) != READ_FROM_ISSUES)
     if write_behind_enabled() and not deferral:
         warning(
             f"serving the snapshot from {snapshot.get('generated_at')} while a background "

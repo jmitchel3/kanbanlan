@@ -256,6 +256,15 @@ class QueueSnapshotTests(unittest.TestCase):
         self.assertEqual(set(reference["items"][0]), set(snapshot["items"][0]))
         self.assertEqual(set(reference["source"]), set(snapshot["source"]))
 
+    def test_queue_snapshot_carries_the_last_project_reads_graphql_quota(self) -> None:
+        self.assertNotIn("graphql", self.read()["rate_limit"])
+        graphql = {"remaining": 42, "resetAt": "2999-01-01T00:00:00Z", "cost": 1}
+        self.github._store_project_metadata(PROJECT_METADATA, graphql_rate_limit=graphql)
+        self.assertEqual(graphql, self.read()["rate_limit"]["graphql"])
+        # A metadata-only renewal keeps the quota the last Project read saw.
+        self.github._store_project_metadata(PROJECT_METADATA)
+        self.assertEqual(graphql, self.read()["rate_limit"]["graphql"])
+
     def test_unchanged_queue_revalidates_with_304s_and_no_graphql(self) -> None:
         first = self.read()
         self.assertEqual(1, self.gh.graphql_calls)  # Project metadata, once
@@ -507,6 +516,34 @@ class CacheStoreRoutingTests(unittest.TestCase):
             client = self.Client()
 
             store.ensure(client)
+
+            self.assertEqual([READ_FROM_ISSUES], client.calls)
+
+    def test_a_low_graphql_quota_still_defers_project_reads_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            stale = {
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": isoformat(datetime.now(UTC) - timedelta(hours=1)),
+                "source": {"read_from": READ_FROM_ISSUES},
+                "items": [],
+                "rate_limit": {
+                    "resource": "core",
+                    "remaining": 4000,
+                    "graphql": {"remaining": 10, "resetAt": "2999-01-01T00:00:00Z"},
+                },
+            }
+            store._write_json(store.snapshot_path, stale)
+            client = self.Client()
+
+            self.assertEqual(10, store.rate_limit_deferral(stale)["remaining"])
+            self.assertIsNone(store.rate_limit_deferral(stale, graphql=False))
+            # The background refresh is a queue read, so it still runs.
+            self.assertTrue(store.needs_revalidation(stale))
+            with self.assertRaises(RateLimitError) as caught:
+                store.refresh(client, projection=True)
+            self.assertTrue(caught.exception.deferred)
+            store.refresh(client)
 
             self.assertEqual([READ_FROM_ISSUES], client.calls)
 
