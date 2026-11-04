@@ -173,14 +173,28 @@ opt-in, has no Docker requirement, and explicit disablement persists.
 
 ## Daily use
 
+A session needs four verbs:
+
 ```sh
-kanbanlan ensure             # serve the worktree-shared cache, refreshing it when stale
-kanbanlan next               # report the first unblocked Ready issue
-kanbanlan status             # summarize the local cache
-kanbanlan reconcile          # report drift, without mutations
-kanbanlan reconcile --apply  # apply and verify the displayed repairs
-kanbanlan sync               # show lifecycle changes still syncing to GitHub
-kanbanlan --json next        # stable output for agents and automation
+kanbanlan start "Add export audit log" --touchpoints "audit API; exports UI"
+kanbanlan done               # push, open the pull request, move to In review
+kanbanlan drop               # abandon: release this worktree's claim
+kanbanlan status             # read-only board summary
+```
+
+`start` prints the worktree to work in as its last line. Write decisions and
+verification in the pull request body. The managed `AGENTS.md` and `CLAUDE.md`
+section tells agents exactly this and nothing more; see
+[Request lifecycle](#request-lifecycle) for details.
+
+Lower-level commands live under `kanbanlan admin`:
+
+```sh
+kanbanlan admin capture "Title"     # "remember this": an Inbox card
+kanbanlan admin reconcile           # report drift, without mutations
+kanbanlan admin reconcile --apply   # apply and verify the displayed repairs
+kanbanlan admin sync                # show lifecycle changes still syncing to GitHub
+kanbanlan --json next               # stable output for agents and automation
 ```
 
 The cache lives at `<primary-checkout>/.cache/kanbanlan/` with private file
