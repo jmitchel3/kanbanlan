@@ -322,200 +322,66 @@ def agent_instructions(config: Config) -> str:
     )
     tracking = ""
     if config.session_tracking:
-        tracking = """\
-- Provider-native session tracking is enabled. Keep the generated agent hook
-  active, and let lifecycle commands auto-detect the current agent session. Use
-  `--actor-session HARNESS:SESSION_ID` only when automatic context is unavailable.
-"""
+        tracking = "- Keep the generated session hook active; commands detect this session.\n"
     return f"""## Request Coordination Workflow
 
-The canonical kanban home is `{config.canonical_home}`. GitHub Issues currently
-store canonical requests, and [{config.project_owner} Project
-{config.project_number}]({project_url}) is their projection. Repository policy
-and durable delivery records remain versioned here. Follow
-`docs/workflow/kanbanlan.md`.
+Requests live on [{config.project_owner} Project {config.project_number}]({project_url}).
+Details: `docs/workflow/kanbanlan.md`.
 
-- At session start run `kanbanlan ensure`. Before mutations run
-  `kanbanlan reconcile` and inspect all open cards and pull requests for
-  semantic overlap. When this repository shares its Project with other
-  repositories, run `kanbanlan overlap` so the check covers them too. If live
-  coordination state is unavailable, do not start potentially overlapping
-  implementation.
-- Status questions are read-only. “Remember this” creates an Inbox card.
-  “Let's work on this” authorizes a live overlap check and one claim.
-- Create or reuse one request per independently reviewable outcome. Each request
-  has a provider-independent Kanbanlan ID. One session
-  may own exactly one `status:in-progress` card, and one card may have exactly
-  one active session. Claim with
-  `kanbanlan claim <kanbanlan-id-or-provider-ref> --touchpoints ...`.
-- Use a dedicated request branch and worktree. Block semantic conflicts even when
-  filenames differ. Do not expand a claimed card into another useful outcome.
-{tracking}- Run `kanbanlan record <kanbanlan-id-or-provider-ref>` in the implementation
-  worktree and complete its durable decisions, verification, and delivered result.
-- A pull request closes its issue and moves it to In review. Ownership lasts
-  until merge, explicit release, close, or handoff. A request that ends without
-  a merge is closed with
-  `kanbanlan close <kanbanlan-id-or-provider-ref> --reason ...`, adding
-  `--not-planned` when it will not be built. Project Done means delivered to
-  `{config.stage_branch}`; production readiness still requires staging review.
-"""
+- Before coding, run `kanbanlan start <ref-or-title> --touchpoints "..."` and
+  work only in the worktree it prints.
+- If `start` refuses, or lists another claim that conflicts semantically with
+  this work, stop and ask.
+- One card per session. Do not expand its scope into another outcome.
+- Write decisions and verification in the pull request body.
+- When the work is ready, run `kanbanlan done` (it opens or finds the pull
+  request). `kanbanlan drop` abandons the card.
+- Status questions are read-only. "Remember this" means `kanbanlan admin capture`.
+{tracking}"""
 
 
 def workflow_doc(config: Config) -> str:
     return f"""# Request coordination with Kanbanlan
 
-This repository uses `{config.canonical_home}` as its canonical kanban home.
-GitHub Issues currently store requests, and Project {config.project_number},
-owned by `{config.project_owner}`, is their board projection. The repository
-binding is `{config.repository}`.
+Requests for `{config.repository}` live in GitHub Issues, projected onto
+Project {config.project_number} owned by `{config.project_owner}`. Each request
+has an immutable `KBL-...` Kanbanlan ID; `#123` is an alias, and every command
+accepts either.
 
-Each request has an immutable `KBL-...` Kanbanlan ID. Provider references such
-as GitHub `#123` are aliases; lifecycle commands accept either form. The live
-kanban home owns volatile queue and claim state. Workflow policy and completed
-delivery evidence remain versioned in this repository.
-
-## Daily commands
+## The four verbs
 
 ```sh
-kanbanlan ensure
-kanbanlan next
-kanbanlan status
-kanbanlan reconcile
-kanbanlan --json next
+kanbanlan start "Add export audit log" --touchpoints "audit API; exports UI"
+kanbanlan start KBL-...           # or #123: pick up an existing request
+kanbanlan done                    # push, open the pull request, move to In review
+kanbanlan drop                    # release the claim
+kanbanlan drop --close --reason "Duplicate of KBL-..." --not-planned
+kanbanlan status                  # read-only board summary
+kanbanlan next                    # first unblocked Ready card
 ```
 
-`ensure` refreshes a private local cache shared by Git worktrees.
-`reconcile` reports drift between request status, identity, active claims, pull
-requests, and projections. It also reports requests that need a Kanbanlan ID.
-Use `kanbanlan reconcile --apply` only after reviewing the plan. `--json`
-provides stable structured output for agents without requiring an MCP server.
+`start` captures the request when given a title, moves it to Ready, checks the
+Project for other active claims, and claims it in a new worktree whose path is
+the last line of output. It refuses a request another session owns, and a
+session that already owns a different request. Other active claims and their
+touchpoints are printed; stop and ask when one conflicts semantically, even if
+the files differ.
 
-## Repository scope and Project scope
+`done` and `drop` default to the request the current worktree claims. One
+session owns one request, and one request has one session.
 
-One GitHub Project can serve several repositories. Kanbanlan reads it at two
-scopes, and the difference is visible in stable JSON as `source.scope`.
+## Pull requests and records
 
-| Scope | Value | What it contains |
-| --- | --- | --- |
-| Repository | `repository` | Only content owned by `{config.repository}`. |
-| Project | `project` | Every repository the Project already references. |
+Pull requests target `{config.default_branch}` and carry `Kanbanlan: KBL-...`
+and `Closes #<issue>`; `done` fills both in from
+`.github/pull_request_template.md`. Write decisions, verification, and the
+delivered result in the body's Decisions, Verification, and Result sections.
+`kanbanlan record KBL-... --from-pr` turns them into
+`docs/kanbanlan/requests/KBL-....md`; commit it in the same pull request.
 
-Repository scope is the default and the only scope lifecycle commands use.
-`next`, `capture`, `claim`, `release`, `review`, `close`, `handoff`, `cleanup`,
-and ordinary
-`reconcile` stay repository-local, so a shared Project never hands this
-repository another repository's work. Queue selection (`ready_cards` and
-`next_ready`) stays repository-local even in project scope.
-
-Project scope is read-only and always live; it never writes the shared cache.
-
-```sh
-kanbanlan overlap                 # open cards and pull requests Project-wide
-kanbanlan status --project        # board counts per repository
-kanbanlan --json snapshot --project
-```
-
-Project-scoped reads are bounded to repositories the Project already
-references. They never enumerate repositories owned by the account. A peer
-repository that cannot be read is reported in
-`source.unavailable_repositories` rather than failing the read.
-
-Every issue and pull request carries `repository` and a repository-qualified
-`provider_ref` such as `github:{config.repository}#123`, so identically
-numbered content in different repositories never collides. `display_id` stays
-short (`#123`) for this repository and is qualified (`owner/repo#123`) for a
-peer. A bare number is always a local reference: `kanbanlan record 123`
-resolves in `{config.repository}` only, and a peer request needs its Kanbanlan
-ID or a qualified reference.
-
-## Cross-repository delivery
-
-A request here can be delivered by a pull request in a peer repository. Two
-references are explicit enough to cross that boundary:
-
-- a repository-qualified closing reference, such as
-  `Closes {config.repository}#123`; or
-- the request's exact Kanbanlan ID declared in the pull request body, which the
-  generated pull request template already asks for.
-
-A bare `Closes #123` is only ever read inside the pull request's own
-repository, so it can never reach a peer request by accident.
-
-Each entry in `linked_open_pull_requests` reports `repository`, a qualified
-`provider_ref`, and `linked_by`, which lists the routes that justified the link
-(`closing_reference`, `kanbanlan_id`, or both). `kanbanlan review` accepts a
-qualifying open cross-repository pull request and keeps the responsible claim.
-
-Open pull requests are discovered across the repositories linked to the Project
-or already carrying Project items, never across the account. In repository
-scope a peer pull request is reported only while it delivers a request in
-`{config.repository}`.
-
-Ambiguity is reported rather than guessed. A pull request that names several
-Kanbanlan IDs without declaring one, or that declares an ID carried by more
-than one request, is listed in `linkage_problems` and linked to nothing.
-`reconcile`, `overlap`, and `review` all surface those entries. Declaring one
-ID on the `Kanbanlan:` line keeps a passing mention of another request
-harmless.
-
-## Capturing into another repository
-
-A client-level Project can hold requests owned by several repositories. The
-request belongs in the repository whose code will change, because that is the
-repository whose queue must offer it and whose branch will deliver it.
-
-```sh
-kanbanlan capture "Add the HSA/FSA page" --repository OWNER/REPO
-```
-
-`capture` defaults to `{config.repository}` and never infers a destination from
-the title or body. A target is only ever this repository or one you name.
-
-Before any request is created, the target is validated and prepared: it must
-parse as `OWNER/REPO` (a URL is accepted only on `{config.hostname}`), be
-accessible, and be linked to the configured Project, and the workflow status
-and priority labels are provisioned there. A target that cannot be reached or
-linked fails while nothing has been created.
-
-The new request keeps one Kanbanlan ID, joins the configured Project, and
-reaches Inbox in the repository that owns it. Success output reports the
-repository, the Kanbanlan ID, the qualified provider reference, and the
-canonical URL.
-
-If something fails after the request exists, the error names the exact created
-URL and the repair to run. Do not run `capture` again: a second run creates a
-second request with a new identity. Run `kanbanlan reconcile --apply` in the
-repository that owns the request instead.
-
-## Moving a request that landed in the wrong repository
-
-A request that already exists moves with `rehome`, which preserves its
-Kanbanlan ID, its discussion, and its Project state. Recreating it elsewhere
-would fragment its history and break the portable identity.
-
-```sh
-kanbanlan rehome KBL-... --repository OWNER/REPO           # plan only
-kanbanlan rehome KBL-... --repository OWNER/REPO --apply   # perform the move
-```
-
-The plan is the default and changes nothing. It reports what transfers, what
-the target still needs, what GitHub will drop (a milestone, and any label the
-target does not have), and anything that blocks the move.
-
-A move is refused while the request has an active claim or a linked open pull
-request, when it is closed, or when the destination is where it already lives.
-Release the claim, or merge or close the pull request, and then move it. Only
-same-host moves to the configured Project are supported; anything else fails
-before a single mutation.
-
-This moves the canonical request, not its implementation. Branches, worktrees,
-commits, and pull requests stay where they are, and the request receives a new
-issue number in its new repository. Look it up by its Kanbanlan ID, which never
-changes.
-
-If the transfer succeeds but reconciling the Project state fails, the error
-names the new canonical URL and a retryable repair. Rerunning `rehome` finishes
-the move; it never creates a replacement request.
+Merging moves the card to Done, which means delivered to
+`{config.stage_branch}`, not production-ready. Production promotion is a
+separate review after staging verification.
 
 ## States
 
@@ -526,124 +392,35 @@ the move; it never creates a replacement request.
 | `status:in-progress` | In progress | Claimed by one session. |
 | `status:blocked` | Blocked | Waiting on a dependency or decision. |
 | `status:review` | In review | A linked pull request is open. |
-| closed issue | Done | Delivered to the staging branch, or closed as not planned. |
+| closed issue | Done | Delivered, or closed as not planned. |
 
 Priority labels are `priority:p0` through `priority:p3`.
 
-## Ownership
+## Reference
+
+Every other command lives under `kanbanlan admin` (`kanbanlan admin --help`).
 
 ```sh
-kanbanlan claim KBL-... --touchpoints "auth contract; src/auth; migrations"
-kanbanlan release KBL-... --reason "Waiting for API decision"
-kanbanlan review KBL-...
+kanbanlan admin capture "Title"                       # "remember this": an Inbox card
+kanbanlan admin capture "Title" --repository OWNER/REPO
+kanbanlan admin overlap                               # open work across the Project
+kanbanlan admin release KBL-... --reason "..." --blocked
+kanbanlan admin handoff KBL-... --session NEXT --branch B --worktree W --reason "..."
+kanbanlan admin close KBL-... --reason "Delivered by ..."
+kanbanlan admin rehome KBL-... --repository OWNER/REPO --apply
+kanbanlan admin cleanup --apply                       # remove unclaimed worktrees
+kanbanlan admin reconcile --apply                     # repair label and claim drift
 ```
 
-The earliest unreleased CLAIM comment owns the card. Claims do not expire
-automatically. Check the canonical request, branch, worktree, and PR before
-asking to take over stale work.
-
-`claim` creates a worktree per request; `cleanup` is what removes them again:
-
-```sh
-kanbanlan cleanup                 # report what is safe to remove
-kanbanlan cleanup --apply
-```
-
-It removes a worktree only when its request has no active claim, and it links a
-worktree to its request through the Kanbanlan ID in the branch or directory name
-that `claim` writes. It never touches the primary worktree, the worktree the
-command runs in, a locked worktree, or one it cannot link to a request.
-
-What keeps a worktree is a commit that exists nowhere else. A branch with an
-upstream is settled once everything is pushed, which is what a squash merge
-leaves behind: the commit on `{config.stage_branch}` is a new one, so the branch
-still reports commits the default branch does not contain, yet nothing is at
-risk. A branch that was never pushed is its own only copy, so there merge state
-decides. Uncommitted changes always keep a worktree.
-
-`--force` removes a worktree despite either. It still never deletes a branch
-holding unpushed commits, so only uncommitted changes are ever discarded. The
-local branch is deleted when it is merged or fully pushed.
-
-## Optional agent session tracking
-
-Provider-native session attribution is disabled by default. On an existing
-configuration, `kanbanlan init --session-tracking` enables it in place while
-preserving the repository and Project binding. Disable it with
-`kanbanlan init --no-session-tracking`; installed hook files remain inert and
-are not deleted. Use `kanbanlan init --reconfigure` only to intentionally rerun
-full Project setup. The repository configuration is:
-
-```toml
-[session_tracking]
-enabled = true
-```
-
-`KANBANLAN_SESSION_TRACKING=true` or `false` overrides the repository setting
-for one process. When enabled, Kanbanlan checks `--actor-session`, then
-`KANBANLAN_AGENT_SESSION=HARNESS:SESSION_ID`, then the paired
-`KANBANLAN_AGENT` and `KANBANLAN_SESSION_ID` variables, provider-native
-variables, and finally fresh context registered by the generated agent hooks.
-If no trustworthy ID is available, activity is recorded as unavailable rather
-than being presented as resumable.
-
-```sh
-kanbanlan triage KBL-...
-kanbanlan sessions KBL-...
-kanbanlan resume KBL-...                 # print the native resume command
-kanbanlan resume KBL-... --action claim --run
-```
-
-Supported resume adapters are Codex, Claude Code, Grok Build, and Google
-Antigravity AGY. Session entries display as `<session-id> · <harness>`. Native
-IDs are written to canonical request comments when tracking is enabled, so
-enable it only where that visibility is acceptable. Local sessions still
-require their original transcript store and account; an ID cannot recreate a
-deleted or non-persisted transcript.
-Claim and handoff history distinguishes the session that performed the action
-from the session responsible for the resulting work. Resume follows the
-responsible session, so a handoff targets its recipient.
-
-## Durable request records
-
-Write durable decisions, verification evidence, and the delivered result in
-the pull request body's Decisions, Verification, and Result sections, then
-generate the repository record from it in the implementation worktree:
-
-```sh
-kanbanlan record KBL-... --from-pr
-```
-
-This writes or updates `docs/kanbanlan/requests/KBL-....md` from the pull
-request on the current branch (or the one pull request linked to the request)
-and reports any section the body lacks instead of inventing it. Commit the
-record in the same pull request. Plain `kanbanlan record KBL-...` still creates
-an empty record once and never overwrites manual edits. Do not commit routine
-status movements or claim heartbeats.
-
-## Delivery
-
-Pull requests target `{config.default_branch}`, carry `Kanbanlan: KBL-...`,
-and use `Closes #<issue>` while GitHub is canonical. Merging moves the card to
-Done. Done means delivered to
-`{config.stage_branch}`, not production-ready. Production promotion remains a
-separate review after staging verification.
-
-A request that ends without a merge is closed directly:
-
-```sh
-kanbanlan close KBL-... --reason "Delivered by <what shipped it>"
-kanbanlan close KBL-... --reason "Duplicate of KBL-..." --not-planned
-```
-
-`close` releases any active claim, closes the canonical request as completed or
-not planned, and settles the projection at Done. It refuses while a linked pull
-request is still open, because merging that pull request is the closing path;
-`--force` overrides the refusal when the pull request will never merge.
-
-Successful live setup can register the repository with the optional user-scoped
-worker. Manage it with `kanbanlan worker status`, `enable`, `disable`, `start`,
-and `stop`; see `docs/workflow/worker.md` for macOS LaunchAgent and Linux
-systemd user-service examples. The worker deduplicates worktrees, preserves
-last-good snapshots, uses bounded retry/backoff, and never stores GitHub tokens.
+- `--json` gives stable structured output on every command.
+- A request belongs in the repository whose code will change. Move a misplaced
+  one with `rehome`, never by capturing it again.
+- A pull request in another repository delivers a request here only through a
+  qualified `Closes {config.repository}#123` or its declared Kanbanlan ID.
+- `close` refuses while a linked pull request is open; merging is the closing
+  path, and `--force` overrides when it never will merge.
+- `cleanup` never removes a worktree holding uncommitted or unpushed work.
+- Session tracking: `kanbanlan init --session-tracking` installs agent hooks
+  that attribute lifecycle activity to the native session, and
+  `kanbanlan admin resume KBL-...` prints its resume command.
 """
