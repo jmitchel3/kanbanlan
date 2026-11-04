@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -11,11 +12,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from kanbanlan.accounts import AccountRunner
 from kanbanlan.config import Config, cache_dir
 from kanbanlan.identity import attach_kanbanlan_id, extract_kanbanlan_id
 from kanbanlan.providers import ProviderCapabilities
+from kanbanlan.rest import REST_CACHE_FILENAME, ConditionalReader
 from kanbanlan.runner import (
     CommandError,
     CommandResult,
@@ -25,6 +28,7 @@ from kanbanlan.runner import (
 )
 from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS
 from kanbanlan.snapshot import (
+    READ_FROM_ISSUES,
     SCOPE_REPOSITORY,
     build_snapshot,
     isoformat,
@@ -32,6 +36,7 @@ from kanbanlan.snapshot import (
     qualified_reference,
     utc_now,
 )
+from kanbanlan.workflow import LABEL_TO_STATUS
 
 # The full per-item selection is shared between the paginated Project read and
 # the targeted hydration query so both are guaranteed to produce identical raw
@@ -400,6 +405,19 @@ ITEM_CACHE_MAX_AGE_SECONDS = 6 * 3600
 # as the hydration that cached it would compare equal forever. An entry whose
 # content changed within this window of its own fetch is never trusted.
 ITEM_CACHE_TIMESTAMP_SLACK_SECONDS = 2.0
+
+# The Project's identity, fields, and repositories, kept from the last Project
+# read so a queue read over REST needs no GraphQL at all. Fields change
+# rarely and a Status write re-reads them when its cached ids are refused, so
+# a copy this old only bounds how late a newly linked peer repository's pull
+# requests join the queue read.
+PROJECT_METADATA_FILENAME = "project_metadata.json"
+PROJECT_METADATA_SCHEMA_VERSION = 1
+PROJECT_METADATA_MAX_AGE_SECONDS = 6 * 3600
+
+# GraphQL selects the newest 100 comments per issue; the queue read keeps the
+# same window so session history reports truncation the same way.
+QUEUE_COMMENT_WINDOW = 100
 
 REQUIRED_STATUS_OPTIONS = [
     ("Inbox", "GRAY", "Captured but not yet ready"),
@@ -868,6 +886,7 @@ class GitHub:
                 target: executor.submit(self._fetch_pull_requests, target) for target in predicted
             }
             project, project_rate_limit = project_future.result()
+            self._store_project_metadata(project)
             targets = sorted({config.repository, *project_repositories(project)})
             for target in targets:
                 if target not in pull_futures:
@@ -928,6 +947,167 @@ class GitHub:
             scope=scope,
             unavailable_repositories=read.unavailable_repositories,
         )
+
+    def queue_snapshot(self, *, generated_at: datetime) -> dict[str, Any]:
+        """Read the repository's request queue over REST, without GraphQL.
+
+        Labels are the canonical request status, so this repository's issues,
+        their claim comments, and the open pull requests that deliver them
+        answer every repository-scope queue question. Each page is a
+        conditional request, and GitHub does not count an unchanged page's
+        ``304`` against the rate limit, so a stable queue revalidates for
+        free. Project Status, item ids, and board drift stay with the Project
+        read (``snapshot``), which reconcile and project scope still use.
+
+        The snapshot keeps the Project read's shape: Status comes from each
+        issue's status label (``Done`` once closed), ``project_item_id`` from
+        the last Project read when it knew the item, and ``source.read_from``
+        says which read produced the document.
+        """
+
+        config = self._config()
+        metadata = self._queue_project_metadata()
+        targets = sorted({config.repository, *metadata["repositories"]})
+        reader = ConditionalReader(
+            self.runner,
+            self._cache_file(REST_CACHE_FILENAME),
+            hostname=config.hostname,
+        )
+        repository = config.repository
+        executor = ThreadPoolExecutor(max_workers=READ_CONCURRENCY)
+        try:
+            issues_future = executor.submit(
+                reader.collection,
+                f"repos/{repository}/issues?state=all&per_page=100&sort=created&direction=asc",
+            )
+            comments_future = executor.submit(
+                reader.collection,
+                f"repos/{repository}/issues/comments?per_page=100&sort=created&direction=asc",
+            )
+            pull_futures = {
+                target: executor.submit(
+                    reader.collection,
+                    f"repos/{target}/pulls?state=open&per_page=100&sort=created&direction=asc",
+                )
+                for target in targets
+            }
+            issues = issues_future.result()
+            comments = comments_future.result()
+            pull_requests: list[dict[str, Any]] = []
+            unavailable: list[dict[str, Any]] = []
+            for target in targets:
+                try:
+                    values = pull_futures[target].result()
+                except RateLimitError:
+                    raise
+                except (CommandError, RuntimeError) as exc:
+                    if target == repository:
+                        raise
+                    unavailable.append({"repository": target, "error": str(exc)})
+                    continue
+                pull_requests.extend(rest_pull_request(value, target) for value in values)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            reader.save()
+        project = {
+            **metadata["project"],
+            "items": queue_items(repository, issues, comments, self._cached_item_ids()),
+        }
+        return build_snapshot(
+            config,
+            project,
+            pull_requests,
+            reader.stats.rate_limit(),
+            generated_at=generated_at,
+            unavailable_repositories=unavailable,
+            read_from=READ_FROM_ISSUES,
+        )
+
+    def _cache_file(self, name: str) -> Path | None:
+        try:
+            return cache_dir(self.root) / name
+        except (CommandError, RuntimeError, OSError):
+            return None
+
+    def _cached_item_ids(self) -> dict[str, str]:
+        """Map issue node ids to the Project item ids the last Project read saw."""
+
+        cache = self._load_item_cache() or {}
+        found: dict[str, str] = {}
+        for item_id, entry in (cache.get("items") or {}).items():
+            node = entry.get("node") if isinstance(entry, dict) else None
+            if not isinstance(node, dict) or node.get("isArchived"):
+                continue
+            content_id = (node.get("content") or {}).get("id")
+            if content_id:
+                found[content_id] = item_id
+        return found
+
+    def _queue_project_metadata(self) -> dict[str, Any]:
+        """Return the Project's metadata and repositories for a queue read.
+
+        The copy the last Project read kept answers while it is recent. Past
+        that, one metadata-only read (no items) renews it. When even that is
+        refused, an older copy, or the bare configured Project, still lets
+        the queue be read, since nothing in it depends on Project fields.
+        """
+
+        config = self._config()
+        cached = self._load_project_metadata()
+        if cached is not None:
+            age = _age_seconds(cached.get("fetched_at"))
+            if age is not None and age <= PROJECT_METADATA_MAX_AGE_SECONDS:
+                return cached
+        try:
+            project = self.projection_metadata()
+        except (CommandError, RuntimeError):
+            if cached is not None:
+                return cached
+            return {
+                "project": {"number": config.project_number},
+                "repositories": self._cached_repositories(),
+            }
+        return self._store_project_metadata(project)
+
+    def _load_project_metadata(self) -> dict[str, Any] | None:
+        path = self._cache_file(PROJECT_METADATA_FILENAME)
+        if path is None:
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(data, dict)
+            or data.get("schema_version") != PROJECT_METADATA_SCHEMA_VERSION
+            or data.get("key") != self._item_cache_key()
+            or not isinstance(data.get("project"), dict)
+            or not isinstance(data.get("repositories"), list)
+        ):
+            return None
+        return data
+
+    def _store_project_metadata(self, project: dict[str, Any]) -> dict[str, Any]:
+        """Keep a Project read's metadata for later queue reads."""
+
+        value = {
+            "schema_version": PROJECT_METADATA_SCHEMA_VERSION,
+            "key": self._item_cache_key(),
+            "fetched_at": isoformat(utc_now()),
+            "project": {key: item for key, item in project.items() if key != "items"},
+            "repositories": sorted(
+                {*project_repositories(project), *self._cached_repositories()}
+                if not project.get("items")
+                else project_repositories(project)
+            ),
+        }
+        path = self._cache_file(PROJECT_METADATA_FILENAME)
+        if path is not None:
+            try:
+                _write_json_atomic(path, value)
+            except OSError:
+                pass
+        return value
 
     def _fetch_project(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch the raw Project, paying only for the items that changed.
@@ -1844,3 +2024,192 @@ def _is_missing_project_scope(result: CommandResult) -> bool:
             "insufficient oauth scope",
         )
     )
+
+
+def _age_seconds(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return (utc_now() - parse_time(value)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+# GitHub's closing keywords. Only a qualified reference crosses a repository
+# boundary, exactly as GitHub resolves closingIssuesReferences.
+CLOSING_REFERENCE_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+"
+    r"(?:(?P<repository>[\w.-]+/[\w.-]+)#(?P<number>\d+)"
+    r"|#(?P<local>\d+)"
+    r"|https?://[^\s/]+/(?P<url_repository>[\w.-]+/[\w.-]+)/issues/(?P<url_number>\d+))",
+    re.IGNORECASE,
+)
+# GitHub ignores references inside code and HTML comments.
+_IGNORED_MARKUP_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`|<!--.*?-->", re.DOTALL)
+
+
+def closing_references(body: str | None, repository: str) -> list[tuple[str, int]]:
+    """Return the issues a pull request body closes, as GitHub would link them."""
+
+    found: list[tuple[str, int]] = []
+    for match in CLOSING_REFERENCE_RE.finditer(_IGNORED_MARKUP_RE.sub(" ", body or "")):
+        if match.group("local"):
+            value = (repository, int(match.group("local")))
+        elif match.group("repository"):
+            value = (match.group("repository"), int(match.group("number")))
+        else:
+            value = (match.group("url_repository"), int(match.group("url_number")))
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def _rest_labels(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"name": label.get("name"), "color": label.get("color")}
+            for label in value.get("labels") or []
+            if isinstance(label, dict) and label.get("name")
+        ]
+    }
+
+
+def _login(value: Any) -> dict[str, Any] | None:
+    login = value.get("login") if isinstance(value, dict) else None
+    return {"login": login} if login else None
+
+
+def rest_pull_request(value: dict[str, Any], repository: str) -> dict[str, Any]:
+    """Shape one REST pull request as the GraphQL pull request read does.
+
+    REST has no closingIssuesReferences, so they come from the body's
+    closing keywords, and no merge state, which is left unknown.
+    """
+
+    base = value.get("base") or {}
+    head = value.get("head") or {}
+    target = ((base.get("repo") or {}).get("full_name")) or repository
+    site = urlsplit(value.get("html_url") or "https://github.com")
+    origin = f"{site.scheme}://{site.netloc}"
+    return {
+        "number": value["number"],
+        "title": value.get("title"),
+        "body": value.get("body"),
+        "url": value.get("html_url"),
+        "repository": {"nameWithOwner": target},
+        "headRefName": head.get("ref"),
+        "baseRefName": base.get("ref"),
+        "isDraft": bool(value.get("draft")),
+        "mergeStateStatus": None,
+        "createdAt": value.get("created_at"),
+        "updatedAt": value.get("updated_at"),
+        "author": _login(value.get("user")),
+        "labels": _rest_labels(value),
+        "closingIssuesReferences": {
+            "nodes": [
+                {
+                    "number": number,
+                    "url": f"{origin}/{name}/issues/{number}",
+                    "repository": {"nameWithOwner": name},
+                }
+                for name, number in closing_references(value.get("body"), target)
+            ]
+        },
+    }
+
+
+def _issue_number_from_url(url: Any) -> int | None:
+    if not isinstance(url, str):
+        return None
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def queue_status(content: dict[str, Any]) -> str | None:
+    """Return a request's Status as its canonical labels state it."""
+
+    if content.get("state") == "CLOSED":
+        return "Done"
+    statuses = {
+        LABEL_TO_STATUS[label["name"]]
+        for label in content.get("labels", {}).get("nodes", [])
+        if label.get("name") in LABEL_TO_STATUS
+    }
+    return statuses.pop() if len(statuses) == 1 else None
+
+
+def queue_items(
+    repository: str,
+    issues: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    item_ids: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Shape REST issues and comments as raw Project items for the snapshot.
+
+    A request is an issue that carries a Kanbanlan ID or a status label, or
+    that the last Project read saw on the board. Pull requests, which the
+    issues endpoint also lists, are left to the pull request read.
+    """
+
+    by_issue: dict[int, list[dict[str, Any]]] = {}
+    for comment in comments:
+        number = _issue_number_from_url((comment or {}).get("issue_url"))
+        if number is None:
+            continue
+        by_issue.setdefault(number, []).append(
+            {
+                "body": comment.get("body"),
+                "createdAt": comment.get("created_at"),
+                "author": _login(comment.get("user")),
+            }
+        )
+    items: list[dict[str, Any]] = []
+    for issue in issues:
+        if not isinstance(issue, dict) or "pull_request" in issue or "number" not in issue:
+            continue
+        number = issue["number"]
+        thread = sorted(by_issue.get(number, []), key=lambda value: value.get("createdAt") or "")
+        total = issue.get("comments")
+        reason = issue.get("state_reason")
+        content = {
+            "id": issue.get("node_id"),
+            "number": number,
+            "title": issue.get("title"),
+            "body": issue.get("body"),
+            "url": issue.get("html_url"),
+            "state": str(issue.get("state") or "").upper() or None,
+            "stateReason": reason.upper() if isinstance(reason, str) else None,
+            "createdAt": issue.get("created_at"),
+            "updatedAt": issue.get("updated_at"),
+            "closedAt": issue.get("closed_at"),
+            "labels": _rest_labels(issue),
+            "milestone": (
+                {"title": issue["milestone"].get("title")}
+                if isinstance(issue.get("milestone"), dict)
+                else None
+            ),
+            "assignees": {
+                "nodes": [value for value in map(_login, issue.get("assignees") or []) if value]
+            },
+            "comments": {
+                "totalCount": total if isinstance(total, int) else len(thread),
+                "nodes": thread[-QUEUE_COMMENT_WINDOW:],
+            },
+            "repository": {"nameWithOwner": repository},
+        }
+        item_id = item_ids.get(content["id"] or "")
+        status = queue_status(content)
+        if not (item_id or extract_kanbanlan_id(content["body"]) or status not in (None, "Done")):
+            continue
+        items.append(
+            {
+                "id": item_id,
+                "type": "ISSUE",
+                "isArchived": False,
+                "fieldValues": {
+                    "nodes": [{"name": status, "field": {"name": "Status"}}] if status else []
+                },
+                "content": content,
+            }
+        )
+    return items

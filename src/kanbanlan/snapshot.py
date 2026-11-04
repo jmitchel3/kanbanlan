@@ -19,6 +19,11 @@ SCHEMA_VERSION = 3
 SCOPE_REPOSITORY = "repository"
 SCOPE_PROJECT = "project"
 SCOPES = (SCOPE_REPOSITORY, SCOPE_PROJECT)
+# Which read produced a snapshot. The Project read carries Project Status and
+# item ids, which reconcile compares against labels; the issues read derives
+# Status from the canonical labels over REST and costs no GraphQL points.
+READ_FROM_PROJECT = "project"
+READ_FROM_ISSUES = "issues"
 CLAIM_RE = re.compile(r"^CLAIM:\s*(?P<claimed_at>[^\n]+)", re.MULTILINE)
 CLAIM_FIELD_RE = re.compile(
     r"^(Session|Branch|Worktree|Touchpoints):\s*(.+)$",
@@ -300,6 +305,7 @@ def build_snapshot(
     *,
     scope: str = SCOPE_REPOSITORY,
     unavailable_repositories: list[dict[str, Any]] | None = None,
+    read_from: str = READ_FROM_PROJECT,
 ) -> dict[str, Any]:
     """Normalize one Project read into the stable snapshot document.
 
@@ -445,6 +451,7 @@ def build_snapshot(
         "fresh_for_seconds": config.stale_seconds,
         "source": {
             "scope": scope,
+            "read_from": read_from,
             "repository": config.repository,
             "repositories": sorted(
                 {
@@ -486,6 +493,23 @@ def build_snapshot(
     }
 
 
+def reads_queue(client: Any) -> bool:
+    """Report whether a client reads the queue over REST (``queue_snapshot``).
+
+    The method is looked up on the class, so a stand-in that answers every
+    attribute (a mock) is treated as a Project reader, as it always was.
+    """
+
+    return callable(getattr(type(client), "queue_snapshot", None))
+
+
+def read_from(snapshot: dict[str, Any] | None) -> str:
+    """Return which read produced a snapshot; older documents are Project reads."""
+
+    source = (snapshot or {}).get("source") or {}
+    return source.get("read_from") or READ_FROM_PROJECT
+
+
 # How many staleness windows a snapshot may serve local reads for while a
 # background refresh replaces it.
 SERVE_STALE_FACTOR = 10
@@ -513,23 +537,29 @@ class CacheStore:
         # repository scope; this copy only answers project-scope reads.
         self.project_snapshot_path = directory / "project_snapshot.json"
 
-    def refresh(self, client: Any) -> dict[str, Any]:
+    def refresh(self, client: Any, *, projection: bool = False) -> dict[str, Any]:
         """Return a snapshot read after this call began.
 
         Sessions that queue on the lock behind another refresh reuse its
         result when that fetch started after they asked: it already reflects
         every write they made before calling, exactly as their own fetch
         would, so repeating it would only double the wait and the points.
+
+        ``projection`` asks for the Project read, which reconcile needs for
+        Project Status and item ids; otherwise a client that can read the
+        queue over REST does so (see ``GitHub.queue_snapshot``).
         """
 
         requested_at = utc_now()
         self._prepare_directory()
         with FileLock(self.lock_path):
             snapshot = self.snapshot()
-            if self._read_after(snapshot, requested_at):
+            if self._read_after(snapshot, requested_at) and (
+                not projection or read_from(snapshot) == READ_FROM_PROJECT
+            ):
                 assert snapshot is not None
                 return snapshot
-            return self._refresh_locked(client)
+            return self._refresh_locked(client, projection=projection)
 
     def refresh_for_write(self, client: Any) -> dict[str, Any]:
         """Return a snapshot a lifecycle write can act on.
@@ -626,11 +656,14 @@ class CacheStore:
         except (KeyError, ValueError, TypeError):
             return False
 
-    def _refresh_locked(self, client: Any) -> dict[str, Any]:
-        self.check_refresh_allowed()
+    def _refresh_locked(self, client: Any, *, projection: bool = False) -> dict[str, Any]:
+        queue = not projection and reads_queue(client)
+        self.check_refresh_allowed(graphql=not queue)
         attempted_at = utc_now()
         try:
-            if hasattr(client, "snapshot"):
+            if queue:
+                snapshot = client.queue_snapshot(generated_at=attempted_at)
+            elif hasattr(client, "snapshot"):
                 snapshot = client.snapshot(generated_at=attempted_at)
             else:
                 project, pull_requests, rate_limit = client.fetch()
@@ -674,7 +707,7 @@ class CacheStore:
         if self._snapshot_state(snapshot) == "fresh":
             assert snapshot is not None
             return snapshot
-        if self.rate_limit_deferral(snapshot):
+        if self.rate_limit_deferral(snapshot, graphql=not reads_queue(client)):
             assert snapshot is not None
             return snapshot
         self._prepare_directory()
@@ -691,7 +724,7 @@ class CacheStore:
                     return snapshot
                 raise
 
-    def check_refresh_allowed(self) -> None:
+    def check_refresh_allowed(self, *, graphql: bool = True) -> None:
         """Refuse a full-board read during cooldown; never certify cached state as live.
 
         An active cooldown is left exactly as recorded, so repeated checks
@@ -700,7 +733,7 @@ class CacheStore:
         snapshot reported, so status shows why the board is not refreshing.
         """
 
-        deferral = self.rate_limit_deferral(self.snapshot())
+        deferral = self.rate_limit_deferral(self.snapshot(), graphql=graphql)
         if deferral:
             exc = RateLimitError(
                 f"GitHub refresh deferred until {deferral['reset_at']} to preserve quota",
@@ -721,13 +754,22 @@ class CacheStore:
         exc.reset_at = reset_at
         self._write_failure_health(utc_now(), exc, refresh_status="throttled")
 
-    def rate_limit_deferral(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    def rate_limit_deferral(
+        self,
+        snapshot: dict[str, Any] | None,
+        *,
+        graphql: bool = True,
+    ) -> dict[str, Any] | None:
         """Explain why a refresh should wait, or return None to proceed.
 
         Spending the last points before the quota resets trades a slightly
         stale board for every other GitHub call failing outright, so a stale
         snapshot keeps serving while its recorded ``remaining`` sits below the
         configured floor and the reset is still ahead.
+
+        The floor guards GraphQL points only. A read that spends none
+        (``graphql=False``) is never held back by it, and a snapshot whose
+        rate limit is the REST quota says nothing about GraphQL points.
         """
 
         health = self._read_json(self.health_path) or {}
@@ -736,10 +778,12 @@ class CacheStore:
             return {"remaining": None, "reset_at": reset_at, "reason": "cooldown"}
 
         floor = self.config.rate_limit_floor
-        if floor <= 0 or not self._usable(snapshot):
+        if floor <= 0 or not graphql or not self._usable(snapshot):
             return None
         assert snapshot is not None
         rate = snapshot.get("rate_limit") or {}
+        if rate.get("resource") == "core":
+            return None
         remaining = rate.get("remaining")
         reset_at = rate.get("resetAt")
         if isinstance(remaining, bool) or not isinstance(remaining, int):
