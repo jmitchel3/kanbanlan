@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from kanbanlan.runner import CommandError, CommandResult, RateLimitError, is_rate_limit_failure
 
@@ -30,6 +30,9 @@ PAGE_CONCURRENCY = 6
 
 # Guards against a Link chain that never ends.
 MAX_PAGES = 500
+
+# GitHub's page size when a path does not ask for one.
+DEFAULT_PER_PAGE = 30
 
 
 @dataclass
@@ -112,7 +115,14 @@ class ConditionalReader:
         return items
 
     def page(self, path: str) -> Response:
-        """Read one page, sending the cached ETag when there is one."""
+        """Read one page, sending the cached ETag when there is one.
+
+        A ``304`` carries no Link header, and GitHub's ETag covers the body
+        only, so a full last page that gains a successor still answers
+        ``304``. Its cached Link would then end the chain before the new
+        page, dropping whatever was created there; such a page is always
+        read in full instead.
+        """
 
         with self._lock:
             entry = self._entries.get(path)
@@ -120,6 +130,9 @@ class ConditionalReader:
         if self.hostname and self.hostname != "github.com":
             args.extend(["--hostname", self.hostname])
         etag = entry.get("etag") if isinstance(entry, dict) else None
+        if etag and _next_link(entry.get("headers") or {}) is None:
+            if _full_page(path, entry.get("body")):
+                etag = None
         if etag:
             args.extend(["-H", f"If-None-Match: {etag}"])
         args.append(path)
@@ -229,6 +242,19 @@ def _next_link(headers: dict[str, str]) -> str | None:
         if 'rel="next"' in params:
             return api_path(target.strip().strip("<>"))
     return None
+
+
+def _full_page(path: str, body: Any) -> bool:
+    """Report whether a page holds as many items as the path asks for."""
+
+    if not isinstance(body, list) or not body:
+        return False
+    values = parse_qs(urlsplit(path).query).get("per_page")
+    try:
+        per_page = int(values[-1]) if values else DEFAULT_PER_PAGE
+    except ValueError:
+        return False
+    return len(body) >= per_page
 
 
 def api_path(url: str) -> str:

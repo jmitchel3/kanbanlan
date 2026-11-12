@@ -304,6 +304,27 @@ ITEM_FIELDS
 }
 """.replace("ITEM_FIELDS", PROJECT_ITEM_FIELDS)
 
+# The Project items an issue itself reports. GitHub's Project items
+# connection has been seen to leave out an item for some time after it was
+# added, while the issue's own ``projectItems`` already lists it, so a Project
+# read asks the issue side for any open request it did not return.
+OMITTED_ITEMS_QUERY = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Issue {
+      id
+      projectItems(first: 10, includeArchived: false) {
+        nodes {
+          project { id }
+ITEM_FIELDS
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}
+""".replace("ITEM_FIELDS", PROJECT_ITEM_FIELDS)
+
 PULL_REQUEST_QUERY = """
 query($owner: String!, $repo: String!, $after: String) {
   repository(owner: $owner, name: $repo) {
@@ -882,17 +903,19 @@ class GitHub:
         executor = ThreadPoolExecutor(max_workers=READ_CONCURRENCY)
         try:
             project_future = executor.submit(self._fetch_project)
+            issues_future = executor.submit(self._repository_issues, config.repository)
             pull_futures = {
                 target: executor.submit(self._fetch_pull_requests, target) for target in predicted
             }
             project, project_rate_limit = project_future.result()
+            omitted_rate_limit = self._add_omitted_items(project, issues_future.result())
             targets = sorted({config.repository, *project_repositories(project)})
             for target in targets:
                 if target not in pull_futures:
                     pull_futures[target] = executor.submit(self._fetch_pull_requests, target)
             pull_requests: list[dict[str, Any]] = []
             unavailable: list[dict[str, Any]] = []
-            rate_limits = [project_rate_limit]
+            rate_limits = [project_rate_limit, *omitted_rate_limit]
             for target in targets:
                 try:
                     values, rate_limit = pull_futures[target].result()
@@ -918,6 +941,86 @@ class GitHub:
             rate_limit=rate_limit,
             unavailable_repositories=unavailable,
         )
+
+    def _repository_issues(self, repository: str) -> list[dict[str, Any]] | None:
+        """Read a repository's issues over conditional REST, or None if refused.
+
+        This is the queue read's issue list, so its pages are usually
+        revalidated for free. It only cross-checks the Project read, which
+        stands on its own when the list cannot be read.
+        """
+
+        reader = ConditionalReader(
+            self.runner,
+            self._cache_file(REST_CACHE_FILENAME),
+            hostname=self._config().hostname,
+        )
+        try:
+            return reader.collection(issues_path(repository))
+        except (CommandError, RuntimeError):
+            return None
+        finally:
+            reader.save()
+
+    def _add_omitted_items(
+        self,
+        project: dict[str, Any],
+        issues: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Add the open requests the Project items connection left out.
+
+        GitHub's items connection has been seen to omit an item, for some
+        time after it was added, that the issue's own ``projectItems``
+        already lists as on the Project and not archived (issue #103 on
+        2026-11-04, through full reads from two independent caches). Every
+        open request in ``issues`` that the read did not return is looked up
+        from the issue side; an item found there on this Project joins the
+        read exactly as the items connection would have returned it. Nothing
+        is looked up while the read is complete. Returns the rate limits the
+        lookups reported.
+        """
+
+        if not issues:
+            return []
+        present = {
+            (item.get("content") or {}).get("id")
+            for item in project.get("items", [])
+            if isinstance(item, dict)
+        }
+        missing = [
+            issue["node_id"]
+            for issue in issues
+            if isinstance(issue, dict)
+            and "pull_request" not in issue
+            and issue.get("state") == "open"
+            and issue.get("node_id")
+            and issue["node_id"] not in present
+            and _is_open_request(issue)
+        ]
+        rate_limits: list[dict[str, Any]] = []
+        for start in range(0, len(missing), HYDRATION_BATCH_SIZE):
+            try:
+                payload = self.graphql(
+                    OMITTED_ITEMS_QUERY,
+                    {"ids": missing[start : start + HYDRATION_BATCH_SIZE]},
+                    retry=True,
+                )
+            except RateLimitError:
+                raise
+            except RuntimeError:
+                return rate_limits
+            if payload.get("rateLimit"):
+                rate_limits.append(payload["rateLimit"])
+            for node in payload.get("nodes") or []:
+                for value in ((node or {}).get("projectItems") or {}).get("nodes") or []:
+                    if not isinstance(value, dict) or value.get("isArchived"):
+                        continue
+                    if (value.get("project") or {}).get("id") != project.get("id"):
+                        continue
+                    project.setdefault("items", []).append(
+                        {key: item for key, item in value.items() if key != "project"}
+                    )
+        return rate_limits
 
     def _cached_repositories(self) -> list[str]:
         """Return the repositories the previous Project read referenced."""
@@ -977,10 +1080,7 @@ class GitHub:
         repository = config.repository
         executor = ThreadPoolExecutor(max_workers=READ_CONCURRENCY)
         try:
-            issues_future = executor.submit(
-                reader.collection,
-                f"repos/{repository}/issues?state=all&per_page=100&sort=created&direction=asc",
-            )
+            issues_future = executor.submit(reader.collection, issues_path(repository))
             comments_future = executor.submit(
                 reader.collection,
                 f"repos/{repository}/issues/comments?per_page=100&sort=created&direction=asc",
@@ -2138,6 +2238,24 @@ def _issue_number_from_url(url: Any) -> int | None:
         return None
     tail = url.rstrip("/").rsplit("/", 1)[-1]
     return int(tail) if tail.isdigit() else None
+
+
+def issues_path(repository: str) -> str:
+    """Return the REST path that lists every issue of a repository, oldest first."""
+
+    return f"repos/{repository}/issues?state=all&per_page=100&sort=created&direction=asc"
+
+
+def _is_open_request(issue: dict[str, Any]) -> bool:
+    """Report whether a REST issue carries a Kanbanlan ID or an open status label."""
+
+    if extract_kanbanlan_id(issue.get("body")):
+        return True
+    return any(
+        LABEL_TO_STATUS.get((label or {}).get("name")) not in (None, "Done")
+        for label in issue.get("labels") or []
+        if isinstance(label, dict)
+    )
 
 
 def queue_status(content: dict[str, Any]) -> str | None:
