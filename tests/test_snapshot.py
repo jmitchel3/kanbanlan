@@ -611,3 +611,17 @@ class RateLimitBehaviorTests(unittest.TestCase):
 
             with self.assertRaises(RateLimitError):
                 store.ensure(client)
+
+
+class UpdateCardTests(unittest.TestCase):
+    def test_a_card_the_snapshot_does_not_hold_marks_it_stale(self) -> None:
+        from board_fixtures import ALPHA, BETA, config, item, snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(config(), Path(directory))
+            store._prepare_directory()
+            store._write_json(store.snapshot_path, snapshot([item(7, ALPHA, "Ready")]))
+
+            self.assertFalse(store.update_card(item(8, BETA, "In progress")))
+
+            self.assertFalse(store.is_fresh())

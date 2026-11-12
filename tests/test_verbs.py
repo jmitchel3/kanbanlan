@@ -108,6 +108,10 @@ class VerbTestCase(unittest.TestCase):
     def _recorder(self, name: str) -> Any:
         def run(args: Any) -> int:
             self.steps.append((name, args))
+            gate = getattr(args, "claim_gate", None)
+            if gate is not None:
+                # The real claim runs its gate before it moves the card.
+                gate()
             reference = getattr(args, "issue", None) or NEW
             results = {
                 "capture": {"kanbanlan_id": NEW, "provider_ref": f"github:{REPOSITORY}#9"},
@@ -309,11 +313,44 @@ class StartTests(VerbTestCase):
     def test_pruned_worktrees_are_reported(self) -> None:
         self.write_snapshot([item(8, BETA, "Ready")])
         removed = [{"path": "/repo/.worktrees/old", "action": REMOVE, "reason": "claim released"}]
-        with patch_cli("_prune_orphaned_worktrees", return_value=removed):
+        with patch_cli("_prune_candidates", return_value=removed):
             code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
 
         self.assertEqual(0, code)
         self.assertEqual(removed, payload["result"]["pruned"])
+
+    def test_a_ready_card_goes_to_its_claim_with_the_project_check_as_its_gate(self) -> None:
+        # The local view already checked the card, so the claim skips its
+        # own read before posting, and checks the Project before moving it.
+        target = item(8, BETA, "Ready")
+        self.write_snapshot([target])
+
+        code, _, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(0, code)
+        (claim,) = [args for name, args in self.steps if name == "claim"]
+        self.assertEqual(target["provider_ref"], claim.known_card["provider_ref"])
+        self.assertTrue(callable(claim.claim_gate))
+
+    def test_a_peer_card_this_session_owns_refuses_the_claim_at_its_gate(self) -> None:
+        self.write_snapshot([item(8, BETA, "Ready")])
+        self.write_project([item(7, ALPHA, "In progress", claim={"session": "s1"})])
+
+        code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(1, code)
+        self.assertIn("already owns", payload["error"]["message"])
+        self.assertEqual(["claim"], self.kinds)
+
+    def test_an_inbox_card_is_checked_against_the_project_before_its_triage(self) -> None:
+        self.write_snapshot([item(8, BETA, "Inbox")])
+        self.write_project([item(7, ALPHA, "In progress", claim={"session": "s1"})])
+
+        code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(1, code)
+        self.assertIn("already owns", payload["error"]["message"])
+        self.assertEqual([], self.steps)
 
 
 class PruneTests(VerbTestCase):

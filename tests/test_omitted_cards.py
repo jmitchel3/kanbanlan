@@ -250,8 +250,25 @@ class StartReadsClaimsLiveTests(VerbTestCase):
 
         self.assertEqual(1, code)
         self.assertIn("already owns", payload["error"]["message"])
-        self.assertEqual([], self.steps)
+        # The live read runs beside the claim, which its gate then refuses
+        # (and releases) before the card moves.
+        self.assertEqual(["claim"], self.kinds)
         self.store.refresh.assert_called_once_with(self.provider)
+
+    def test_a_claim_missing_from_the_local_view_refuses_an_inbox_card_before_triage(
+        self,
+    ) -> None:
+        self.write_snapshot([item(8, BETA, "Inbox")])
+        live = snapshot(
+            [item(7, ALPHA, "In progress", claim={"session": "s1"}), item(8, BETA, "Inbox")]
+        )
+        self.store.refresh = mock.Mock(return_value=live)  # type: ignore[method-assign]
+
+        code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(1, code)
+        self.assertIn("already owns", payload["error"]["message"])
+        self.assertEqual([], self.steps)
 
     def test_a_live_read_that_fails_refuses_start(self) -> None:
         self.write_snapshot([item(8, BETA, "Ready")])
@@ -260,7 +277,7 @@ class StartReadsClaimsLiveTests(VerbTestCase):
         code, _, _ = self.run_cli("start", "#8", "--session", "s1")
 
         self.assertEqual(1, code)
-        self.assertEqual([], self.steps)
+        self.assertEqual(["claim"], self.kinds)
 
 
 class RecordFallsBackToALiveReadTests(unittest.TestCase):

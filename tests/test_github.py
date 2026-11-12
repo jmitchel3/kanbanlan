@@ -502,3 +502,152 @@ class BoundedReadTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "time allowed"):
             budget.options()
+
+
+class WriteTests(unittest.TestCase):
+    """Each write is the fewest GitHub calls that make it."""
+
+    def github(self, *, stderr: str = "", returncode: int = 0) -> tuple[GitHub, mock.Mock]:
+        runner = mock.Mock()
+        runner.run.side_effect = lambda args, **_kwargs: CommandResult(
+            tuple(args), returncode, "{}", stderr
+        )
+        runner.json.return_value = [{"name": "status:ready"}, {"name": "priority:p2"}]
+        return GitHub(Path("/tmp"), config(), runner=runner), runner
+
+    def test_a_comment_is_one_rest_call(self) -> None:
+        github, runner = self.github()
+
+        github.comment_request(7, "CLAIM: now")
+
+        runner.run.assert_called_once_with(
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                "repos/acme/widget/issues/7/comments",
+                "--input",
+                "-",
+            ],
+            input_text='{"body": "CLAIM: now"}',
+        )
+
+    def test_known_labels_move_the_status_label_without_a_read(self) -> None:
+        github, runner = self.github()
+
+        github.set_request_status(7, "status:in-progress", current=["status:ready", "priority:p2"])
+
+        runner.json.assert_not_called()
+        calls = sorted(call.args[0] for call in runner.run.call_args_list)
+        self.assertEqual(
+            [
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "DELETE",
+                    "repos/acme/widget/issues/7/labels/status%3Aready",
+                ],
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "POST",
+                    "repos/acme/widget/issues/7/labels",
+                    "--input",
+                    "-",
+                ],
+            ],
+            calls,
+        )
+
+    def test_unknown_labels_are_read_first(self) -> None:
+        github, runner = self.github()
+
+        github.set_request_status(7, "status:ready")
+
+        runner.json.assert_called_once()
+        runner.run.assert_not_called()
+
+    def test_a_status_label_already_gone_is_not_an_error(self) -> None:
+        github, _ = self.github(stderr="gh: Label does not exist (HTTP 404)", returncode=1)
+
+        github.set_request_status(7, None, current=["status:ready"])
+
+    def test_a_failed_label_write_raises(self) -> None:
+        github, _ = self.github(stderr="gh: Forbidden (HTTP 403)", returncode=1)
+
+        with self.assertRaises(CommandError):
+            github.set_request_status(7, "status:review", current=["status:ready"])
+
+    def test_project_status_is_one_mutation(self) -> None:
+        github = StubGitHub({})
+        project = {
+            "id": "project-1",
+            "fields": {
+                "nodes": [
+                    {
+                        "id": "field-1",
+                        "name": "Status",
+                        "options": [{"id": "option-1", "name": "Ready"}],
+                    }
+                ]
+            },
+        }
+
+        github.set_project_status("item-7", project, "Ready")
+
+        ((query, variables),) = github.mutations
+        self.assertIn("updateProjectV2ItemFieldValue", query)
+        self.assertEqual(
+            {"project": "project-1", "item": "item-7", "field": "field-1", "option": "option-1"},
+            variables,
+        )
+
+
+class CommentAndReadTests(unittest.TestCase):
+    def test_the_card_comes_back_from_the_comment_mutation(self) -> None:
+        github = GitHub(Path("/tmp"), config(), runner=mock.Mock())
+        issue = {
+            "id": "issue-7",
+            "number": 7,
+            "title": "Request",
+            "body": "",
+            "url": "https://github.test/acme/widget/issues/7",
+            "state": "OPEN",
+            "repository": {"nameWithOwner": "acme/widget"},
+            "labels": {"nodes": []},
+            "assignees": {"nodes": []},
+            "comments": {
+                "nodes": [
+                    {
+                        "body": "CLAIM: now\nSession: s1",
+                        "createdAt": "2026-11-12T00:00:00Z",
+                        "author": {"login": "agent"},
+                    }
+                ]
+            },
+            "projectItems": {
+                "nodes": [
+                    {
+                        "id": "item-7",
+                        "project": {"id": "project-1", "number": 2, "owner": {"login": "acme"}},
+                        "fieldValues": {"nodes": [{"name": "Ready", "field": {"name": "Status"}}]},
+                    }
+                ]
+            },
+        }
+        with mock.patch.object(
+            GitHub, "graphql", return_value={"addComment": {"subject": issue}}
+        ) as graphql:
+            card = github.comment_and_read_request("issue-7", "CLAIM: now\nSession: s1")
+
+        self.assertEqual(
+            {"subject": "issue-7", "body": "CLAIM: now\nSession: s1"}, graphql.call_args.args[1]
+        )
+        (item,) = card["items"]
+        self.assertEqual(
+            ("item-7", "Ready", "s1"),
+            (item["project_item_id"], item["status"], item["active_claim"]["session"]),
+        )

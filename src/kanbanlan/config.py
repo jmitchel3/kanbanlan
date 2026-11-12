@@ -189,10 +189,22 @@ def resolve_config_path(root: Path) -> Path:
     return shared if shared.exists() else local
 
 
+# One command resolves the same checkout several times (each verb step builds
+# its own context); git answers the same way every time within one process.
+_GIT_PATHS: dict[tuple[str, str], Path] = {}
+
+
+def _git_path(start: Path, args: list[str]) -> Path:
+    key = (str(start), " ".join(args))
+    cached = _GIT_PATHS.get(key)
+    if cached is None:
+        result = Runner(start).run(["git", "rev-parse", *args])
+        cached = _GIT_PATHS[key] = Path(result.stdout.strip()).resolve()
+    return cached
+
+
 def find_repo_root(start: Path | None = None) -> Path:
-    runner = Runner((start or Path.cwd()).resolve())
-    result = runner.run(["git", "rev-parse", "--show-toplevel"])
-    return Path(result.stdout.strip()).resolve()
+    return _git_path((start or Path.cwd()).resolve(), ["--show-toplevel"])
 
 
 def discover_repository(root: Path) -> str:
@@ -256,8 +268,7 @@ def cache_dir(root: Path) -> Path:
 
 def common_dir(root: Path) -> Path:
     """Return the resolved Git common directory shared by all worktrees."""
-    result = Runner(root).run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
-    return Path(result.stdout.strip()).resolve()
+    return _git_path(root, ["--path-format=absolute", "--git-common-dir"])
 
 
 def primary_worktree(root: Path) -> Path:
