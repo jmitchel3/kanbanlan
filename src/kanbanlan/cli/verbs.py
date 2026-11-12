@@ -96,6 +96,29 @@ def _session_claims(
     ]
 
 
+def _issues(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in snapshot.get("items", []) if item.get("type") == "ISSUE"]
+
+
+def _live_claims(
+    store: CacheStore,
+    provider: CoordinationProvider,
+    session: str | None,
+) -> dict[str, Any]:
+    """Read this repository's claims live before a session claims another card.
+
+    The local view may be stale or incomplete (a card the Project read left
+    out), and a claim missing from it would let one session hold two cards.
+    A read begun after this call reflects every claim already posted; it
+    fails closed, refusing the start, when GitHub cannot be read.
+    """
+
+    if not session:
+        return {}
+    with status("Checking this session's claims on GitHub"):
+        return store.refresh(provider)
+
+
 def _same_request(left: dict[str, Any], right: dict[str, Any] | None) -> bool:
     if right is None:
         return False
@@ -190,9 +213,8 @@ def _cmd_start(args: argparse.Namespace) -> int:
     overlap = _run_step(args, ["overlap"])
     requests = overlap.get("open_requests", [])
     for owned in [
-        *_session_claims(
-            [item for item in view.get("items", []) if item.get("type") == "ISSUE"], session
-        ),
+        *_session_claims(_issues(view), session),
+        *_session_claims(_issues(_live_claims(store, provider, session)), session),
         *_session_claims(requests, session),
     ]:
         if not _same_request(owned, target):

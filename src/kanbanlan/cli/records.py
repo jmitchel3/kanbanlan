@@ -26,7 +26,12 @@ def _cmd_record(args: argparse.Namespace) -> int:
     if args.from_pr:
         return _record_from_pull_request(args, root, provider, store, config)
     snapshot = _local_view(root, store, provider, label=f"Loading request {args.request}")
-    item = _issue(snapshot, args.request)
+    try:
+        item = _issue(snapshot, args.request)
+    except RuntimeError:
+        # Not in the local view (newer than it, or left out of the read):
+        # GitHub decides.
+        item = {}
     if item.get("number") is None:
         # A record names the canonical issue.
         with status(f"Loading request {args.request}"):
