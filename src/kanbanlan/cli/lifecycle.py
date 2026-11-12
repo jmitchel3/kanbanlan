@@ -6,7 +6,7 @@ import argparse
 import re
 import shlex
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -274,47 +274,43 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     session = session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
     branch, worktree = _claim_checkout(args, root, config, item)
     timestamp = _utc_timestamp()
+    body = (
+        f"CLAIM: {timestamp}\n"
+        f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
+        f"Session: {session}\n"
+        f"Branch: {branch}\n"
+        f"Worktree: {worktree}\n"
+        f"Touchpoints: {args.touchpoints}"
+    )
     with ThreadPoolExecutor(max_workers=1) as pool:
-        # The worktree is local, so it is built while GitHub settles the
-        # claim, and removed again if the claim does not hold.
-        checkout = (
-            None
-            if args.no_worktree
-            else pool.submit(_create_worktree, root, config, branch, Path(worktree))
-        )
+        # Only the fetch runs while GitHub settles the claim. The worktree is
+        # added once the claim holds: two sessions on one machine racing for
+        # one card compute the same path, and the loser must never take it.
+        fetch = None if args.no_worktree else pool.submit(_fetch_default_branch, root, config)
+        posted_claim = False
         try:
             with status(f"Posting claim for {label}"):
-                posted = _post_claim(
-                    provider,
-                    item,
-                    (
-                        f"CLAIM: {timestamp}\n"
-                        f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
-                        f"Session: {session}\n"
-                        f"Branch: {branch}\n"
-                        f"Worktree: {worktree}\n"
-                        f"Touchpoints: {args.touchpoints}"
-                    ),
-                )
+                posted_claim = True
+                posted = _post_claim(provider, item, body)
                 claimed_item = _verify_claim(
                     provider, store, config, number, session, posted=posted
                 )
             reason, failure = _claim_failure(args, claimed_item, label, session, known)
-            if failure is None and checkout is not None:
+            if failure is None and fetch is not None:
                 try:
-                    checkout.result()
+                    _create_worktree(root, config, branch, Path(worktree), fetch=not fetch.result())
                 except Exception as exc:  # noqa: BLE001 - reported once released
-                    checkout = None
                     reason, failure = "worktree creation failed", exc
         except BaseException:
-            _discard_checkout(root, checkout, branch, worktree)
+            if posted_claim:
+                # A claim this command cannot settle must not stay active.
+                _release_quietly(provider, number, session, "claim interrupted")
             raise
         if failure is not None:
             provider.comment_request(
                 number,
                 f"RELEASED: {_utc_timestamp()} — {reason}\nSession: {session}",
             )
-            _discard_checkout(root, checkout, branch, worktree)
             raise failure
 
     with status("Moving request to In progress"), ThreadPoolExecutor(max_workers=1) as pool:
@@ -387,24 +383,28 @@ def _claim_failure(
     return "", None
 
 
-def _discard_checkout(
-    root: Path,
-    checkout: Future[bool] | None,
-    branch: str,
-    worktree: str,
-) -> None:
-    """Remove a worktree built for a claim that did not hold."""
+def _fetch_default_branch(root: Path, config: Config) -> bool:
+    """Fetch the default branch for a new worktree; report whether it worked."""
 
-    if checkout is None:
-        return
+    result = Runner(root).run(["git", "fetch", "origin", config.default_branch], check=False)
+    return result.returncode == 0
+
+
+def _release_quietly(
+    provider: CoordinationProvider,
+    number: int,
+    session: str,
+    reason: str,
+) -> None:
+    """Release a claim on the way out of a failure, never masking that failure."""
+
     try:
-        created_branch = checkout.result()
-    except Exception:  # noqa: BLE001 - nothing was built
-        return
-    runner = Runner(root)
-    runner.run(["git", "worktree", "remove", "--force", worktree], check=False)
-    if created_branch:
-        runner.run(["git", "branch", "-D", branch], check=False)
+        provider.comment_request(
+            number,
+            f"RELEASED: {_utc_timestamp()} — {reason}\nSession: {session}",
+        )
+    except Exception:  # noqa: BLE001 - the original failure is the one to report
+        warning(f"could not release the claim on #{number}; release it with 'kanbanlan drop'")
 
 
 def _claim_checkout(
@@ -442,9 +442,7 @@ def _create_worktree(
     worktree: Path,
     *,
     fetch: bool = True,
-) -> bool:
-    """Add the request worktree; return whether its branch was created too."""
-
+) -> None:
     runner = Runner(root)
     if fetch:
         runner.run(["git", "fetch", "origin", config.default_branch])
@@ -468,7 +466,6 @@ def _create_worktree(
             ]
         )
     runner.run(args)
-    return not branch_exists
 
 
 def _cmd_release(args: argparse.Namespace) -> int:

@@ -303,7 +303,8 @@ class NoBoardReadTests(unittest.TestCase):
             patch_cli("_context", return_value=(self.root, config(), github, store)),
             patch_cli("_actor_session", return_value=None),
             patch_cli("notify_if_update_available"),
-            patch_cli("_create_worktree", create_worktree or mock.Mock(return_value=True)),
+            patch_cli("_create_worktree", create_worktree or mock.Mock(return_value=None)),
+            patch_cli("_fetch_default_branch", return_value=True),
             mock.patch("kanbanlan.cli.app.build_parser", _parser_with(handoff or {})),
             patch_cli("_claim_checkout", return_value=("work/a", str(self.root / "wt"))),
             patch_cli("read_board", side_effect=refuse),
@@ -442,25 +443,63 @@ class NoBoardReadTests(unittest.TestCase):
     def test_a_handed_over_card_that_moved_is_released_not_claimed(self) -> None:
         github = OneCardGitHub("Blocked")
         known = cached_snapshot(OneCardGitHub("Ready"), age_seconds=0)["items"][0]
-        create = mock.Mock(return_value=True)
-        discard = mock.Mock()
+        create = mock.Mock(return_value=None)
 
-        with patch_cli("Runner", return_value=discard):
-            code, payload = self.run_command(
-                ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
-                github,
-                snapshot=None,
-                handoff={"known_card": known},
-                create_worktree=create,
-            )
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
+            github,
+            snapshot=None,
+            handoff={"known_card": known},
+            create_worktree=create,
+        )
 
         self.assertEqual(1, code)
         self.assertIn("'Blocked', not Ready", payload["error"]["message"])
         self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
         self.assertFalse([call for call in github.calls if call.startswith("status:")])
-        removed = [call.args[0] for call in discard.run.call_args_list]
-        self.assertIn(["git", "worktree", "remove", "--force", str(self.root / "wt")], removed)
-        self.assertIn(["git", "branch", "-D", "work/a"], removed)
+        # A claim that does not hold never takes the worktree path.
+        create.assert_not_called()
+
+    def test_a_lost_claim_never_adds_the_worktree(self) -> None:
+        # Two sessions on one machine compute the same worktree path; only
+        # the winner may add it, or the loser's worktree would make the
+        # winner's fail.
+        github = OneCardGitHub("Ready")
+        create = mock.Mock(return_value=None)
+
+        def rival_claim() -> None:
+            raise RuntimeError("session s1 already owns github:acme/other#3")
+
+        code, _ = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
+            github,
+            snapshot=None,
+            handoff={"claim_gate": rival_claim},
+            create_worktree=create,
+        )
+
+        self.assertEqual(1, code)
+        create.assert_not_called()
+
+    def test_a_claim_whose_read_fails_after_posting_is_released(self) -> None:
+        class FailingReadGitHub(OneCardGitHub):
+            def read_request(self, *args: Any, **kwargs: Any) -> Any:
+                if self.comments:
+                    raise RuntimeError("GitHub unavailable")
+                return super().read_request(*args, **kwargs)
+
+        github = FailingReadGitHub("Ready")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=None,
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("GitHub unavailable", payload["error"]["message"])
+        self.assertIn("claim interrupted", github.comments[-1]["body"])
+        self.assertFalse([call for call in github.calls if call.startswith("status:")])
 
     def test_a_claim_its_gate_refuses_is_released_before_the_card_moves(self) -> None:
         github = OneCardGitHub("Ready")
