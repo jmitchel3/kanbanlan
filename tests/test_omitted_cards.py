@@ -76,6 +76,9 @@ class FullLastPageTests(unittest.TestCase):
             values = ConditionalReader(gh, cache).collection(self.FIRST)
 
         self.assertEqual([1, 2, 3], [value["number"] for value in values])
+        # The full last page is asked for in full once, not revalidated first.
+        self.assertEqual(3, len(gh.calls))
+        self.assertNotIn("-H", gh.calls[1])
 
     def test_a_partial_last_page_is_still_revalidated_for_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -114,14 +114,14 @@ class ConditionalReader:
             position += 1
         return items
 
-    def page(self, path: str, *, conditional: bool = True) -> Response:
+    def page(self, path: str) -> Response:
         """Read one page, sending the cached ETag when there is one.
 
         A ``304`` carries no Link header, and GitHub's ETag covers the body
         only, so a full last page that gains a successor still answers
         ``304``. Its cached Link would then end the chain before the new
-        page, dropping whatever was created there; such a page is read again
-        in full instead.
+        page, dropping whatever was created there; such a page is always
+        read in full instead.
         """
 
         with self._lock:
@@ -129,7 +129,10 @@ class ConditionalReader:
         args = ["gh", "api", "--include"]
         if self.hostname and self.hostname != "github.com":
             args.extend(["--hostname", self.hostname])
-        etag = entry.get("etag") if conditional and isinstance(entry, dict) else None
+        etag = entry.get("etag") if isinstance(entry, dict) else None
+        if etag and _next_link(entry.get("headers") or {}) is None:
+            if _full_page(path, entry.get("body")):
+                etag = None
         if etag:
             args.extend(["-H", f"If-None-Match: {etag}"])
         args.append(path)
@@ -140,12 +143,9 @@ class ConditionalReader:
             if headers:
                 self.stats.headers = headers
         if status == 304 and isinstance(entry, dict) and "body" in entry:
-            cached_headers = entry.get("headers") or {}
-            if _next_link(cached_headers) is None and _full_page(path, entry["body"]):
-                return self.page(path, conditional=False)
             with self._lock:
                 self.stats.not_modified += 1
-            return Response(304, {**cached_headers, **headers}, entry["body"])
+            return Response(304, {**entry.get("headers", {}), **headers}, entry["body"])
         if status == 200 and result.returncode == 0:
             try:
                 body = json.loads(body_text)
