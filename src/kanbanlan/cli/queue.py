@@ -11,6 +11,7 @@ from typing import Any
 from kanbanlan.cli.cards import _local_view
 from kanbanlan.cli.context import _context
 from kanbanlan.cli.output import _emit_result, _rate_limit_text
+from kanbanlan.config import Config
 from kanbanlan.domain import request_label
 from kanbanlan.providers import CoordinationProvider
 from kanbanlan.snapshot import READ_FROM_ISSUES, SCOPE_PROJECT, CacheStore, read_from, utc_now
@@ -101,6 +102,8 @@ def _project_snapshot(
     provider: CoordinationProvider,
     label: str,
     store: CacheStore | None = None,
+    *,
+    progress: bool = True,
 ) -> dict[str, Any]:
     """Read the whole Project live without disturbing the repository cache.
 
@@ -114,7 +117,7 @@ def _project_snapshot(
         raise RuntimeError(
             f"canonical home {provider.provider_name!r} does not support project scope"
         )
-    with status(label):
+    with status(label, enabled=progress):
         snapshot = provider.snapshot(generated_at=utc_now(), scope=SCOPE_PROJECT)
     if store is not None:
         try:
@@ -128,12 +131,14 @@ def _project_view(
     provider: CoordinationProvider,
     store: CacheStore,
     label: str,
+    *,
+    progress: bool = True,
 ) -> dict[str, Any]:
     """Read the project-scope view live, keeping a copy for later local reads."""
 
     if not provider.capabilities.project_scope:
-        return _project_snapshot(provider, label)
-    return _project_snapshot(provider, label, store)
+        return _project_snapshot(provider, label, progress=progress)
+    return _project_snapshot(provider, label, store, progress=progress)
 
 
 def _project_source(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -256,6 +261,16 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
 def _cmd_overlap(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     snapshot = _project_view(provider, store, "Checking every open card and pull request")
+    result = _overlap_result(config, snapshot)
+    if _emit_result(args, result):
+        return 0
+    _print_overlap(snapshot, result)
+    return 0
+
+
+def _overlap_result(config: Config, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Every open request and unlinked pull request on the Project, from one read."""
+
     source = _project_source(snapshot)
     requests = [
         {
@@ -294,8 +309,13 @@ def _cmd_overlap(args: argparse.Namespace) -> int:
         "unlinked_open_pull_requests": unlinked,
         "linkage_problems": snapshot.get("linkage_problems", []),
     }
-    if _emit_result(args, result):
-        return 0
+    return result
+
+
+def _print_overlap(snapshot: dict[str, Any], result: dict[str, Any]) -> None:
+    requests = result["open_requests"]
+    unlinked = result["unlinked_open_pull_requests"]
+    source = _project_source(snapshot)
     heading("Project overlap check")
     project = snapshot.get("project", {})
     field("Project", f"{project.get('title')} (#{project.get('number')})")
@@ -327,7 +347,6 @@ def _cmd_overlap(args: argparse.Namespace) -> int:
         section("Open pull requests with no linked request")
         for pull_request in unlinked:
             field(pull_request["provider_ref"], pull_request["url"])
-    return 0
 
 
 def _cmd_path(args: argparse.Namespace) -> int:

@@ -194,7 +194,14 @@ def resolve_account(
     return choice
 
 
+# Tokens already looked up by this process; each verb step builds its own runner.
+_TOKENS: dict[tuple[str, str], str] = {}
+
+
 def account_token(hostname: str, login: str) -> str:
+    cached = _TOKENS.get((hostname, login))
+    if cached:
+        return cached
     result = _ambient_runner(hostname).run(
         ["gh", "auth", "token", "--hostname", hostname, "--user", login], check=False
     )
@@ -205,6 +212,7 @@ def account_token(hostname: str, login: str) -> str:
             f"gh has no usable login for {login} on {hostname} ({detail}); "
             f"run 'gh auth login --hostname {hostname}' as {login}"
         )
+    _TOKENS[(hostname, login)] = token
     return token
 
 

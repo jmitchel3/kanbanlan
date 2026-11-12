@@ -49,6 +49,45 @@ def _refresh_after_mutation(
     store.invalidate()
 
 
+def _record_card(
+    store: CacheStore,
+    item: dict[str, Any],
+    label: str | None,
+    status: str,
+    **changes: Any,
+) -> None:
+    """Write the card a command just moved into the shared snapshot.
+
+    ``item`` is the command's live read of the card; ``label`` and
+    ``status`` are what the command then wrote, and ``changes`` anything
+    else it settled (a released claim). Only this card changes, so the next
+    read stays local instead of reading the whole board again.
+    """
+
+    labels = [
+        value
+        for value in item.get("labels") or []
+        if not str(value.get("name", "")).startswith("status:")
+    ]
+    if label:
+        labels.append({"name": label, "color": ""})
+    store.update_card(
+        {
+            **item,
+            "labels": sorted(labels, key=lambda value: value["name"]),
+            "status": status,
+            **changes,
+        }
+    )
+
+
+def _label_names(item: dict[str, Any]) -> list[str] | None:
+    labels = item.get("labels")
+    if labels is None:
+        return None
+    return [value["name"] for value in labels if value.get("name")]
+
+
 def _set_state(
     provider: CoordinationProvider,
     store: CacheStore,
@@ -64,7 +103,14 @@ def _set_state(
     # The label and the Project Status are separate records, so both writes
     # run at once; each still raises exactly as it would alone.
     with ThreadPoolExecutor(max_workers=2) as executor:
-        label_write = executor.submit(provider.set_request_status, item["number"], label)
+        # The card was just read live, so its labels need no second read.
+        current = _label_names(item)
+        label_write = executor.submit(
+            provider.set_request_status,
+            item["number"],
+            label,
+            **({"current": current} if current is not None else {}),
+        )
         status_write = executor.submit(_set_card_status, provider, store, item_id, status)
         label_write.result()
         status_write.result()
@@ -166,26 +212,56 @@ def _read_card(
     return card
 
 
+def _post_claim(
+    provider: CoordinationProvider,
+    item: dict[str, Any],
+    body: str,
+) -> dict[str, Any] | None:
+    """Post a claim comment; return the card right after it, when GitHub says.
+
+    A provider that can comment and read in one call answers from the
+    write's own response, which already holds every comment stored before
+    this one; otherwise the claim is read back separately.
+    """
+
+    content_id = item.get("content_id") or item.get("provider_id")
+    if content_id and callable(getattr(type(provider), "comment_and_read_request", None)):
+        card = provider.comment_and_read_request(  # type: ignore[attr-defined]
+            content_id, body, repository=item.get("repository")
+        )
+        posted = _issue(card, item["number"])
+        if not posted.get("project_item_id"):
+            raise _NotOnBoard(f"request {request_label(item)} is not on the configured kanban home")
+        return posted
+    provider.comment_request(item["number"], body)
+    return None
+
+
 def _verify_claim(
     provider: CoordinationProvider,
     store: CacheStore,
     config: Config,
     number: int,
     session: str,
+    *,
+    posted: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the card as its claim comments settle it, after posting a claim.
 
     The earliest unreleased CLAIM comment wins however many sessions raced,
-    so reading this one card decides it. A read that does not show any claim
-    yet is repeated briefly rather than mistaken for a lost race.
+    so reading this one card decides it. ``posted`` is the card as the
+    claim's own write returned it, which stands in for the first read. A
+    read that does not show any claim yet is repeated briefly rather than
+    mistaken for a lost race.
     """
 
-    item: dict[str, Any] = {}
-    for delay in CLAIM_VERIFY_DELAYS:
-        time.sleep(delay)
-        item = _issue(_read_card(provider, store, config, number), number)
-        if item.get("active_claim"):
-            break
+    item: dict[str, Any] = posted or {}
+    if not item.get("active_claim"):
+        for delay in CLAIM_VERIFY_DELAYS:
+            time.sleep(delay)
+            item = _issue(_read_card(provider, store, config, number), number)
+            if item.get("active_claim"):
+                break
     claim = item.get("active_claim") or {}
     if claim.get("session") != session:
         return item

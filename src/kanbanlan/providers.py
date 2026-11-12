@@ -56,6 +56,7 @@ class CoordinationProvider(Protocol):
         label: str | None,
         *,
         repository: str | None = None,
+        current: list[str] | None = None,
     ) -> None: ...
 
     def set_projection_status(

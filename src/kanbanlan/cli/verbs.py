@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from kanbanlan.cli.context import _actor_session, _context
 from kanbanlan.cli.dispatch import _handler
 from kanbanlan.cli.output import _emit_result
 from kanbanlan.cli.parser import build_parser
+from kanbanlan.cli.queue import _overlap_result, _project_view
 from kanbanlan.config import Config
 from kanbanlan.domain import request_label
 from kanbanlan.identity import normalize_kanbanlan_id
@@ -29,7 +31,7 @@ from kanbanlan.providers import CoordinationProvider
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.ui import field, section, status, success, warning
-from kanbanlan.worktrees import checkout_identity, removals
+from kanbanlan.worktrees import CleanupAction, checkout_identity, removals
 
 # Commands that take --actor-session, so a verb's own one passes through.
 ACTOR_STEP_COMMANDS = frozenset({"capture", "triage", "claim", "release", "review", "close"})
@@ -69,8 +71,12 @@ def _step_args(
     return step
 
 
-def _run_step(args: argparse.Namespace, argv: list[str]) -> dict[str, Any]:
+def _run_step(args: argparse.Namespace, argv: list[str], **handoff: Any) -> dict[str, Any]:
+    """Run one step and return its result; ``handoff`` sets internal step inputs."""
+
     step = _step_args(args, argv)
+    for name, value in handoff.items():
+        setattr(step, name, value)
     _handler(step.command)(step)
     if not step.result_sink:
         raise RuntimeError(f"kanbanlan {argv[0]} reported no result")
@@ -115,8 +121,8 @@ def _live_claims(
 
     if not session:
         return {}
-    with status("Checking this session's claims on GitHub"):
-        return store.refresh(provider)
+    # It runs beside the claim, whose progress is the one shown.
+    return store.refresh(provider)
 
 
 def _same_request(left: dict[str, Any], right: dict[str, Any] | None) -> bool:
@@ -151,26 +157,66 @@ def _prune_orphaned_worktrees(
     store: CacheStore,
     view: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Remove only what 'cleanup --apply' would remove, and report it.
+    """Remove only what 'cleanup --apply' would remove, and report it."""
 
-    The local view finds candidates without touching GitHub. Any candidate
-    is then decided exactly as cleanup decides, against a fresh board read and
-    a current default branch.
-    """
-
-    runner = Runner(root)
     with status("Checking for orphaned request worktrees"):
-        candidates = removals(
-            _plan_worktree_cleanup(root, config, runner, view, force=False, fetch=False)
-        )
+        candidates = _orphan_candidates(root, config, view)
+    return _prune_candidates(root, config, provider, store, candidates)
+
+
+def _orphan_candidates(root: Path, config: Config, view: dict[str, Any]) -> list[CleanupAction]:
+    """Find worktrees cleanup might remove, from the local view and git alone."""
+
+    return removals(
+        _plan_worktree_cleanup(root, config, Runner(root), view, force=False, fetch=False)
+    )
+
+
+def _prune_candidates(
+    root: Path,
+    config: Config,
+    provider: CoordinationProvider,
+    store: CacheStore,
+    candidates: list[CleanupAction],
+) -> list[dict[str, Any]]:
+    """Decide each candidate exactly as cleanup does, against a fresh board read."""
+
     if not candidates:
         return []
+    runner = Runner(root)
     with status("Confirming orphaned worktrees against GitHub"):
         snapshot = store.refresh(provider)
         confirmed = removals(_plan_worktree_cleanup(root, config, runner, snapshot, force=False))
     if not confirmed:
         return []
     return _apply_cleanup(runner, confirmed)
+
+
+def _check_session_free(
+    session: str | None,
+    target: dict[str, Any] | None,
+    *sources: list[dict[str, Any]],
+) -> None:
+    """Refuse when ``session`` already owns a request other than ``target``."""
+
+    for requests in sources:
+        for owned in _session_claims(requests, session):
+            if not _same_request(owned, target):
+                raise RuntimeError(
+                    f"session {session} already owns {request_label(owned)}; finish it with "
+                    "'kanbanlan done' or release it with 'kanbanlan drop' first"
+                )
+
+
+def _read_overlap(
+    config: Config,
+    provider: CoordinationProvider,
+    store: CacheStore,
+) -> dict[str, Any]:
+    """Read the whole Project live for its active claims and unlinked pull requests."""
+
+    snapshot = _project_view(provider, store, "Checking the Project", progress=False)
+    return _overlap_result(config, snapshot)
 
 
 def _cmd_start(args: argparse.Namespace) -> int:
@@ -209,19 +255,60 @@ def _cmd_start(args: argparse.Namespace) -> int:
                 f"request {label} is {target.get('status')!r}; only Inbox or Ready "
                 "requests can be started"
             )
+    _check_session_free(session, target, _issues(view))
 
-    overlap = _run_step(args, ["overlap"])
-    requests = overlap.get("open_requests", [])
-    for owned in [
-        *_session_claims(_issues(view), session),
-        *_session_claims(_issues(_live_claims(store, provider, session)), session),
-        *_session_claims(requests, session),
-    ]:
-        if not _same_request(owned, target):
-            raise RuntimeError(
-                f"session {session} already owns {request_label(owned)}; finish it with "
-                "'kanbanlan done' or release it with 'kanbanlan drop' first"
-            )
+    # The Project read, the live read of this repository's claims, and the
+    # orphaned worktree scan are independent of each other and of the claim,
+    # so they run while it does. A Ready card goes straight to its claim, and
+    # the claim is refused (and released) before the card moves if either
+    # read shows this session already owns another card. Anything that
+    # writes first (a capture, a triage) waits for those checks instead.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        overlap_read = pool.submit(_read_overlap, config, provider, store)
+        live_read = pool.submit(_live_claims, store, provider, session)
+        orphan_scan = pool.submit(_orphan_candidates, root, config, view)
+
+        def overlap() -> dict[str, Any]:
+            _check_session_free(session, target, _issues(live_read.result()))
+            result = overlap_read.result()
+            _check_session_free(session, target, result.get("open_requests", []))
+            return result
+
+        captured = None
+        handoff: dict[str, Any] = {}
+        if target is not None and target.get("status") == "Ready":
+            reference = _sync_reference(target)
+            handoff = {"known_card": target, "claim_gate": overlap}
+            triaged = False
+        else:
+            with status("Checking the Project for other active claims"):
+                overlap()
+            if target is None:
+                captured = _run_step(
+                    args,
+                    [
+                        "capture",
+                        f"--priority={args.priority}",
+                        f"--body={args.body}",
+                        "--",
+                        reference,
+                    ],
+                )
+                reference = captured["kanbanlan_id"]
+            else:
+                reference = _sync_reference(target)
+            triaged = True
+            _run_step(args, ["triage", reference])
+        claim_argv = ["claim", reference, f"--touchpoints={args.touchpoints}"]
+        if args.session:
+            claim_argv.append(f"--session={args.session}")
+        claimed = _run_step(args, claim_argv, **handoff)
+        # The claim checked the Project already; this only collects it.
+        overlap_result = overlap()
+        candidates = orphan_scan.result()
+    pruned = _prune_candidates(root, config, provider, store, candidates)
+
+    requests = overlap_result.get("open_requests", [])
     others = [
         {
             "kanbanlan_id": request.get("kanbanlan_id"),
@@ -239,33 +326,6 @@ def _cmd_start(args: argparse.Namespace) -> int:
         for request in requests
         if request.get("active_claim") and not _same_request(request, target)
     ]
-
-    pruned = _prune_orphaned_worktrees(root, config, provider, store, view)
-
-    captured = None
-    if target is None:
-        captured = _run_step(
-            args,
-            [
-                "capture",
-                f"--priority={args.priority}",
-                f"--body={args.body}",
-                "--",
-                reference,
-            ],
-        )
-        reference = captured["kanbanlan_id"]
-        status_name = "Inbox"
-    else:
-        reference = _sync_reference(target)
-        status_name = target.get("status")
-    triaged = status_name == "Inbox"
-    if triaged:
-        _run_step(args, ["triage", reference])
-    claim_argv = ["claim", reference, f"--touchpoints={args.touchpoints}"]
-    if args.session:
-        claim_argv.append(f"--session={args.session}")
-    claimed = _run_step(args, claim_argv)
     request = target or {
         "kanbanlan_id": captured["kanbanlan_id"] if captured else None,
         "provider_ref": (captured or {}).get("provider_ref"),
@@ -285,7 +345,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
                 "title": pull_request.get("title"),
                 "url": pull_request.get("url"),
             }
-            for pull_request in overlap.get("unlinked_open_pull_requests", [])
+            for pull_request in overlap_result.get("unlinked_open_pull_requests", [])
         ],
         pruned=pruned,
     )

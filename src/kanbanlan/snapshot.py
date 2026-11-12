@@ -493,6 +493,26 @@ def build_snapshot(
     }
 
 
+# What one card's own read and write settle. Everything else on a cached item
+# (its linked pull requests, its Project item id) comes from the board read.
+CARD_FIELDS = (
+    "status",
+    "state",
+    "state_reason",
+    "closed_at",
+    "title",
+    "body",
+    "labels",
+    "priority",
+    "assignees",
+    "milestone",
+    "active_claim",
+    "session_history",
+    "session_history_truncated",
+    "updated_at",
+)
+
+
 def reads_queue(client: Any) -> bool:
     """Report whether a client reads the queue over REST (``queue_snapshot``).
 
@@ -591,6 +611,64 @@ class CacheStore:
             self.invalidated_path,
             {"schema_version": SCHEMA_VERSION, "invalidated_at": isoformat(utc_now())},
         )
+
+    def update_card(self, card: dict[str, Any]) -> bool:
+        """Write one card this session just changed into the shared snapshot.
+
+        Every other card stays as the last board read left it, so the
+        snapshot stays fresh instead of costing the next command a board
+        read. The write happens only while ``refresh.lock`` is free: a
+        refresh in flight may have read GitHub before this change and would
+        overwrite the patch, so then the snapshot is marked stale instead,
+        exactly as before. Nothing ever waits on the lock.
+
+        Returns whether the card was written in place.
+        """
+
+        self._prepare_directory()
+        lock = FileLock(self.lock_path, timeout=0.0)
+        try:
+            lock.__enter__()
+        except RuntimeError:
+            self.invalidate()
+            return False
+        try:
+            snapshot = self.snapshot()
+            if not self._usable(snapshot) or self._invalidated(snapshot):
+                # Already due for a board read, which will see this change.
+                return False
+            assert snapshot is not None
+            items = snapshot.get("items") or []
+            index = next(
+                (
+                    position
+                    for position, value in enumerate(items)
+                    if value.get("type") == "ISSUE"
+                    and value.get("provider_ref")
+                    and value.get("provider_ref") == card.get("provider_ref")
+                ),
+                None,
+            )
+            if index is None:
+                self.invalidate()
+                return False
+            items[index] = {
+                **items[index],
+                **{name: card[name] for name in CARD_FIELDS if name in card},
+            }
+            ready = select_ready(items, self.config.repository)
+            snapshot.update(
+                {
+                    "items": items,
+                    "status_counts": count_statuses(items),
+                    "ready_cards": ready,
+                    "next_ready": ready[0] if ready else None,
+                }
+            )
+            self._write_json(self.snapshot_path, snapshot)
+            return True
+        finally:
+            lock.__exit__()
 
     def _read_after(self, snapshot: dict[str, Any] | None, moment: datetime) -> bool:
         if not self._usable(snapshot) or self._invalidated(snapshot):

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from kanbanlan.accounts import AccountRunner
 from kanbanlan.config import Config, cache_dir
@@ -207,10 +207,7 @@ PULL_REQUEST_FIELDS = """
 # large the board grows. Closing pull requests come with it; the Project's
 # repositories bound the search for pull requests that only declare the
 # request's Kanbanlan ID.
-REQUEST_CARD_QUERY = """
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    issue(number: $number) {
+REQUEST_CARD_FIELDS = """
       id
       number
       title
@@ -257,11 +254,47 @@ query($owner: String!, $repo: String!, $number: Int!) {
 PULL_REQUEST_FIELDS
         }
       }
+""".replace("PULL_REQUEST_FIELDS", PULL_REQUEST_FIELDS)
+
+REQUEST_CARD_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+REQUEST_CARD_FIELDS
     }
   }
   rateLimit { cost remaining resetAt }
 }
-""".replace("PULL_REQUEST_FIELDS", PULL_REQUEST_FIELDS)
+""".replace("REQUEST_CARD_FIELDS", REQUEST_CARD_FIELDS)
+
+# Posts a comment and reads its card back in the same response, so a claim
+# sees every comment GitHub stored before it without a second round trip.
+COMMENT_AND_READ_MUTATION = """
+mutation($subject: ID!, $body: String!) {
+  addComment(input: { subjectId: $subject, body: $body }) {
+    subject {
+      ... on Issue {
+REQUEST_CARD_FIELDS
+      }
+    }
+  }
+}
+""".replace("REQUEST_CARD_FIELDS", REQUEST_CARD_FIELDS)
+
+SET_PROJECT_STATUS_MUTATION = """
+mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+  updateProjectV2ItemFieldValue(
+    input: {
+      projectId: $project
+      itemId: $item
+      fieldId: $field
+      value: { singleSelectOptionId: $option }
+    }
+  ) {
+    projectV2Item { id }
+  }
+}
+"""
 
 REQUEST_PULL_REQUEST_SEARCH = """
 query($query: String!) {
@@ -1617,7 +1650,6 @@ class GitHub:
         finished before it is known to be reflected in the card.
         """
 
-        config = self._config()
         target = self._repository(repository)
         owner, repo = target.split("/", 1)
         number = _issue_number(reference)
@@ -1631,6 +1663,50 @@ class GitHub:
         issue = (payload.get("repository") or {}).get("issue")
         if not issue:
             raise RuntimeError(f"request {qualified_reference(target, number)} was not found")
+        return self._card_snapshot(
+            issue,
+            target,
+            started,
+            payload.get("rateLimit") or {},
+            pull_requests=pull_requests,
+            budget=budget,
+        )
+
+    def comment_and_read_request(
+        self,
+        content_id: str,
+        body: str,
+        *,
+        repository: str | None = None,
+    ) -> dict[str, Any]:
+        """Post ``body`` on the issue ``content_id`` and return its card after it.
+
+        The card comes from the mutation's own response, so it reflects the
+        new comment and every one stored before it, in one round trip.
+        """
+
+        started = utc_now()
+        payload = self.graphql(COMMENT_AND_READ_MUTATION, {"subject": content_id, "body": body})
+        issue = ((payload.get("addComment") or {}).get("subject")) or {}
+        if not issue.get("number"):
+            raise RuntimeError("GitHub did not return the commented request")
+        target = (issue.get("repository") or {}).get("nameWithOwner") or self._repository(
+            repository
+        )
+        return self._card_snapshot(issue, target, started, {})
+
+    def _card_snapshot(
+        self,
+        issue: dict[str, Any],
+        target: str,
+        started: datetime,
+        rate_limit: dict[str, Any],
+        *,
+        pull_requests: bool = False,
+        budget: _Budget | None = None,
+    ) -> dict[str, Any]:
+        config = self._config()
+        budget = budget or _Budget(None)
         project_item = next(
             (
                 value
@@ -1674,7 +1750,7 @@ class GitHub:
             config,
             {"id": project.get("id"), "number": project.get("number"), "items": [raw_item]},
             found if pull_requests else [],
-            payload.get("rateLimit") or {},
+            rate_limit,
             generated_at=started,
         )
 
@@ -1685,20 +1761,16 @@ class GitHub:
         option = next((value for value in field["options"] if value["name"] == status), None)
         if not option:
             raise RuntimeError(f"Project Status option {status!r} is missing")
-        self.runner.run(
-            [
-                "gh",
-                "project",
-                "item-edit",
-                "--id",
-                item_id,
-                "--project-id",
-                project["id"],
-                "--field-id",
-                field["id"],
-                "--single-select-option-id",
-                option["id"],
-            ]
+        # One mutation; 'gh project item-edit' spends extra round trips
+        # resolving what the cached Project fields already name.
+        self.graphql(
+            SET_PROJECT_STATUS_MUTATION,
+            {
+                "project": project["id"],
+                "item": item_id,
+                "field": field["id"],
+                "option": option["id"],
+            },
         )
 
     def set_projection_status(
@@ -1715,42 +1787,51 @@ class GitHub:
         label: str | None,
         *,
         repository: str | None = None,
+        current: list[str] | None = None,
     ) -> None:
+        """Leave ``label`` as the issue's only status label.
+
+        ``current`` is the issue's label names from a read the caller just
+        made; without it the labels are read first. Each change is its own
+        REST call, and they run at once: an add and a removal never touch
+        the same label.
+        """
+
         target = self._repository(repository)
-        payload = self.runner.json(
-            [
-                "gh",
-                "issue",
-                "view",
-                str(number),
-                "--repo",
-                target,
-                "--json",
-                "labels",
-            ],
-            retry=True,
-        )
-        current = {
-            value["name"]
-            for value in payload.get("labels", [])
-            if value["name"].startswith("status:")
-        }
+        if current is None:
+            payload = self.runner.json(
+                ["gh", "api", f"repos/{target}/issues/{number}/labels?per_page=100"],
+                retry=True,
+            )
+            current = [value["name"] for value in payload]
+        present = {value for value in current if value.startswith("status:")}
         wanted = {label} if label else set()
-        if current == wanted:
+        if present == wanted:
             return
-        args = [
-            "gh",
-            "issue",
-            "edit",
-            str(number),
-            "--repo",
-            target,
+        issue = f"repos/{target}/issues/{number}/labels"
+        calls: list[tuple[list[str], str | None]] = [
+            (["gh", "api", "--method", "DELETE", f"{issue}/{quote(value, safe='')}"], None)
+            for value in sorted(present - wanted)
         ]
-        for value in sorted(current - wanted):
-            args.extend(["--remove-label", value])
-        for value in sorted(wanted - current):
-            args.extend(["--add-label", value])
-        self.runner.run(args)
+        if wanted - present:
+            calls.append(
+                (
+                    ["gh", "api", "--method", "POST", issue, "--input", "-"],
+                    json.dumps({"labels": sorted(wanted - present)}),
+                )
+            )
+        with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+            results = [
+                pool.submit(self.runner.run, args, input_text=body, check=False)
+                for args, body in calls
+            ]
+            for future in results:
+                result = future.result()
+                # A label someone else already removed is the state we want.
+                if result.returncode and not (
+                    result.args[3] == "DELETE" and "(HTTP 404)" in result.stderr
+                ):
+                    raise CommandError(result)
 
     def set_request_status(
         self,
@@ -1758,21 +1839,25 @@ class GitHub:
         label: str | None,
         *,
         repository: str | None = None,
+        current: list[str] | None = None,
     ) -> None:
-        self.set_issue_status_label(_issue_number(reference), label, repository=repository)
+        self.set_issue_status_label(
+            _issue_number(reference), label, repository=repository, current=current
+        )
 
     def comment_issue(self, number: int, body: str, *, repository: str | None = None) -> None:
+        # One REST call; 'gh issue comment' first resolves the issue over GraphQL.
         self.runner.run(
             [
                 "gh",
-                "issue",
-                "comment",
-                str(number),
-                "--repo",
-                self._repository(repository),
-                "--body",
-                body,
-            ]
+                "api",
+                "--method",
+                "POST",
+                f"repos/{self._repository(repository)}/issues/{number}/comments",
+                "--input",
+                "-",
+            ],
+            input_text=json.dumps({"body": body}),
         )
 
     def comment_request(

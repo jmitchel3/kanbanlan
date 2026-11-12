@@ -6,12 +6,15 @@ import argparse
 import re
 import shlex
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from kanbanlan.cli.cards import (
     _issue,
+    _post_claim,
     _read_card,
+    _record_card,
     _refresh_after_mutation,
     _set_card_status,
     _set_state,
@@ -238,7 +241,7 @@ def _cmd_triage(args: argparse.Namespace) -> int:
             to_status="Ready",
             actor=actor,
         )
-        _refresh_after_mutation(root, store, provider)
+        _record_card(store, item, "status:ready", "Ready")
     result = {
         "kanbanlan_id": item.get("kanbanlan_id"),
         "status": "Ready",
@@ -253,69 +256,78 @@ def _cmd_triage(args: argparse.Namespace) -> int:
 def _cmd_claim(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
     actor = _actor_session(args, root, config)
-    with status(f"Checking request {args.issue}"):
-        card = _read_card(provider, store, config, args.issue)
-    item = _issue(card, args.issue)
+    # 'start' hands over the card it already checked in the local view; the
+    # read after the claim comment then checks it live instead of a read
+    # before it, and a claim it refuses is released.
+    known = getattr(args, "known_card", None)
+    if known is None:
+        with status(f"Checking request {args.issue}"):
+            card = _read_card(provider, store, config, args.issue)
+        item = _issue(card, args.issue)
+    else:
+        item = known
     number = item["number"]
     label = request_label(item)
-    if item.get("state") != "OPEN":
-        raise RuntimeError(f"request {label} is not open")
-    if item.get("status") != "Ready":
-        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Ready")
-    if item.get("active_claim"):
-        owner = item["active_claim"].get("session") or "another session"
-        raise RuntimeError(f"request {label} already has an active claim by {owner}")
+    _require_claimable(item, label)
 
     session = args.session or (actor.reference if actor else None)
     session = session or f"kanbanlan-{uuid.uuid4().hex[:8]}"
     branch, worktree = _claim_checkout(args, root, config, item)
     timestamp = _utc_timestamp()
-    with status(f"Posting claim for {label}"):
-        provider.comment_request(
-            number,
-            (
-                f"CLAIM: {timestamp}\n"
-                f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
-                f"Session: {session}\n"
-                f"Branch: {branch}\n"
-                f"Worktree: {worktree}\n"
-                f"Touchpoints: {args.touchpoints}"
-            ),
-        )
-        claimed_item = _verify_claim(provider, store, config, number, session)
-    claimed = claimed_item.get("active_claim") or {}
-    if claimed.get("session") != session:
-        provider.comment_request(
-            number,
-            (f"RELEASED: {_utc_timestamp()} — concurrent claim lost\nSession: {session}"),
-        )
-        owner = claimed.get("session") or "another session"
-        raise RuntimeError(f"request {label} was claimed first by {owner}")
-
-    with status("Moving request to In progress"):
-        _set_state(provider, store, claimed_item, "status:in-progress", "In progress")
-    try:
-        if not args.no_worktree:
-            with status(f"Creating worktree {worktree}"):
-                _create_worktree(root, config, branch, Path(worktree))
-    except Exception:
-        provider.comment_request(
-            number,
-            (f"RELEASED: {_utc_timestamp()} — worktree creation failed\nSession: {session}"),
-        )
-        _set_state(provider, store, claimed_item, "status:ready", "Ready")
-        raise
-    _record_session_activity(
-        config=config,
-        provider=provider,
-        reference=number,
-        action="claim",
-        from_status="Ready",
-        to_status="In progress",
-        actor=actor,
-        owner_session=session,
+    body = (
+        f"CLAIM: {timestamp}\n"
+        f"Kanbanlan: {item.get('kanbanlan_id') or 'unassigned'}\n"
+        f"Session: {session}\n"
+        f"Branch: {branch}\n"
+        f"Worktree: {worktree}\n"
+        f"Touchpoints: {args.touchpoints}"
     )
-    _refresh_after_mutation(root, store, provider)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        # Only the fetch runs while GitHub settles the claim. The worktree is
+        # added once the claim holds: two sessions on one machine racing for
+        # one card compute the same path, and the loser must never take it.
+        fetch = None if args.no_worktree else pool.submit(_fetch_default_branch, root, config)
+        posted_claim = False
+        try:
+            with status(f"Posting claim for {label}"):
+                posted_claim = True
+                posted = _post_claim(provider, item, body)
+                claimed_item = _verify_claim(
+                    provider, store, config, number, session, posted=posted
+                )
+            reason, failure = _claim_failure(args, claimed_item, label, session, known)
+            if failure is None and fetch is not None:
+                try:
+                    _create_worktree(root, config, branch, Path(worktree), fetch=not fetch.result())
+                except Exception as exc:  # noqa: BLE001 - reported once released
+                    reason, failure = "worktree creation failed", exc
+        except BaseException:
+            if posted_claim:
+                # A claim this command cannot settle must not stay active.
+                _release_quietly(provider, number, session, "claim interrupted")
+            raise
+        if failure is not None:
+            provider.comment_request(
+                number,
+                f"RELEASED: {_utc_timestamp()} — {reason}\nSession: {session}",
+            )
+            raise failure
+
+    with status("Moving request to In progress"), ThreadPoolExecutor(max_workers=1) as pool:
+        activity = pool.submit(
+            _record_session_activity,
+            config=config,
+            provider=provider,
+            reference=number,
+            action="claim",
+            from_status="Ready",
+            to_status="In progress",
+            actor=actor,
+            owner_session=session,
+        )
+        _set_state(provider, store, claimed_item, "status:in-progress", "In progress")
+        activity.result()
+    _record_card(store, claimed_item, "status:in-progress", "In progress")
     result = {
         "kanbanlan_id": item.get("kanbanlan_id"),
         "provider_ref": item.get("provider_ref"),
@@ -330,6 +342,69 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     print(f"branch: {branch}")
     print(f"worktree: {worktree}")
     return 0
+
+
+def _require_claimable(item: dict[str, Any], label: str) -> None:
+    if item.get("state") != "OPEN":
+        raise RuntimeError(f"request {label} is not open")
+    if item.get("status") != "Ready":
+        raise RuntimeError(f"request {label} is {item.get('status')!r}, not Ready")
+    if item.get("active_claim"):
+        owner = item["active_claim"].get("session") or "another session"
+        raise RuntimeError(f"request {label} already has an active claim by {owner}")
+
+
+def _claim_failure(
+    args: argparse.Namespace,
+    claimed_item: dict[str, Any],
+    label: str,
+    session: str,
+    known: dict[str, Any] | None,
+) -> tuple[str, Exception | None]:
+    """Decide whether a posted claim holds, before anything moves the card."""
+
+    claimed = claimed_item.get("active_claim") or {}
+    if claimed.get("session") != session:
+        owner = claimed.get("session") or "another session"
+        lost = RuntimeError(f"request {label} was claimed first by {owner}")
+        return "concurrent claim lost", lost
+    if known is not None:
+        # The card came from the local view; this is its first live check.
+        try:
+            _require_claimable({**claimed_item, "active_claim": None}, label)
+        except RuntimeError as exc:
+            return "request was not claimable", exc
+    gate = getattr(args, "claim_gate", None)
+    if gate is not None:
+        try:
+            gate()
+        except RuntimeError as exc:
+            return "claim refused", exc
+    return "", None
+
+
+def _fetch_default_branch(root: Path, config: Config) -> bool:
+    """Fetch the default branch for a new worktree; report whether it worked."""
+
+    result = Runner(root).run(["git", "fetch", "origin", config.default_branch], check=False)
+    return result.returncode == 0
+
+
+def _release_quietly(
+    provider: CoordinationProvider,
+    number: int,
+    session: str,
+    reason: str,
+) -> None:
+    """Release a claim on the way out of a failure, never masking that failure."""
+
+    try:
+        provider.comment_request(
+            number,
+            f"RELEASED: {_utc_timestamp()} — {reason}\nSession: {session}",
+        )
+    except Exception:  # noqa: BLE001 - the original failure is the one to report
+        warning(f"could not release the claim on #{number}; release it with 'kanbanlan drop'")
 
 
 def _claim_checkout(
@@ -425,7 +500,13 @@ def _cmd_release(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=session,
         )
-        _refresh_after_mutation(root, store, provider)
+        _record_card(
+            store,
+            item,
+            "status:blocked" if args.blocked else "status:ready",
+            destination,
+            active_claim=None,
+        )
     if _emit_result(
         args,
         {
@@ -584,7 +665,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
             actor=actor,
             owner_session=(item.get("active_claim") or {}).get("session"),
         )
-        _refresh_after_mutation(root, store, provider)
+        _record_card(store, item, "status:review", "In review")
     if _emit_result(
         args,
         {

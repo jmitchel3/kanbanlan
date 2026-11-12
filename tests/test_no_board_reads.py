@@ -188,13 +188,18 @@ def cached_snapshot(github: OneCardGitHub, *, age_seconds: float) -> dict[str, A
 
 
 def guard_refresh_lock(*names: str) -> Any:
-    """Fail on entering ``refresh.lock``, or any other lock file named."""
+    """Fail on waiting for ``refresh.lock``, or on entering any other lock named.
+
+    Writing a card into the snapshot only tries ``refresh.lock`` without
+    waiting (``timeout=0``), which can never queue a command behind a refresh.
+    """
 
     enter = locks.FileLock.__enter__
-    refused = {"refresh.lock", *names}
+    named = set(names)
 
     def guarded(self: locks.FileLock) -> locks.FileLock:
-        if Path(self.path).name in refused:
+        name = Path(self.path).name
+        if name in named or (name == "refresh.lock" and self.timeout > 0):
             raise BoardRead(f"took {self.path}")
         return enter(self)
 
@@ -241,6 +246,27 @@ COMMANDS: list[tuple[str, list[str], dict[str, Any]]] = [
 ]
 
 
+def _parser_with(handoff: dict[str, Any]) -> Any:
+    """Build the real parser, adding what 'start' hands a claim step."""
+
+    from kanbanlan.cli.parser import build_parser
+
+    def build() -> Any:
+        parser = build_parser()
+        parse = parser.parse_args
+
+        def parse_args(argv: Any = None) -> Any:
+            args = parse(argv)
+            for name, value in handoff.items():
+                setattr(args, name, value)
+            return args
+
+        parser.parse_args = parse_args  # type: ignore[method-assign]
+        return parser
+
+    return build
+
+
 class NoBoardReadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -261,6 +287,8 @@ class NoBoardReadTests(unittest.TestCase):
         *,
         snapshot: dict[str, Any] | None,
         environment: dict[str, str] | None = None,
+        handoff: dict[str, Any] | None = None,
+        create_worktree: Any = None,
     ) -> tuple[int, dict[str, Any]]:
         store = CacheStore(config(), self.root / "cache")
         if snapshot is not None:
@@ -275,7 +303,9 @@ class NoBoardReadTests(unittest.TestCase):
             patch_cli("_context", return_value=(self.root, config(), github, store)),
             patch_cli("_actor_session", return_value=None),
             patch_cli("notify_if_update_available"),
-            patch_cli("_create_worktree"),
+            patch_cli("_create_worktree", create_worktree or mock.Mock(return_value=None)),
+            patch_cli("_fetch_default_branch", return_value=True),
+            mock.patch("kanbanlan.cli.app.build_parser", _parser_with(handoff or {})),
             patch_cli("_claim_checkout", return_value=("work/a", str(self.root / "wt"))),
             patch_cli("read_board", side_effect=refuse),
             mock.patch.object(CacheStore, "refresh", refuse),
@@ -320,7 +350,9 @@ class NoBoardReadTests(unittest.TestCase):
                 self.assertIn("create", github.calls)
                 self.assertIsNotNone(payload["result"]["url"])
 
-    def test_a_mutation_marks_the_snapshot_stale_without_reading_the_board(self) -> None:
+    def test_a_mutation_writes_its_card_into_the_snapshot_without_reading_the_board(
+        self,
+    ) -> None:
         github = OneCardGitHub("Inbox")
         store = CacheStore(config(), self.root / "cache")
 
@@ -329,7 +361,178 @@ class NoBoardReadTests(unittest.TestCase):
         )
 
         self.assertEqual(0, code, payload)
+        self.assertTrue(store.is_fresh())
+        (card,) = store.snapshot()["items"]
+        self.assertEqual("Ready", card["status"])
+        self.assertIn("status:ready", [label["name"] for label in card["labels"]])
+        self.assertEqual(IDENTITY, store.snapshot()["next_ready"]["kanbanlan_id"])
+
+    def test_a_claim_writes_itself_into_the_snapshot(self) -> None:
+        github = OneCardGitHub("Ready")
+        store = CacheStore(config(), self.root / "cache")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
+        )
+
+        self.assertEqual(0, code, payload)
+        self.assertTrue(store.is_fresh())
+        (card,) = store.snapshot()["items"]
+        self.assertEqual(("In progress", "s1"), (card["status"], card["active_claim"]["session"]))
+        self.assertIsNone(store.snapshot()["next_ready"])
+
+    def test_a_mutation_during_a_refresh_marks_the_snapshot_stale(self) -> None:
+        # A refresh holding the lock may have read GitHub before this write.
+        github = OneCardGitHub("Inbox")
+        store = CacheStore(config(), self.root / "cache")
+        store._prepare_directory()
+
+        with (
+            locks.FileLock(store.lock_path),
+            # The owner check runs ps, which run_command stubs out.
+            mock.patch.object(locks, "owner_predates_lock", return_value=True),
+        ):
+            code, payload = self.run_command(
+                ["triage", IDENTITY], github, snapshot=cached_snapshot(github, age_seconds=0)
+            )
+
+        self.assertEqual(0, code, payload)
         self.assertFalse(store.is_fresh())
+        self.assertEqual("Inbox", store.snapshot()["items"][0]["status"])
+
+    def test_a_claim_written_and_read_in_one_call_is_only_read_again_to_confirm(self) -> None:
+        class OneCallGitHub(OneCardGitHub):
+            def comment_and_read_request(self, content_id: str, body: str, **_kwargs: Any) -> Any:
+                self.calls.append(f"comment_and_read:{content_id}")
+                self.comment_request(7, body)
+                self.calls.pop()
+                return build_snapshot(config(), self._project(), [], {})
+
+        github = OneCallGitHub("Ready")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=cached_snapshot(OneCardGitHub("Ready"), age_seconds=0),
+        )
+
+        self.assertEqual(0, code, payload)
+        # The read before the claim, the claim itself, and the confirming read.
+        posted = github.calls.index("comment_and_read:issue-7")
+        self.assertEqual(["read_request"], github.calls[:posted])
+        self.assertEqual(1, github.calls[posted:].count("read_request"))
+        self.assertIn("status:In progress", github.calls)
+
+    def test_a_handed_over_card_is_claimed_without_a_read_before_its_comment(self) -> None:
+        github = OneCardGitHub("Ready")
+        known = cached_snapshot(OneCardGitHub("Ready"), age_seconds=0)["items"][0]
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=None,
+            handoff={"known_card": known},
+        )
+
+        self.assertEqual(0, code, payload)
+        self.assertEqual("comment", github.calls[0])
+        self.assertIn("status:In progress", github.calls)
+
+    def test_a_handed_over_card_that_moved_is_released_not_claimed(self) -> None:
+        github = OneCardGitHub("Blocked")
+        known = cached_snapshot(OneCardGitHub("Ready"), age_seconds=0)["items"][0]
+        create = mock.Mock(return_value=None)
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
+            github,
+            snapshot=None,
+            handoff={"known_card": known},
+            create_worktree=create,
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("'Blocked', not Ready", payload["error"]["message"])
+        self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
+        self.assertFalse([call for call in github.calls if call.startswith("status:")])
+        # A claim that does not hold never takes the worktree path.
+        create.assert_not_called()
+
+    def test_a_lost_claim_never_adds_the_worktree(self) -> None:
+        # Two sessions on one machine compute the same worktree path; only
+        # the winner may add it, or the loser's worktree would make the
+        # winner's fail.
+        github = OneCardGitHub("Ready")
+        create = mock.Mock(return_value=None)
+
+        def rival_claim() -> None:
+            raise RuntimeError("session s1 already owns github:acme/other#3")
+
+        code, _ = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
+            github,
+            snapshot=None,
+            handoff={"claim_gate": rival_claim},
+            create_worktree=create,
+        )
+
+        self.assertEqual(1, code)
+        create.assert_not_called()
+
+    def test_a_claim_whose_read_fails_after_posting_is_released(self) -> None:
+        class FailingReadGitHub(OneCardGitHub):
+            def read_request(self, *args: Any, **kwargs: Any) -> Any:
+                if self.comments:
+                    raise RuntimeError("GitHub unavailable")
+                return super().read_request(*args, **kwargs)
+
+        github = FailingReadGitHub("Ready")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=None,
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("GitHub unavailable", payload["error"]["message"])
+        self.assertIn("claim interrupted", github.comments[-1]["body"])
+        self.assertFalse([call for call in github.calls if call.startswith("status:")])
+
+    def test_a_claim_its_gate_refuses_is_released_before_the_card_moves(self) -> None:
+        github = OneCardGitHub("Ready")
+
+        def gate() -> None:
+            raise RuntimeError("session s1 already owns github:acme/other#3")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1", "--no-worktree"],
+            github,
+            snapshot=None,
+            handoff={"claim_gate": gate},
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("already owns", payload["error"]["message"])
+        self.assertTrue(github.comments[-1]["body"].startswith("RELEASED:"))
+        self.assertFalse([call for call in github.calls if call.startswith("status:")])
+
+    def test_a_failed_worktree_releases_the_claim_without_moving_the_card(self) -> None:
+        github = OneCardGitHub("Ready")
+
+        code, payload = self.run_command(
+            ["claim", IDENTITY, "--touchpoints", "src", "--session", "s1"],
+            github,
+            snapshot=None,
+            create_worktree=mock.Mock(side_effect=RuntimeError("worktree path is taken")),
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("worktree path is taken", payload["error"]["message"])
+        self.assertIn("worktree creation failed", github.comments[-1]["body"])
+        self.assertFalse([call for call in github.calls if call.startswith("status:")])
 
     def test_an_issue_off_the_configured_project_is_refused_not_added(self) -> None:
         for argv in (
