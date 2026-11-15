@@ -17,7 +17,13 @@ from cli_patch import patch_cli
 from kanbanlan.cli.app import main
 from kanbanlan.cli.output import _emit_result
 from kanbanlan.cli.parser import ADMIN_COMMANDS, VISIBLE_COMMANDS, build_parser
-from kanbanlan.cli.verbs import DEFAULT_DROP_REASON, _prune_orphaned_worktrees, _pull_request_body
+from kanbanlan.cli.verbs import (
+    DEFAULT_DROP_REASON,
+    START_PRUNE_LIMIT,
+    _prune_candidates,
+    _prune_orphaned_worktrees,
+    _pull_request_body,
+)
 from kanbanlan.runner import CommandResult
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.worktrees import (
@@ -194,7 +200,10 @@ class StartTests(VerbTestCase):
         self.cleanup_plan = patch_cli("_plan_worktree_cleanup", return_value=[])
         self.cleanup_plan.start()
         self.addCleanup(self.cleanup_plan.stop)
-        for name, value in (("_claim_checkout", (BRANCH, WORKTREE)),):
+        for name, value in (
+            ("_claim_checkout", (BRANCH, WORKTREE)),
+            ("_existing_worktree_paths", {"/repo/.worktrees/old"}),
+        ):
             patcher = patch_cli(name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -313,11 +322,58 @@ class StartTests(VerbTestCase):
     def test_pruned_worktrees_are_reported(self) -> None:
         self.write_snapshot([item(8, BETA, "Ready")])
         removed = [{"path": "/repo/.worktrees/old", "action": REMOVE, "reason": "claim released"}]
-        with patch_cli("_prune_candidates", return_value=removed):
+        with patch_cli("_prune_candidates", return_value=(removed, 4)):
             code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
 
         self.assertEqual(0, code)
         self.assertEqual(removed, payload["result"]["pruned"])
+        self.assertEqual(4, payload["result"]["cleanup_deferred"])
+
+    def test_pruning_reuses_the_live_claim_read_instead_of_a_second_board_read(self) -> None:
+        self.write_snapshot([item(8, BETA, "Ready")])
+        live = snapshot([item(8, BETA, "Ready")])
+        self.store.refresh = mock.Mock(return_value=live)  # type: ignore[method-assign]
+        orphan = CleanupAction(path="/repo/.worktrees/old", action=REMOVE, reason="closed")
+        with (
+            patch_cli("_orphan_candidates", return_value=[orphan]),
+            patch_cli("_apply_cleanup", return_value=[orphan.to_dict()]),
+        ):
+            self.cleanup_plan.stop()
+            plan = patch_cli("_plan_worktree_cleanup", return_value=[orphan])
+            plan_mock = plan.start()
+            self.addCleanup(plan.stop)
+            self.cleanup_plan = plan
+            code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(0, code)
+        self.assertEqual([orphan.to_dict()], payload["result"]["pruned"])
+        # One live read serves both the claim check and the confirmation.
+        self.store.refresh.assert_called_once_with(self.provider)
+        confirm = plan_mock.call_args
+        self.assertIs(live, confirm.args[3])
+        # The claim fetched the default branch already.
+        self.assertFalse(confirm.kwargs["fetch"])
+        self.assertEqual({orphan.path}, confirm.kwargs["paths"])
+
+    def test_a_worktree_added_after_the_live_read_began_is_not_pruned(self) -> None:
+        # Its claim may postdate the live read, which would show it unclaimed.
+        self.write_snapshot([item(8, BETA, "Ready")])
+        live = snapshot([item(8, BETA, "Ready")])
+        self.store.refresh = mock.Mock(return_value=live)  # type: ignore[method-assign]
+        late = CleanupAction(path="/repo/.worktrees/late", action=REMOVE, reason="claim released")
+        self.cleanup_plan.stop()
+        self.cleanup_plan = patch_cli("_plan_worktree_cleanup", return_value=[late])
+        self.cleanup_plan.start()
+        self.addCleanup(self.cleanup_plan.stop)
+        with (
+            patch_cli("_orphan_candidates", return_value=[late]),
+            patch_cli("_apply_cleanup") as apply,
+        ):
+            code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(0, code)
+        self.assertEqual([], payload["result"]["pruned"])
+        apply.assert_not_called()
 
     def test_a_ready_card_goes_to_its_claim_with_the_project_check_as_its_gate(self) -> None:
         # The local view already checked the card, so the claim skips its
@@ -354,8 +410,8 @@ class StartTests(VerbTestCase):
 
 
 class PruneTests(VerbTestCase):
-    def action(self, kind: str) -> CleanupAction:
-        return CleanupAction(path="/repo/.worktrees/old", action=kind, reason="claim was released")
+    def action(self, kind: str, path: str = "/repo/.worktrees/old", **kwargs: Any) -> CleanupAction:
+        return CleanupAction(path=path, action=kind, reason="claim was released", **kwargs)
 
     def test_nothing_orphaned_costs_no_github_read(self) -> None:
         with patch_cli("_plan_worktree_cleanup", return_value=[self.action("keep")]) as plan:
@@ -363,7 +419,7 @@ class PruneTests(VerbTestCase):
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
-        self.assertEqual([], pruned)
+        self.assertEqual(([], 0), pruned)
         self.assertFalse(plan.call_args.kwargs["fetch"])
         self.assertFalse(plan.call_args.kwargs["force"])
         self.provider.snapshot.assert_not_called()
@@ -383,10 +439,11 @@ class PruneTests(VerbTestCase):
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
-        self.assertEqual(["done"], pruned)
+        self.assertEqual((["done"], 0), pruned)
         second = plan.call_args_list[1]
+        self.assertIs(refreshed, second.args[3])
         self.assertFalse(second.kwargs["force"])
-        self.assertNotIn("fetch", second.kwargs)
+        self.assertTrue(second.kwargs["fetch"])
         self.assertEqual(confirmed, apply.call_args.args[1])
 
     def test_a_candidate_the_live_board_keeps_is_left_alone(self) -> None:
@@ -402,7 +459,73 @@ class PruneTests(VerbTestCase):
                 self.root, config(), self.provider, self.store, snapshot([])
             )
 
-        self.assertEqual([], pruned)
+        self.assertEqual(([], 0), pruned)
+        apply.assert_not_called()
+
+    def test_a_live_board_read_settles_candidates_without_another_read(self) -> None:
+        board = snapshot([])
+        self.store.refresh = mock.Mock()  # type: ignore[method-assign]
+        candidate = self.action(REMOVE)
+        with (
+            patch_cli("_plan_worktree_cleanup", return_value=[candidate]) as plan,
+            patch_cli("_apply_cleanup", return_value=["done"]),
+        ):
+            pruned = _prune_candidates(
+                self.root, config(), self.provider, self.store, [candidate], board=board
+            )
+
+        self.assertEqual((["done"], 0), pruned)
+        self.store.refresh.assert_not_called()
+        self.assertIs(board, plan.call_args.args[3])
+
+    def test_only_a_bounded_number_of_worktrees_are_removed_and_the_rest_deferred(self) -> None:
+        candidates = [
+            self.action(REMOVE, f"/repo/.worktrees/old-{index}")
+            for index in range(START_PRUNE_LIMIT + 4)
+        ]
+        missing = self.action(PRUNE, "/repo/.worktrees/gone")
+        chosen = [missing, *candidates[:START_PRUNE_LIMIT]]
+        with (
+            patch_cli("_plan_worktree_cleanup", return_value=chosen) as plan,
+            patch_cli("_apply_cleanup", side_effect=lambda _runner, values: values) as apply,
+        ):
+            removed, deferred = _prune_candidates(
+                self.root,
+                config(),
+                self.provider,
+                self.store,
+                [*candidates, missing],
+                board=snapshot([]),
+            )
+
+        self.assertEqual(4, deferred)
+        self.assertEqual(chosen, removed)
+        # Only the chosen worktrees are inspected again, and a missing
+        # directory costs one 'git worktree prune', so it is always included.
+        self.assertEqual({value.path for value in chosen}, plan.call_args.kwargs["paths"])
+        self.assertEqual(chosen, apply.call_args.args[1])
+
+    def test_the_request_just_claimed_is_never_pruned(self) -> None:
+        # A released card started again shows as unclaimed in a read made
+        # before its claim; its old worktree must survive.
+        reused = self.action(REMOVE, WORKTREE, kanbanlan_id=ALPHA)
+        claimed = {"kanbanlan_id": ALPHA, "worktree": WORKTREE}
+        with (
+            patch_cli("_plan_worktree_cleanup", return_value=[reused]) as plan,
+            patch_cli("_apply_cleanup") as apply,
+        ):
+            pruned = _prune_candidates(
+                self.root,
+                config(),
+                self.provider,
+                self.store,
+                [reused],
+                board=snapshot([]),
+                claimed=claimed,
+            )
+
+        self.assertEqual(([], 0), pruned)
+        plan.assert_not_called()
         apply.assert_not_called()
 
 

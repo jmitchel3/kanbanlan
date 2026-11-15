@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -68,10 +69,18 @@ def _plan_worktree_cleanup(
     *,
     force: bool,
     fetch: bool = True,
+    paths: Collection[str] | None = None,
 ) -> list[CleanupAction]:
-    """Plan what 'cleanup' does to each linked worktree against ``snapshot``."""
+    """Plan what 'cleanup' does to each linked worktree against ``snapshot``.
+
+    ``paths`` limits the plan, and the git inspection it pays for, to those
+    worktrees; every other one is left out of the plan rather than kept.
+    """
 
     entries = list_worktrees(runner)
+    if paths is not None:
+        wanted = set(paths)
+        entries = [entry for entry in entries if entry.path in wanted]
     main_path = str(primary_worktree(root))
     current_path = runner.run(
         ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"]
