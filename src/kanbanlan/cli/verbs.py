@@ -183,7 +183,7 @@ def _prune_candidates(
 
     if not candidates:
         return []
-    runner = Runner(root)
+    runner = AccountRunner(root, config)
     with status("Confirming orphaned worktrees against GitHub"):
         snapshot = store.refresh(provider)
         confirmed = removals(_plan_worktree_cleanup(root, config, runner, snapshot, force=False))
@@ -556,7 +556,8 @@ def _cmd_done(args: argparse.Namespace) -> int:
     created = pull_request is None
     if pull_request is None:
         with status(f"Pushing {branch}"):
-            runner.run(["git", "push", "--set-upstream", "origin", branch])
+            # The push authenticates as the bound account, like gh does.
+            gh.run(["git", "push", "--set-upstream", "origin", branch])
         command = [
             "gh",
             "pr",

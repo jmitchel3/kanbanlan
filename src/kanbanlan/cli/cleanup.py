@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from kanbanlan.accounts import AccountRunner
 from kanbanlan.cli.context import _context
 from kanbanlan.cli.output import _emit_result
 from kanbanlan.config import Config, primary_worktree
@@ -27,7 +28,8 @@ from kanbanlan.worktrees import (
 
 def _cmd_cleanup(args: argparse.Namespace) -> int:
     root, config, provider, store = _context(args)
-    runner = Runner(root)
+    # Its fetch authenticates as the bound account; local git runs untouched.
+    runner = AccountRunner(root, config)
     with status("Loading worktrees and current claim state"):
         snapshot = store.refresh(provider)
         plan = _plan_worktree_cleanup(root, config, runner, snapshot, force=args.force)

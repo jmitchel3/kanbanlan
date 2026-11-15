@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -18,12 +19,14 @@ from kanbanlan.accounts import (
     Account,
     AccountRunner,
     AccountStore,
+    git_account_env,
+    git_reaches_remote,
     owner_key,
     repository_key,
     resolve_account,
 )
 from kanbanlan.config import Config
-from kanbanlan.runner import CommandResult
+from kanbanlan.runner import CommandError, CommandResult, Runner
 
 
 def config(repository: str = "acme/widget", project_owner: str = "acme") -> Config:
@@ -219,3 +222,256 @@ class AccountRunnerTests(unittest.TestCase):
             runner.run(["gh", "api", "user"])
 
         self.assertIsNone(run.call_args.kwargs["env"])
+
+
+FAKE_GIT = """#!/bin/sh
+{
+  echo "args=$*"
+  echo "GH_TOKEN=${GH_TOKEN-<unset>}"
+  echo "GITHUB_TOKEN=${GITHUB_TOKEN-<unset>}"
+  echo "GIT_CONFIG_COUNT=${GIT_CONFIG_COUNT-<unset>}"
+  i=0
+  while [ "$i" -lt "${GIT_CONFIG_COUNT:-0}" ]; do
+    eval "echo GIT_CONFIG_KEY_$i=\\$GIT_CONFIG_KEY_$i"
+    eval "echo GIT_CONFIG_VALUE_$i=\\$GIT_CONFIG_VALUE_$i"
+    i=$((i + 1))
+  done
+} >> "$FAKE_GIT_LOG"
+if [ -n "$FAKE_GIT_FAIL" ]; then
+  echo "remote: Permission denied (token $GH_TOKEN)" >&2
+  exit 1
+fi
+"""
+
+# Stands in for gh's credential helper: answers with whatever GH_TOKEN it got.
+FAKE_GH = """#!/bin/sh
+if [ "$1 $2 $3" = "auth git-credential get" ]; then
+  cat >/dev/null
+  echo "username=x-access-token"
+  echo "password=${GH_TOKEN-none}"
+fi
+"""
+
+
+class RemoteGitTests(unittest.TestCase):
+    """git commands that reach the remote authenticate as the resolved account."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        for name, body in (("git", FAKE_GIT), ("gh", FAKE_GH)):
+            path = bin_dir / name
+            path.write_text(body)
+            path.chmod(0o755)
+        self.log = self.root / "git.log"
+        patcher = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_GIT_LOG": str(self.log)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in (ACCOUNT_ENV, "GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_COUNT", "FAKE_GIT_FAIL"):
+            os.environ.pop(name, None)
+        self.store = AccountStore(self.root / "state")
+
+    def runner(self, *, bound="acme", active="j-other", resolver=None) -> AccountRunner:
+        self.token_lookups: list[str] = []
+
+        def tokens(host, login):
+            self.token_lookups.append(login)
+            return f"secret-token-for-{login}"
+
+        return AccountRunner(
+            self.root,
+            config(),
+            resolver=resolver or (lambda _config: Account("github.com", bound, "test")),
+            token_lookup=tokens,
+            active_lookup=lambda _host: active,
+        )
+
+    def recorded(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for line in self.log.read_text().splitlines():
+            name, _, value = line.partition("=")
+            values[name] = value
+        return values
+
+    def assert_scoped(self, token: str) -> None:
+        values = self.recorded()
+        self.assertEqual(token, values["GH_TOKEN"])
+        self.assertEqual("<unset>", values["GITHUB_TOKEN"])
+        self.assertEqual("2", values["GIT_CONFIG_COUNT"])
+        self.assertEqual("credential.https://github.com.helper", values["GIT_CONFIG_KEY_0"])
+        self.assertEqual("", values["GIT_CONFIG_VALUE_0"])
+        self.assertEqual("!gh auth git-credential", values["GIT_CONFIG_VALUE_1"])
+
+    def assert_untouched(self) -> None:
+        values = self.recorded()
+        self.assertEqual("<unset>", values["GH_TOKEN"])
+        self.assertEqual("<unset>", values["GIT_CONFIG_COUNT"])
+
+    def test_push_authenticates_as_the_bound_account_when_another_is_active(self) -> None:
+        self.runner().run(["git", "push", "--set-upstream", "origin", "work/x"])
+
+        self.assert_scoped("secret-token-for-acme")
+
+    def test_fetch_ls_remote_and_option_prefixed_commands_are_scoped(self) -> None:
+        for command in (
+            ["git", "fetch", "origin", "main"],
+            ["git", "ls-remote", "origin"],
+            ["git", "-C", str(self.root), "fetch", "origin"],
+            ["git", "-c", "core.askPass=", "pull"],
+            ["git", "remote", "update"],
+        ):
+            with self.subTest(command=command):
+                self.log.unlink(missing_ok=True)
+                self.runner().run(command)
+                self.assert_scoped("secret-token-for-acme")
+
+    def test_local_git_commands_run_untouched_and_never_resolve(self) -> None:
+        resolver = mock.Mock()
+        runner = self.runner(resolver=resolver)
+        for command in (
+            ["git", "status"],
+            ["git", "worktree", "add", "-b", "work/x", "/tmp/x", "origin/main"],
+            ["git", "remote", "get-url", "origin"],
+            ["git", "-C", "fetch", "status"],
+        ):
+            runner.run(command)
+        resolver.assert_not_called()
+        self.assertNotIn("GH_TOKEN=secret", self.log.read_text())
+
+    def test_the_bound_account_being_active_leaves_git_untouched(self) -> None:
+        self.runner(bound="acme", active="Acme").run(["git", "push", "origin", "work/x"])
+
+        self.assert_untouched()
+
+    def test_no_resolved_account_leaves_git_untouched(self) -> None:
+        self.runner(resolver=lambda _config: None).run(["git", "fetch", "origin"])
+
+        self.assert_untouched()
+
+    def test_an_unresolvable_account_leaves_git_to_its_own_credentials(self) -> None:
+        def ambiguous(_config):
+            raise RuntimeError("cannot choose a GitHub account")
+
+        self.runner(resolver=ambiguous).run(["git", "fetch", "origin"])
+
+        self.assert_untouched()
+
+    def test_the_environment_account_is_used_for_git(self) -> None:
+        os.environ[ACCOUNT_ENV] = "acme-bot"
+        runner = self.runner(
+            resolver=lambda value: resolve_account(value, store=self.store, persist=False)
+        )
+
+        runner.run(["git", "push", "origin", "work/x"])
+
+        self.assert_scoped("secret-token-for-acme-bot")
+        self.assertEqual(["acme-bot"], self.token_lookups)
+
+    def test_an_ambient_token_is_replaced_for_a_bound_account(self) -> None:
+        os.environ["GH_TOKEN"] = "ambient-token"
+        os.environ["GITHUB_TOKEN"] = "ambient-token"
+
+        self.runner(active="acme").run(["git", "fetch", "origin"])
+
+        self.assert_scoped("secret-token-for-acme")
+
+    def test_existing_git_config_environment_is_extended_not_replaced(self) -> None:
+        os.environ["GIT_CONFIG_COUNT"] = "1"
+        os.environ["GIT_CONFIG_KEY_0"] = "user.name"
+        os.environ["GIT_CONFIG_VALUE_0"] = "Someone"
+
+        self.runner().run(["git", "fetch", "origin"])
+
+        values = self.recorded()
+        self.assertEqual("3", values["GIT_CONFIG_COUNT"])
+        self.assertEqual("user.name", values["GIT_CONFIG_KEY_0"])
+        self.assertEqual("credential.https://github.com.helper", values["GIT_CONFIG_KEY_1"])
+        self.assertEqual("!gh auth git-credential", values["GIT_CONFIG_VALUE_2"])
+
+    def test_a_failure_never_reveals_the_token(self) -> None:
+        os.environ["FAKE_GIT_FAIL"] = "1"
+
+        with self.assertRaises(CommandError) as raised:
+            self.runner().run(["git", "push", "origin", "work/x"])
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        self.assertNotIn("secret-token", raised.exception.result.stderr)
+        self.assertIn("[redacted]", str(raised.exception))
+        result = self.runner().run(["git", "push", "origin", "work/x"], check=False)
+        self.assertNotIn("secret-token", result.stderr)
+
+    def test_the_token_is_never_written_to_git_config(self) -> None:
+        self.runner().run(["git", "push", "origin", "work/x"])
+
+        self.assertNotIn("secret-token", "".join(self.recorded()["args"]))
+        self.assertFalse((self.root / ".git").exists())
+
+
+class GitCredentialEnvironmentTests(unittest.TestCase):
+    """Real git asks gh, with the bound token, even over a configured helper."""
+
+    def test_real_git_resolves_credentials_through_gh_with_the_token(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            gh = bin_dir / "gh"
+            gh.write_text(FAKE_GH)
+            gh.chmod(0o755)
+            global_config = root / "gitconfig"
+            # The keychain-style helper the environment must override.
+            global_config.write_text(
+                '[credential]\n\thelper = "!f() { echo password=wrong-account; }; f"\n'
+            )
+            env = {
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                **git_account_env("github.com", "bound-token"),
+            }
+            result = Runner(root, env=env).run(
+                ["git", "credential", "fill"],
+                input_text="protocol=https\nhost=github.com\n\n",
+            )
+
+        self.assertIn("password=bound-token", result.stdout)
+        self.assertNotIn("wrong-account", result.stdout)
+
+
+class GitRemoteDetectionTests(unittest.TestCase):
+    def test_only_commands_that_contact_a_remote_qualify(self) -> None:
+        self.assertTrue(git_reaches_remote(["git", "push"]))
+        self.assertTrue(git_reaches_remote(["/usr/bin/git", "--no-pager", "fetch"]))
+        self.assertTrue(git_reaches_remote(["git", "-C", "/x", "ls-remote", "origin"]))
+        self.assertTrue(git_reaches_remote(["git", "submodule", "update", "--init"]))
+        self.assertFalse(git_reaches_remote(["git", "worktree", "add", "x", "origin/main"]))
+        self.assertFalse(git_reaches_remote(["git", "remote", "get-url", "origin"]))
+        self.assertFalse(git_reaches_remote(["git"]))
+        self.assertFalse(git_reaches_remote(["gh", "fetch"]))
+
+
+class StartFetchTests(unittest.TestCase):
+    """start fetches the default branch as the bound account."""
+
+    def test_start_fetches_through_the_account_runner(self) -> None:
+        from kanbanlan.cli import lifecycle
+
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(("git",), 0, "", "")
+        with mock.patch.object(lifecycle, "AccountRunner", return_value=runner) as factory:
+            self.assertTrue(lifecycle._fetch_default_branch(Path("/repo"), config()))
+            lifecycle._create_worktree(Path("/repo"), config(), "work/x", Path("/repo/.w/x"))
+
+        self.assertEqual(2, factory.call_count)
+        commands = [call.args[0] for call in runner.run.call_args_list]
+        self.assertEqual(["git", "fetch", "origin", "main"], commands[0])
+        self.assertIn(["git", "fetch", "origin", "main"], commands[1:])

@@ -17,6 +17,12 @@ Anything else is an error naming the logged-in accounts. An explicit
 ``GH_TOKEN`` or ``GITHUB_TOKEN`` in the environment (CI, a scoped token) is
 honored as is when no account was requested, since it already names one
 identity.
+
+git commands that reach the remote (fetch, push, ls-remote, ...) authenticate
+through a credential helper, which would otherwise answer as gh's active
+account. When the resolved account is not the active one, those commands get
+the resolved account's token and gh as their credential helper for the host,
+in their own process environment only.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from typing import Any
 
 from kanbanlan.config import Config, state_dir
 from kanbanlan.locks import FileLock
-from kanbanlan.runner import CommandResult, Runner
+from kanbanlan.runner import CommandError, CommandResult, Runner
 
 ACCOUNT_ENV = "KANBANLAN_GITHUB_ACCOUNT"
 TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
@@ -216,6 +222,70 @@ def account_token(hostname: str, login: str) -> str:
     return token
 
 
+def active_login(hostname: str) -> str | None:
+    """Return gh's active account on ``hostname``, read from its config file."""
+
+    result = _ambient_runner(hostname).run(
+        ["gh", "config", "get", "user", "--host", hostname], check=False
+    )
+    login = result.stdout.strip()
+    return login if result.returncode == 0 and login else None
+
+
+# git subcommands that talk to a remote, so need credentials.
+GIT_REMOTE_SUBCOMMANDS = frozenset({"fetch", "push", "pull", "ls-remote", "clone"})
+GIT_REMOTE_REMOTE_ACTIONS = frozenset({"update", "prune", "show", "set-head"})
+# git global options that take a separate value.
+_GIT_VALUE_OPTIONS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+)
+
+
+def git_reaches_remote(args: list[str]) -> bool:
+    """Report whether a git command line contacts a remote."""
+
+    if not args or Path(args[0]).name != "git":
+        return False
+    index = 1
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in _GIT_VALUE_OPTIONS else 1
+    if index >= len(args):
+        return False
+    subcommand = args[index]
+    if subcommand in GIT_REMOTE_SUBCOMMANDS:
+        return True
+    if subcommand == "remote":
+        return index + 1 < len(args) and args[index + 1] in GIT_REMOTE_REMOTE_ACTIONS
+    if subcommand == "submodule":
+        return index + 1 < len(args) and args[index + 1] in {"update", "sync", "add"}
+    return False
+
+
+def git_account_env(hostname: str, token: str) -> dict[str, str | None]:
+    """Environment that makes git authenticate to ``hostname`` with ``token``.
+
+    gh's credential helper answers with ``GH_TOKEN``. Configuring it through
+    ``GIT_CONFIG_*`` (after an empty value that clears any helper from git
+    config, such as a keychain) keeps the token out of git config and argv.
+    """
+
+    try:
+        count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        count = 0
+    key = f"credential.https://{hostname}.helper"
+    env = account_env(hostname, token)
+    for offset, value in enumerate(("", "!gh auth git-credential")):
+        env[f"GIT_CONFIG_KEY_{count + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{count + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(count + 2)
+    return env
+
+
+def redact(text: str, secret: str) -> str:
+    return text.replace(secret, "[redacted]") if secret and text else text
+
+
 def account_env(hostname: str, token: str) -> dict[str, str | None]:
     return {
         "GH_HOST": hostname,
@@ -229,8 +299,10 @@ class AccountRunner(Runner):
     """A runner whose gh commands act as one resolved account.
 
     Resolution and the token lookup happen on the first gh command, so a
-    command that never reaches GitHub never pays for them. Other programs
-    (git) run with the environment untouched.
+    command that never reaches GitHub never pays for them. git commands that
+    reach a remote authenticate as the same account when it is not gh's
+    active one (see ``git_account_env``); other programs, and every other
+    git command, run with the environment untouched.
     """
 
     def __init__(
@@ -240,11 +312,16 @@ class AccountRunner(Runner):
         *,
         resolver: Callable[[Config], Account | None] = resolve_account,
         token_lookup: Callable[[str, str], str] = account_token,
+        active_lookup: Callable[[str], str | None] = active_login,
     ):
         super().__init__(cwd)
         self.config = config
         self._resolver = resolver
         self._token_lookup = token_lookup
+        self._active_lookup = active_lookup
+        self._token: str | None = None
+        self._git_env: dict[str, str | None] | None = None
+        self._git_resolved = False
         self._account: Account | None = None
         self._gh_env: dict[str, str | None] | None = None
         self._resolved = False
@@ -264,11 +341,37 @@ class AccountRunner(Runner):
             account = self._resolver(self.config)
             if account is not None:
                 token = self._token_lookup(account.hostname, account.login)
+                self._token = token
                 self._gh_env = account_env(account.hostname, token)
             self._account = account
             self._resolved = True
 
+    def _resolve_git(self) -> dict[str, str | None] | None:
+        """Return the environment remote git commands need, or None for none."""
+
+        try:
+            self._resolve()
+        except RuntimeError:
+            # gh commands report an unresolvable account; git keeps its own auth.
+            return None
+        with self._resolve_lock:
+            if not self._git_resolved:
+                account = self._account
+                if account is not None and self._token:
+                    ambient_token = any(os.environ.get(name) for name in TOKEN_ENVS)
+                    active = None if ambient_token else self._active_lookup(account.hostname)
+                    if ambient_token or (active or "").lower() != account.login.lower():
+                        self._git_env = git_account_env(account.hostname, self._token)
+                self._git_resolved = True
+            return self._git_env
+
     def _execute(self, args: list[str], **kwargs: Any) -> CommandResult:
+        if git_reaches_remote(args):
+            git_env = self._resolve_git()
+            if git_env is None:
+                return super()._execute(args, **kwargs)
+            scoped = Runner(self.cwd, env={**(self.env or {}), **git_env})
+            return self._redacted(scoped, args, **kwargs)
         if not args or Path(args[0]).name != "gh":
             return super()._execute(args, **kwargs)
         self._resolve()
@@ -276,3 +379,20 @@ class AccountRunner(Runner):
             return super()._execute(args, **kwargs)
         scoped = Runner(self.cwd, env={**(self.env or {}), **self._gh_env})
         return scoped._execute(args, **kwargs)
+
+    def _redacted(self, runner: Runner, args: list[str], **kwargs: Any) -> CommandResult:
+        token = self._token or ""
+        try:
+            result = runner._execute(args, **kwargs)
+        except CommandError as exc:
+            raise CommandError(_redact_result(exc.result, token)) from None
+        return _redact_result(result, token)
+
+
+def _redact_result(result: CommandResult, token: str) -> CommandResult:
+    return CommandResult(
+        args=tuple(redact(value, token) for value in result.args),
+        returncode=result.returncode,
+        stdout=redact(result.stdout, token),
+        stderr=redact(result.stderr, token),
+    )
