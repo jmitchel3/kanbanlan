@@ -351,9 +351,10 @@ kanbanlan status
 
 `start` takes a Kanbanlan ID or `#number` for an existing request, or a title
 for a new one. In one call it captures the request when needed, triages it
-from Inbox to Ready, reads the Project for other active claims, prunes
-orphaned request worktrees (only what `cleanup --apply` would remove), and
-claims the request in a new worktree. It refuses a request another session
+from Inbox to Ready, reads the Project for other active claims, claims the
+request in a new worktree, and then prunes up to three orphaned request
+worktrees (only what `cleanup --apply` would remove), reporting any others
+for `kanbanlan admin cleanup --apply`. It refuses a request another session
 claims and a session that already owns a different request; starting the
 request the session already owns prints its worktree again. Other active
 claims and their touchpoints are printed, and returned under `overlap` with

@@ -10,7 +10,7 @@ from unittest import mock
 
 from cli_patch import patch_cli
 
-from kanbanlan.cli.cleanup import _cmd_cleanup
+from kanbanlan.cli.cleanup import _cmd_cleanup, _plan_worktree_cleanup
 from kanbanlan.cli.parser import build_parser
 from kanbanlan.config import Config
 from kanbanlan.runner import CommandResult
@@ -463,6 +463,33 @@ class CleanupCommandTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("claude-1", output)
         self.assertNotIn(["git", "worktree", "remove", WORKTREE], self.git_calls(runner))
+
+
+class PlanPathsTests(unittest.TestCase):
+    def test_paths_limit_the_plan_and_its_inspection(self) -> None:
+        other = f"/repo/.worktrees/{OTHER_IDENTITY.lower()}-other"
+        entries = [entry(), entry(path=other, branch=f"work/{OTHER_IDENTITY.lower()}-other")]
+        board = snapshot([item(), item(kanbanlan_id=OTHER_IDENTITY)])
+        runner = mock.Mock()
+        runner.run.return_value = CommandResult(args=["git"], returncode=0, stdout=MAIN, stderr="")
+        inspected: list[str] = []
+
+        def inspect(_runner: Any, value: WorktreeEntry, **_kwargs: Any) -> WorktreeStatus:
+            inspected.append(value.path)
+            return pushed()
+
+        with (
+            patch_cli("primary_worktree", return_value=Path(MAIN)),
+            patch_cli("list_worktrees", return_value=entries),
+            patch_cli("inspect_worktree", side_effect=inspect),
+        ):
+            plan = _plan_worktree_cleanup(
+                Path(MAIN), config(), runner, board, force=False, fetch=False, paths={WORKTREE}
+            )
+
+        self.assertEqual([WORKTREE], [value.path for value in plan])
+        self.assertEqual(REMOVE, plan[0].action)
+        self.assertEqual([WORKTREE], inspected)
 
 
 class CleanupParserTests(unittest.TestCase):

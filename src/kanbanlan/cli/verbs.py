@@ -31,7 +31,7 @@ from kanbanlan.providers import CoordinationProvider
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.ui import field, section, status, success, warning
-from kanbanlan.worktrees import CleanupAction, checkout_identity, removals
+from kanbanlan.worktrees import PRUNE, CleanupAction, checkout_identity, removals
 
 # Commands that take --actor-session, so a verb's own one passes through.
 ACTOR_STEP_COMMANDS = frozenset({"capture", "triage", "claim", "release", "review", "close"})
@@ -43,6 +43,12 @@ DONE_LINK_DELAYS = (0.0, 2.0, 3.0, 5.0)
 
 
 DEFAULT_DROP_REASON = "dropped by its owner"
+
+
+# Removing a worktree deletes every file in it, dependencies and build output
+# included, which takes seconds in a large checkout. 'start' removes at most
+# this many and leaves the rest to 'kanbanlan admin cleanup --apply'.
+START_PRUNE_LIMIT = 3
 
 
 def _step_args(
@@ -156,12 +162,13 @@ def _prune_orphaned_worktrees(
     provider: CoordinationProvider,
     store: CacheStore,
     view: dict[str, Any],
-) -> list[dict[str, Any]]:
+    **options: Any,
+) -> tuple[list[dict[str, Any]], int]:
     """Remove only what 'cleanup --apply' would remove, and report it."""
 
     with status("Checking for orphaned request worktrees"):
         candidates = _orphan_candidates(root, config, view)
-    return _prune_candidates(root, config, provider, store, candidates)
+    return _prune_candidates(root, config, provider, store, candidates, **options)
 
 
 def _orphan_candidates(root: Path, config: Config, view: dict[str, Any]) -> list[CleanupAction]:
@@ -172,24 +179,64 @@ def _orphan_candidates(root: Path, config: Config, view: dict[str, Any]) -> list
     )
 
 
+def _is_claimed(action: CleanupAction, claimed: dict[str, Any] | None) -> bool:
+    """Report whether ``action`` touches the request or worktree start just claimed."""
+
+    if not claimed:
+        return False
+    identity = normalize_kanbanlan_id(str(claimed.get("kanbanlan_id") or ""))
+    if identity and action.kanbanlan_id == identity:
+        return True
+    return bool(claimed.get("worktree")) and action.path == claimed.get("worktree")
+
+
 def _prune_candidates(
     root: Path,
     config: Config,
     provider: CoordinationProvider,
     store: CacheStore,
     candidates: list[CleanupAction],
-) -> list[dict[str, Any]]:
-    """Decide each candidate exactly as cleanup does, against a fresh board read."""
+    *,
+    board: dict[str, Any] | None = None,
+    claimed: dict[str, Any] | None = None,
+    fetch: bool = True,
+    limit: int = START_PRUNE_LIMIT,
+) -> tuple[list[dict[str, Any]], int]:
+    """Decide up to ``limit`` candidates exactly as cleanup does, and remove them.
 
-    if not candidates:
-        return []
+    ``board`` is a live board read this command already made, which settles
+    the candidates without a second read; without one, the board is read
+    now. The request just claimed is never a candidate, however that read
+    shows it. Returns what was removed and how many candidates were left for
+    'kanbanlan admin cleanup --apply'.
+    """
+
+    candidates = [value for value in candidates if not _is_claimed(value, claimed)]
+    # One 'git worktree prune' clears every missing directory, so those cost
+    # nothing; each removal deletes a whole checkout, so only a few run here.
+    missing = [value for value in candidates if value.action == PRUNE]
+    present = [value for value in candidates if value.action != PRUNE]
+    removable = present[: max(0, limit)]
+    chosen = [*missing, *removable]
+    deferred = len(present) - len(removable)
+    if not chosen:
+        return [], deferred
     runner = AccountRunner(root, config)
     with status("Confirming orphaned worktrees against GitHub"):
-        snapshot = store.refresh(provider)
-        confirmed = removals(_plan_worktree_cleanup(root, config, runner, snapshot, force=False))
+        snapshot = board or store.refresh(provider)
+        plan = _plan_worktree_cleanup(
+            root,
+            config,
+            runner,
+            snapshot,
+            force=False,
+            fetch=fetch,
+            paths={value.path for value in chosen},
+        )
+        confirmed = [value for value in removals(plan) if not _is_claimed(value, claimed)]
     if not confirmed:
-        return []
-    return _apply_cleanup(runner, confirmed)
+        return [], deferred
+    return _apply_cleanup(runner, confirmed), deferred
 
 
 def _check_session_free(
@@ -305,8 +352,20 @@ def _cmd_start(args: argparse.Namespace) -> int:
         claimed = _run_step(args, claim_argv, **handoff)
         # The claim checked the Project already; this only collects it.
         overlap_result = overlap()
+        board = live_read.result()
         candidates = orphan_scan.result()
-    pruned = _prune_candidates(root, config, provider, store, candidates)
+    # The live read settles the candidates, so pruning costs no second board
+    # read, and the claim just fetched the default branch for merge state.
+    pruned, deferred = _prune_candidates(
+        root,
+        config,
+        provider,
+        store,
+        candidates,
+        board=board,
+        claimed=claimed,
+        fetch=False,
+    )
 
     requests = overlap_result.get("open_requests", [])
     others = [
@@ -348,6 +407,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
             for pull_request in overlap_result.get("unlinked_open_pull_requests", [])
         ],
         pruned=pruned,
+        deferred=deferred,
     )
 
 
@@ -363,6 +423,7 @@ def _emit_start(
     others: list[dict[str, Any]] | None = None,
     unlinked: list[dict[str, Any]] | None = None,
     pruned: list[dict[str, Any]] | None = None,
+    deferred: int = 0,
 ) -> int:
     others = others or []
     result = {
@@ -375,6 +436,7 @@ def _emit_start(
         "triaged": triaged,
         "resumed": resumed,
         "pruned": pruned or [],
+        "cleanup_deferred": deferred,
         "overlap": {
             "active_claims": others,
             "unlinked_open_pull_requests": unlinked or [],
@@ -394,6 +456,11 @@ def _emit_start(
         success(f"Moved {label} to Ready")
     for value in pruned or []:
         success(f"Pruned orphaned worktree {value['path']} ({value['reason']})")
+    if deferred:
+        warning(
+            f"{deferred} more orphaned worktree(s) may be removable; "
+            "run 'kanbanlan admin cleanup --apply'"
+        )
     if others:
         warning(
             f"{len(others)} other active claim(s) on the Project; "
