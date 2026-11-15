@@ -471,7 +471,9 @@ class DoneTests(VerbTestCase):
         self.assertIn(f"Kanbanlan: {ALPHA}", body)
         self.assertIn("Closes #7", body)
         self.assertEqual(BRANCH, create[create.index("--head") + 1])
-        self.assertIn(["git", "push", "--set-upstream", "origin", BRANCH], self.git.calls)
+        # The push goes through the account runner, so it authenticates as the bound account.
+        self.assertIn(["git", "push", "--set-upstream", "origin", BRANCH], self.gh.calls)
+        self.assertNotIn(["git", "push", "--set-upstream", "origin", BRANCH], self.git.calls)
         self.provider.set_request_status.assert_called_once_with(7, "status:review")
 
     def test_done_reuses_an_open_pull_request(self) -> None:
@@ -482,7 +484,7 @@ class DoneTests(VerbTestCase):
         self.assertEqual(0, code)
         self.assertFalse(payload["result"]["created_pull_request"])
         self.assertEqual([], self.gh_calls("create"))
-        self.assertNotIn(["git", "push", "--set-upstream", "origin", BRANCH], self.git.calls)
+        self.assertNotIn(["git", "push", "--set-upstream", "origin", BRANCH], self.gh.calls)
 
     def test_done_waits_briefly_for_a_new_pull_request_to_link(self) -> None:
         self.gh.answers = {

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from kanbanlan.accounts import AccountRunner
 from kanbanlan.cli.cards import (
     _issue,
     _post_claim,
@@ -386,7 +387,9 @@ def _claim_failure(
 def _fetch_default_branch(root: Path, config: Config) -> bool:
     """Fetch the default branch for a new worktree; report whether it worked."""
 
-    result = Runner(root).run(["git", "fetch", "origin", config.default_branch], check=False)
+    result = AccountRunner(root, config).run(
+        ["git", "fetch", "origin", config.default_branch], check=False
+    )
     return result.returncode == 0
 
 
@@ -443,7 +446,7 @@ def _create_worktree(
     *,
     fetch: bool = True,
 ) -> None:
-    runner = Runner(root)
+    runner = AccountRunner(root, config)
     if fetch:
         runner.run(["git", "fetch", "origin", config.default_branch])
     branch_exists = (

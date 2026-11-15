@@ -385,7 +385,7 @@ class CleanupCommandTests(unittest.TestCase):
                 "_context",
                 return_value=(Path(MAIN), config(), provider, store),
             ),
-            patch_cli("Runner", return_value=runner),
+            patch_cli("AccountRunner", return_value=runner),
             patch_cli("primary_worktree", return_value=Path(MAIN)),
             patch_cli("list_worktrees", return_value=entries),
             patch_cli(
