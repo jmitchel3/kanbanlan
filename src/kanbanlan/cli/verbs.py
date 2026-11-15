@@ -31,7 +31,13 @@ from kanbanlan.providers import CoordinationProvider
 from kanbanlan.runner import Runner
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.ui import field, section, status, success, warning
-from kanbanlan.worktrees import PRUNE, CleanupAction, checkout_identity, removals
+from kanbanlan.worktrees import (
+    PRUNE,
+    CleanupAction,
+    checkout_identity,
+    list_worktrees,
+    removals,
+)
 
 # Commands that take --actor-session, so a verb's own one passes through.
 ACTOR_STEP_COMMANDS = frozenset({"capture", "triage", "claim", "release", "review", "close"})
@@ -179,6 +185,21 @@ def _orphan_candidates(root: Path, config: Config, view: dict[str, Any]) -> list
     )
 
 
+def _existing_worktree_paths(root: Path) -> set[str]:
+    """List the linked worktrees that exist before 'start' reads the board.
+
+    A claim is visible on GitHub before its worktree is added, so a worktree
+    listed before the live read began has its claim in that read. One added
+    later may belong to a claim the read missed, so pruning skips it. A
+    listing git cannot give prunes nothing.
+    """
+
+    try:
+        return {entry.path for entry in list_worktrees(Runner(root))}
+    except Exception:  # noqa: BLE001 - doubt must never delete work
+        return set()
+
+
 def _is_claimed(action: CleanupAction, claimed: dict[str, Any] | None) -> bool:
     """Report whether ``action`` touches the request or worktree start just claimed."""
 
@@ -310,6 +331,9 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # the claim is refused (and released) before the card moves if either
     # read shows this session already owns another card. Anything that
     # writes first (a capture, a triage) waits for those checks instead.
+    # Listed before the live read starts, so every candidate's claim, if it
+    # has one, is in that read.
+    existing = _existing_worktree_paths(root)
     with ThreadPoolExecutor(max_workers=3) as pool:
         overlap_read = pool.submit(_read_overlap, config, provider, store)
         live_read = pool.submit(_live_claims, store, provider, session)
@@ -353,7 +377,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         # The claim checked the Project already; this only collects it.
         overlap_result = overlap()
         board = live_read.result()
-        candidates = orphan_scan.result()
+        candidates = [value for value in orphan_scan.result() if value.path in existing]
     # The live read settles the candidates, so pruning costs no second board
     # read, and the claim just fetched the default branch for merge state.
     pruned, deferred = _prune_candidates(

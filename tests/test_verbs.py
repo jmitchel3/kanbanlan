@@ -200,7 +200,10 @@ class StartTests(VerbTestCase):
         self.cleanup_plan = patch_cli("_plan_worktree_cleanup", return_value=[])
         self.cleanup_plan.start()
         self.addCleanup(self.cleanup_plan.stop)
-        for name, value in (("_claim_checkout", (BRANCH, WORKTREE)),):
+        for name, value in (
+            ("_claim_checkout", (BRANCH, WORKTREE)),
+            ("_existing_worktree_paths", {"/repo/.worktrees/old"}),
+        ):
             patcher = patch_cli(name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -351,6 +354,26 @@ class StartTests(VerbTestCase):
         # The claim fetched the default branch already.
         self.assertFalse(confirm.kwargs["fetch"])
         self.assertEqual({orphan.path}, confirm.kwargs["paths"])
+
+    def test_a_worktree_added_after_the_live_read_began_is_not_pruned(self) -> None:
+        # Its claim may postdate the live read, which would show it unclaimed.
+        self.write_snapshot([item(8, BETA, "Ready")])
+        live = snapshot([item(8, BETA, "Ready")])
+        self.store.refresh = mock.Mock(return_value=live)  # type: ignore[method-assign]
+        late = CleanupAction(path="/repo/.worktrees/late", action=REMOVE, reason="claim released")
+        self.cleanup_plan.stop()
+        self.cleanup_plan = patch_cli("_plan_worktree_cleanup", return_value=[late])
+        self.cleanup_plan.start()
+        self.addCleanup(self.cleanup_plan.stop)
+        with (
+            patch_cli("_orphan_candidates", return_value=[late]),
+            patch_cli("_apply_cleanup") as apply,
+        ):
+            code, payload, _ = self.run_cli("start", "#8", "--session", "s1")
+
+        self.assertEqual(0, code)
+        self.assertEqual([], payload["result"]["pruned"])
+        apply.assert_not_called()
 
     def test_a_ready_card_goes_to_its_claim_with_the_project_check_as_its_gate(self) -> None:
         # The local view already checked the card, so the claim skips its

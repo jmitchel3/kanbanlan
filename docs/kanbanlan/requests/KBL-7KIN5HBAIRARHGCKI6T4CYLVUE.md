@@ -15,6 +15,7 @@ start took 100s to over 3 minutes in repos with many closed-request worktrees (d
 - `start` now settles prune candidates against the live claim read it already made, so pruning costs no second board read. Without a session (no live read) it still reads the board once before removing anything.
 - The claim already fetches the default branch, so the confirming plan skips its own fetch. A stale `origin/main` can only overcount unmerged commits, which keeps more, never less.
 - `start` removes at most `START_PRUNE_LIMIT` (3) worktrees and re-inspects only those; missing directories are always included since one `git worktree prune` clears them. The rest are reported as `cleanup_deferred` (JSON) and a warning pointing at `kanbanlan admin cleanup --apply`.
+- Candidates are limited to worktrees listed before the live read starts. A claim is visible on GitHub before its worktree is added, so such a worktree's claim is in that read; one added later by a concurrent claim could look unclaimed, so it is skipped.
 - The request just claimed is excluded by Kanbanlan ID and worktree path, because the live read predates its claim and would show it unclaimed.
 - `_plan_worktree_cleanup` gains `paths` to limit planning and inspection; `admin cleanup` is unchanged. The safety rules (never remove a worktree with uncommitted or unpushed work) are the same `plan_cleanup` decisions as before.
 
