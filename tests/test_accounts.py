@@ -11,7 +11,10 @@ from unittest import mock
 
 from kanbanlan.accounts import (
     ACCOUNT_ENV,
+    PROBE_TIMEOUT_SECONDS,
+    SOURCE_ACTIVE_ACCESS,
     SOURCE_ENVIRONMENT,
+    SOURCE_ONLY_ACCESS,
     SOURCE_ONLY_ACCOUNT,
     SOURCE_OWNER,
     SOURCE_OWNER_MATCH,
@@ -19,6 +22,8 @@ from kanbanlan.accounts import (
     Account,
     AccountRunner,
     AccountStore,
+    account_env,
+    can_push_to,
     git_account_env,
     git_reaches_remote,
     owner_key,
@@ -66,8 +71,24 @@ class ResolutionTests(unittest.TestCase):
         self.directory.cleanup()
 
     def resolve(self, runner: StatusRunner, **kwargs) -> Account | None:
+        pushers = {login.lower() for login in kwargs.pop("pushers", ())}
+        unknown = {login.lower() for login in kwargs.pop("unknown", ())}
+        active = kwargs.pop("active", None)
+        self.probed: list[str] = []
+
+        def can_push(hostname: str, repository: str, login: str) -> bool | None:
+            self.probed.append(login)
+            if login.lower() in unknown:
+                return None
+            return login.lower() in pushers
+
         return resolve_account(
-            kwargs.pop("cfg", config()), store=self.store, runner=runner, **kwargs
+            kwargs.pop("cfg", config()),
+            store=self.store,
+            runner=runner,
+            can_push=can_push,
+            active=lambda _hostname: active,
+            **kwargs,
         )
 
     def test_environment_account_wins_over_every_binding(self) -> None:
@@ -128,6 +149,63 @@ class ResolutionTests(unittest.TestCase):
             self.resolve(StatusRunner("beta", "alpha"))
         self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
 
+    def test_the_active_account_is_chosen_when_it_can_push_and_is_persisted(self) -> None:
+        runner = StatusRunner("j-paracord", "jmitchel3", "cooper")
+
+        account = self.resolve(runner, pushers=("j-paracord", "cooper"), active="j-paracord")
+        again = self.resolve(runner)
+
+        self.assertEqual(("j-paracord", SOURCE_ACTIVE_ACCESS), (account.login, account.source))
+        self.assertEqual(("j-paracord", SOURCE_REPOSITORY), (again.login, again.source))
+        self.assertEqual([], self.probed)
+
+    def test_the_active_account_is_probed_first_and_alone_when_it_can_push(self) -> None:
+        self.resolve(StatusRunner("alpha", "beta", "gamma"), pushers=("beta",), active="beta")
+
+        self.assertEqual(["beta"], self.probed)
+
+    def test_no_account_that_can_push_is_an_error_naming_the_accounts(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError, "alpha, beta are logged in and none owns or can push"
+        ):
+            self.resolve(StatusRunner("alpha", "beta"), active="alpha")
+        self.assertEqual({"alpha", "beta"}, set(self.probed))
+
+    def test_an_unknown_probe_result_is_reported_and_never_guessed_around(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "could not check push access for gamma"):
+            self.resolve(
+                StatusRunner("alpha", "beta", "gamma"),
+                pushers=("beta",),
+                unknown=("gamma",),
+                active="alpha",
+            )
+        self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
+
+    def test_the_only_account_that_can_push_is_chosen_over_the_active_one(self) -> None:
+        account = self.resolve(
+            StatusRunner("alpha", "beta", "gamma"), pushers=("beta",), active="alpha"
+        )
+
+        self.assertEqual(("beta", SOURCE_ONLY_ACCESS), (account.login, account.source))
+
+    def test_several_pushers_without_the_active_one_is_an_error_naming_them(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "beta, gamma can all push.*account use"):
+            self.resolve(
+                StatusRunner("alpha", "beta", "gamma"), pushers=("gamma", "beta"), active="alpha"
+            )
+        self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
+
+    def test_an_owner_match_never_probes_access(self) -> None:
+        self.resolve(StatusRunner("other", "acme"), pushers=("other",), active="other")
+
+        self.assertEqual([], self.probed)
+
+    def test_show_does_not_persist_an_access_choice(self) -> None:
+        account = self.resolve(StatusRunner("alpha", "beta"), pushers=("beta",), persist=False)
+
+        self.assertEqual(("beta", SOURCE_ONLY_ACCESS), (account.login, account.source))
+        self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
+
     def test_no_logged_in_account_is_an_error(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "gh auth login"):
             self.resolve(StatusRunner())
@@ -158,6 +236,62 @@ class ResolutionTests(unittest.TestCase):
         self.assertFalse(self.store.unbind("github.com", repository_key("acme/widget")))
         self.assertEqual("org-bot", self.store.lookup("github.com", "acme/widget").login)
         self.assertEqual(0o600, os.stat(self.store.path).st_mode & 0o777)
+
+
+class ProbeRunner:
+    def __init__(self, result: CommandResult | None = None, error: Exception | None = None):
+        self.result = result
+        self.error = error
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def run(self, args, **kwargs):
+        self.calls.append((list(args), kwargs))
+        if self.error:
+            raise self.error
+        return self.result
+
+
+class PushProbeTests(unittest.TestCase):
+    def probe(self, runner: ProbeRunner) -> bool | None:
+        with mock.patch("kanbanlan.accounts.account_token", return_value="secret-token"):
+            return can_push_to("github.com", "acme/widget", "alpha", runner=runner)
+
+    def test_the_probe_asks_gh_for_push_permission_with_a_bounded_timeout(self) -> None:
+        runner = ProbeRunner(CommandResult((), 0, "true\n", ""))
+
+        self.assertTrue(self.probe(runner))
+        args, kwargs = runner.calls[0]
+        self.assertEqual(["gh", "api", "repos/acme/widget", "--jq", ".permissions.push"], args)
+        self.assertNotIn("secret-token", " ".join(args))
+        self.assertEqual(PROBE_TIMEOUT_SECONDS, kwargs["timeout"])
+
+    def test_false_and_not_found_mean_no_push_access(self) -> None:
+        self.assertFalse(self.probe(ProbeRunner(CommandResult((), 0, "false\n", ""))))
+        self.assertFalse(
+            self.probe(ProbeRunner(CommandResult((), 1, "", "gh: Not Found (HTTP 404)")))
+        )
+
+    def test_other_failures_and_timeouts_are_unknown(self) -> None:
+        self.assertIsNone(
+            self.probe(ProbeRunner(CommandResult((), 1, "", "HTTP 401: Bad credentials")))
+        )
+        timeout = CommandError(CommandResult(("gh",), 124, "", "timed out after 15s"))
+        self.assertIsNone(self.probe(ProbeRunner(error=timeout)))
+
+    def test_a_missing_token_is_unknown(self) -> None:
+        with mock.patch("kanbanlan.accounts.account_token", side_effect=RuntimeError("no login")):
+            self.assertIsNone(
+                can_push_to("github.com", "acme/widget", "alpha", runner=ProbeRunner())
+            )
+
+    def test_the_default_runner_carries_the_account_environment(self) -> None:
+        with (
+            mock.patch("kanbanlan.accounts.account_token", return_value="secret-token"),
+            mock.patch("kanbanlan.accounts.Runner") as runner_class,
+        ):
+            runner_class.return_value.run.return_value = CommandResult((), 0, "true", "")
+            can_push_to("github.com", "acme/widget", "alpha")
+        runner_class.assert_called_once_with(env=account_env("github.com", "secret-token"))
 
 
 class AccountRunnerTests(unittest.TestCase):
