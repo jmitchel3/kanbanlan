@@ -28,7 +28,12 @@ from kanbanlan.config import (
 from kanbanlan.github import REQUIRED_STATUS_OPTIONS, GitHub
 from kanbanlan.legacy import pending_legacy_changes, uninstall_worker, worker_leftovers
 from kanbanlan.runner import CommandError, Runner
-from kanbanlan.scaffold import PRIORITY_LABELS, STATUS_LABELS, scaffold_repository
+from kanbanlan.scaffold import (
+    NEEDS_REPAIR,
+    PRIORITY_LABELS,
+    STATUS_LABELS,
+    scaffold_repository,
+)
 from kanbanlan.snapshot import CacheStore
 from kanbanlan.ui import (
     BOLD,
@@ -347,6 +352,9 @@ def _print_scaffold_results(results: list[Any], root: Path) -> None:
     for result in results:
         marker = style(f"{result.action:<10}", CYAN if result.action != "unchanged" else DIM)
         print(f"  {marker} {result.path.relative_to(root)}")
+    for result in results:
+        if result.action == NEEDS_REPAIR:
+            warning(f"{result.path.relative_to(root)} was left unchanged: {result.detail}")
 
 
 def _project_reference(

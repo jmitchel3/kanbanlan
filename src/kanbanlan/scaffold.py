@@ -30,6 +30,10 @@ PRIORITY_LABELS = {
 class WriteResult:
     path: Path
     action: str
+    detail: str | None = None
+
+
+NEEDS_REPAIR = "needs repair"
 
 
 def scaffold_repository(root: Path, config: Config, *, force: bool = False) -> list[WriteResult]:
@@ -144,22 +148,67 @@ def _write_managed_file(
 def _upsert_section(path: Path, default_heading: str, body: str) -> WriteResult:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        existing = path.read_text(encoding="utf-8")
+        existing = path.read_bytes().decode("utf-8")
     else:
         existing = f"{default_heading}\n"
     managed = f"{START_MARKER}\n{body.strip()}\n{END_MARKER}"
-    if START_MARKER in existing and END_MARKER in existing:
-        before, remainder = existing.split(START_MARKER, 1)
-        _, after = remainder.split(END_MARKER, 1)
-        rendered = f"{before}{managed}{after}"
-        action = "updated"
-    else:
+    span = _managed_span(existing, body.strip().splitlines()[0])
+    if isinstance(span, str):
+        return WriteResult(path, NEEDS_REPAIR, span)
+    if span is None:
         rendered = f"{existing.rstrip()}\n\n{managed}\n"
         action = "updated" if path.exists() else "created"
+    else:
+        start, end = span
+        rendered = f"{existing[:start]}{managed}{existing[end:]}"
+        action = "updated"
     if rendered == existing:
         return WriteResult(path, "unchanged")
-    path.write_text(rendered, encoding="utf-8")
+    path.write_bytes(rendered.encode("utf-8"))
     return WriteResult(path, action)
+
+
+def _managed_span(existing: str, heading: str) -> tuple[int, int] | str | None:
+    """Locate the managed block as (start, end) offsets.
+
+    Returns None when the file has no markers, or a repair message when the
+    markers are malformed and the file must be left untouched.
+    """
+    starts = existing.count(START_MARKER)
+    ends = existing.count(END_MARKER)
+    if starts == 0 and ends == 0:
+        return None
+    if starts == 1 and ends == 1:
+        start = existing.index(START_MARKER)
+        end = existing.index(END_MARKER)
+        if start < end:
+            return start, end + len(END_MARKER)
+        return f"{END_MARKER} appears before {START_MARKER}; fix the markers by hand"
+    if starts == 0 and ends == 1:
+        end = existing.index(END_MARKER)
+        start = _last_heading_line(existing[:end], heading)
+        if start is not None:
+            return start, end + len(END_MARKER)
+        return (
+            f"{END_MARKER} has no matching {START_MARKER} and no {heading!r} "
+            "heading above it; fix the markers by hand"
+        )
+    if starts == 1 and ends == 0:
+        return f"{START_MARKER} has no matching {END_MARKER}; fix the markers by hand"
+    return (
+        f"found {starts} {START_MARKER} and {ends} {END_MARKER} markers; "
+        "keep exactly one managed block and fix the markers by hand"
+    )
+
+
+def _last_heading_line(text: str, heading: str) -> int | None:
+    offset = 0
+    found = None
+    for line in text.splitlines(keepends=True):
+        if line.rstrip("\r\n") == heading:
+            found = offset
+        offset += len(line)
+    return found
 
 
 def _append_gitignore(path: Path) -> WriteResult:
