@@ -10,10 +10,13 @@ repository resolves to one account, in this order:
    ``kanbanlan account use``.
 3. An automatic choice, only when it is unambiguous: the repository owner
    or the Project owner is itself a logged-in account, or exactly one
-   account is logged in. The choice is persisted as a binding, so the
-   ``gh auth status`` call it needs is paid once.
+   account is logged in. Otherwise, for a repository owned by an
+   organization none of the accounts is named after, each logged-in account
+   is asked whether it can push to the repository: gh's active account wins
+   when it can, and otherwise the one account that can. The choice is
+   persisted as a binding, so the ``gh`` calls it needs are paid once.
 
-Anything else is an error naming the logged-in accounts. An explicit
+Anything else is an error naming the accounts that were considered. An explicit
 ``GH_TOKEN`` or ``GITHUB_TOKEN`` in the environment (CI, a scoped token) is
 honored as is when no account was requested, since it already names one
 identity.
@@ -49,6 +52,8 @@ SOURCE_REPOSITORY = "repository binding"
 SOURCE_OWNER = "owner binding"
 SOURCE_OWNER_MATCH = "automatic: owner is a logged-in account"
 SOURCE_ONLY_ACCOUNT = "automatic: only logged-in account"
+SOURCE_ACTIVE_ACCESS = "automatic: active account can push to the repository"
+SOURCE_ONLY_ACCESS = "automatic: only logged-in account that can push to the repository"
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,8 @@ def resolve_account(
     store: AccountStore | None = None,
     runner: Runner | None = None,
     persist: bool = True,
+    can_push: Callable[[str, str, str], bool] | None = None,
+    active: Callable[[str], str | None] | None = None,
 ) -> Account | None:
     """Return the account to act as, or None to use an explicit environment token."""
 
@@ -190,14 +197,54 @@ def resolve_account(
             raise RuntimeError(
                 f"no gh account is logged in to {config.hostname}; run 'gh auth login'"
             )
+        choice = _choose_by_access(
+            config, accounts, can_push or can_push_to, active or active_login
+        )
+    if choice is None:
         raise RuntimeError(
             f"cannot choose a GitHub account for {config.repository}: "
-            f"{', '.join(sorted(accounts))} are logged in and none owns it; "
+            f"{', '.join(sorted(accounts))} are logged in and none owns or can push to it; "
             f"run 'kanbanlan account use LOGIN' or set {ACCOUNT_ENV}"
         )
     if persist:
         store.bind(config.hostname, repository_key(config.repository), choice.login)
     return choice
+
+
+def _choose_by_access(
+    config: Config,
+    accounts: list[str],
+    can_push: Callable[[str, str, str], bool],
+    active: Callable[[str], str | None],
+) -> Account | None:
+    pushers = [login for login in accounts if can_push(config.hostname, config.repository, login)]
+    current = (active(config.hostname) or "").lower()
+    for login in pushers:
+        if login.lower() == current:
+            return Account(config.hostname, login, SOURCE_ACTIVE_ACCESS)
+    if len(pushers) == 1:
+        return Account(config.hostname, pushers[0], SOURCE_ONLY_ACCESS)
+    if len(pushers) > 1:
+        raise RuntimeError(
+            f"cannot choose a GitHub account for {config.repository}: "
+            f"{', '.join(sorted(pushers))} can all push to it and none is gh's active "
+            f"account; run 'kanbanlan account use LOGIN' or set {ACCOUNT_ENV}"
+        )
+    return None
+
+
+def can_push_to(hostname: str, repository: str, login: str) -> bool:
+    """Report whether ``login`` has push access to ``repository``."""
+
+    try:
+        token = account_token(hostname, login)
+    except RuntimeError:
+        return False
+    runner = Runner(env={"GH_HOST": hostname, "GH_TOKEN": token, "GITHUB_TOKEN": None})
+    result = runner.run(
+        ["gh", "api", f"repos/{repository}", "--jq", ".permissions.push"], check=False
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
 
 
 # Tokens already looked up by this process; each verb step builds its own runner.

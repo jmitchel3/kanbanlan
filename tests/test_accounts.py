@@ -11,7 +11,9 @@ from unittest import mock
 
 from kanbanlan.accounts import (
     ACCOUNT_ENV,
+    SOURCE_ACTIVE_ACCESS,
     SOURCE_ENVIRONMENT,
+    SOURCE_ONLY_ACCESS,
     SOURCE_ONLY_ACCOUNT,
     SOURCE_OWNER,
     SOURCE_OWNER_MATCH,
@@ -66,8 +68,21 @@ class ResolutionTests(unittest.TestCase):
         self.directory.cleanup()
 
     def resolve(self, runner: StatusRunner, **kwargs) -> Account | None:
+        pushers = {login.lower() for login in kwargs.pop("pushers", ())}
+        active = kwargs.pop("active", None)
+        self.probed: list[str] = []
+
+        def can_push(hostname: str, repository: str, login: str) -> bool:
+            self.probed.append(login)
+            return login.lower() in pushers
+
         return resolve_account(
-            kwargs.pop("cfg", config()), store=self.store, runner=runner, **kwargs
+            kwargs.pop("cfg", config()),
+            store=self.store,
+            runner=runner,
+            can_push=can_push,
+            active=lambda _hostname: active,
+            **kwargs,
         )
 
     def test_environment_account_wins_over_every_binding(self) -> None:
@@ -126,6 +141,40 @@ class ResolutionTests(unittest.TestCase):
     def test_an_ambiguous_choice_is_an_error_naming_the_accounts(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "alpha, beta are logged in.*account use"):
             self.resolve(StatusRunner("beta", "alpha"))
+        self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
+
+    def test_the_active_account_is_chosen_when_it_can_push_and_is_persisted(self) -> None:
+        runner = StatusRunner("j-paracord", "jmitchel3", "cooper")
+
+        account = self.resolve(runner, pushers=("j-paracord", "cooper"), active="j-paracord")
+        again = self.resolve(runner)
+
+        self.assertEqual(("j-paracord", SOURCE_ACTIVE_ACCESS), (account.login, account.source))
+        self.assertEqual(("j-paracord", SOURCE_REPOSITORY), (again.login, again.source))
+        self.assertEqual([], self.probed)
+
+    def test_the_only_account_that_can_push_is_chosen_over_the_active_one(self) -> None:
+        account = self.resolve(
+            StatusRunner("alpha", "beta", "gamma"), pushers=("beta",), active="alpha"
+        )
+
+        self.assertEqual(("beta", SOURCE_ONLY_ACCESS), (account.login, account.source))
+
+    def test_several_pushers_without_the_active_one_is_an_error_naming_them(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "beta, gamma can all push.*account use"):
+            self.resolve(
+                StatusRunner("alpha", "beta", "gamma"), pushers=("gamma", "beta"), active="alpha"
+            )
+        self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
+
+    def test_an_owner_match_never_probes_access(self) -> None:
+        self.resolve(StatusRunner("other", "acme"), pushers=("other",), active="other")
+
+        self.assertEqual([], self.probed)
+
+    def test_show_does_not_persist_an_access_choice(self) -> None:
+        self.resolve(StatusRunner("alpha", "beta"), pushers=("beta",), persist=False)
+
         self.assertIsNone(self.store.lookup("github.com", "acme/widget"))
 
     def test_no_logged_in_account_is_an_error(self) -> None:

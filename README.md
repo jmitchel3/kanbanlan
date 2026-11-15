@@ -245,8 +245,10 @@ kanbanlan account clear
 
 Resolution order: `KANBANLAN_GITHUB_ACCOUNT`, a repository binding, an owner
 binding, then an automatic choice only when it is unambiguous (the repository
-or Project owner is a logged-in account, or exactly one account is logged in),
-which is saved as a repository binding. Otherwise the command fails and names
+or Project owner is a logged-in account, exactly one account is logged in, or,
+for an organization none of them is named after, gh's active account can push
+to the repository or exactly one logged-in account can), which is saved as a
+repository binding. Otherwise the command fails and names
 the logged-in accounts. An explicit `GH_TOKEN` or `GITHUB_TOKEN` is used as is
 when nothing is bound. Bindings live in the user state directory, never in the
 repository.
