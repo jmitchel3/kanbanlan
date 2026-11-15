@@ -10,11 +10,13 @@ repository resolves to one account, in this order:
    ``kanbanlan account use``.
 3. An automatic choice, only when it is unambiguous: the repository owner
    or the Project owner is itself a logged-in account, or exactly one
-   account is logged in. Otherwise, for a repository owned by an
-   organization none of the accounts is named after, each logged-in account
-   is asked whether it can push to the repository: gh's active account wins
-   when it can, and otherwise the one account that can. The choice is
-   persisted as a binding, so the ``gh`` calls it needs are paid once.
+   account is logged in. Otherwise each logged-in account is asked whether
+   it can push to the repository: gh's active account wins when it can, and
+   otherwise the one account that can. Because that tiebreak follows gh's
+   active account at the moment of the first resolution, the result is
+   saved as a binding that ``kanbanlan account use`` can change. A
+   successful choice is persisted, so its ``gh`` calls are paid once; a
+   failed one is retried by the next command.
 
 Anything else is an error naming the accounts that were considered. An explicit
 ``GH_TOKEN`` or ``GITHUB_TOKEN`` in the environment (CI, a scoped token) is
@@ -168,7 +170,7 @@ def resolve_account(
     store: AccountStore | None = None,
     runner: Runner | None = None,
     persist: bool = True,
-    can_push: Callable[[str, str, str], bool] | None = None,
+    can_push: Callable[[str, str, str], bool | None] | None = None,
     active: Callable[[str], str | None] | None = None,
 ) -> Account | None:
     """Return the account to act as, or None to use an explicit environment token."""
@@ -211,20 +213,36 @@ def resolve_account(
     return choice
 
 
+PROBE_TIMEOUT_SECONDS = 15.0
+
+
 def _choose_by_access(
     config: Config,
     accounts: list[str],
-    can_push: Callable[[str, str, str], bool],
+    can_push: Callable[[str, str, str], bool | None],
     active: Callable[[str], str | None],
 ) -> Account | None:
-    pushers = [login for login in accounts if can_push(config.hostname, config.repository, login)]
     current = (active(config.hostname) or "").lower()
-    for login in pushers:
-        if login.lower() == current:
+    ordered = sorted(accounts, key=lambda login: login.lower() != current)
+    pushers: list[str] = []
+    unknown: list[str] = []
+    for login in ordered:
+        verdict = can_push(config.hostname, config.repository, login)
+        if verdict and login.lower() == current:
             return Account(config.hostname, login, SOURCE_ACTIVE_ACCESS)
+        if verdict is None:
+            unknown.append(login)
+        elif verdict:
+            pushers.append(login)
+    if unknown:
+        raise RuntimeError(
+            f"cannot choose a GitHub account for {config.repository}: could not check "
+            f"push access for {', '.join(sorted(unknown))}; retry, or run "
+            f"'kanbanlan account use LOGIN' or set {ACCOUNT_ENV}"
+        )
     if len(pushers) == 1:
         return Account(config.hostname, pushers[0], SOURCE_ONLY_ACCESS)
-    if len(pushers) > 1:
+    if pushers:
         raise RuntimeError(
             f"cannot choose a GitHub account for {config.repository}: "
             f"{', '.join(sorted(pushers))} can all push to it and none is gh's active "
@@ -233,18 +251,29 @@ def _choose_by_access(
     return None
 
 
-def can_push_to(hostname: str, repository: str, login: str) -> bool:
-    """Report whether ``login`` has push access to ``repository``."""
+def can_push_to(
+    hostname: str, repository: str, login: str, runner: Runner | None = None
+) -> bool | None:
+    """Report whether ``login`` can push to ``repository``; None when unknown."""
 
     try:
         token = account_token(hostname, login)
     except RuntimeError:
+        return None
+    runner = runner or Runner(env=account_env(hostname, token))
+    try:
+        result = runner.run(
+            ["gh", "api", f"repos/{repository}", "--jq", ".permissions.push"],
+            check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except CommandError:
+        return None
+    if result.returncode == 0:
+        return result.stdout.strip() == "true"
+    if "HTTP 404" in result.stderr:
         return False
-    runner = Runner(env={"GH_HOST": hostname, "GH_TOKEN": token, "GITHUB_TOKEN": None})
-    result = runner.run(
-        ["gh", "api", f"repos/{repository}", "--jq", ".permissions.push"], check=False
-    )
-    return result.returncode == 0 and result.stdout.strip() == "true"
+    return None
 
 
 # Tokens already looked up by this process; each verb step builds its own runner.

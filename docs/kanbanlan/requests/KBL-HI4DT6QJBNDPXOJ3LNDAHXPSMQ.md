@@ -7,13 +7,25 @@
 
 ## Request
 
+Kanbanlan could not choose a gh account for a repository owned by an
+organization that no logged-in account is named after (for example
+`paracord-clients/beehaveserviceteam.com` with five accounts logged in), even
+though gh's active account could push to it. Every command failed with
+"none owns it".
+
 ## Outcome
 
-<!-- Describe the independently reviewable result. -->
+When no binding, owner match, or single login decides, Kanbanlan checks which
+logged-in accounts can push to the repository and chooses one only when the
+answer is unambiguous.
 
 ## Acceptance criteria
 
-- [ ]
+- [x] gh's active account is chosen when it can push, probed first and alone.
+- [x] Otherwise the single account that can push is chosen.
+- [x] Several pushers without the active one, or any probe that cannot be
+  answered, is an error naming the accounts, never a guess.
+- [x] Probes are bounded by a timeout and never put the token in argv.
 
 ## Decisions
 
