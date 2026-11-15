@@ -484,7 +484,8 @@ class DoneTests(VerbTestCase):
         self.assertEqual(0, code)
         self.assertFalse(payload["result"]["created_pull_request"])
         self.assertEqual([], self.gh_calls("create"))
-        self.assertNotIn(["git", "push", "--set-upstream", "origin", BRANCH], self.gh.calls)
+        for runner in (self.gh, self.git):
+            self.assertNotIn(["git", "push", "--set-upstream", "origin", BRANCH], runner.calls)
 
     def test_done_waits_briefly_for_a_new_pull_request_to_link(self) -> None:
         self.gh.answers = {
